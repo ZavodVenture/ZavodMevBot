@@ -1,0 +1,131 @@
+[[group]]
+markets = [
+    "Ewtkczrye9oweNQckGQZuR618AzfoL4zn996Skyctyp9",
+    "9czFfnQyW1b3Kw1tBGULpxBKoRVnXhvDLM9FjqbAK4Z",
+    "FHQZNKTX5iEQTX5eyXDYMZCHZMzsSZVUBL7ifp9Ykf2D",
+]
+luts = [
+    "5sv5tN2YDXZhXxTA8Mqhr75QTckZWTo2947ae57dt1d4",
+    "CwSSQ8ge5TMGPGgwGzz1QvnSRSYp7HRLzJv3gDAx4Nka",
+    "A5gjMgtEE8fzNB2AaSyZKPBtz4CbiDm7QQQe6aMWuXSb",
+    "HA95fswPmEdcU7BHA5DviwvrpcPj3k5JSPZjAncaEY9M",
+    "AsQLhBq3xodjpZfpqoY4hZb5YmEM9HzoE9FjUnv7z2Qw",
+    "7z919h3oudjT3Ab5WrMfSACmHZTMFq4YvBt8NuCK4UZZ",
+    "HG5wjp19jshfJg3ktkCom9bYx3oqCyhjA4XLjp3VDkXg",
+    "tREvioDpnXMpL7SLfSNWXSuc8U2ju9ALX9UszDbMhzU",
+    "CXh2s3cJVwJxZBa7q2ur3paKsWrrznZfApmvjQCPQJpc",
+    "Dhq8Ay7z9ao1VgMgQk5AD8qU9YwVvt1euBE3xhh5pKm9",
+    "2H6C5zrZP5iCfYj94K9wNJ9qY9C97uHVJRiHHFBcKF2r",
+    "BaXRNenZGDrZkvYjjPqsfx24QHWb6UEnF7b6H2QVam8e",
+    "Ar8dos6ySZdMsgkrpMuAqsHkLwK967kapzvi8bpfRUcz",
+    "FdybU6ViqQgNYgzyhX5uUDxeach7gaLmogrNyp9y4GmP",
+    "7UGGKq7fUeHydCZ5yCDZMMzBTDLDeQq3TPgVbSBGUUjA",
+    "2MZEqAnDGGBKqv9VHGemjZq599rrVhRnTfW6YraS72sz",
+    "673dP9BfXgJxYyH9mVcxpZyzWA7YjqvWD3sFFJVLjf6W",
+    "EW6UheJgU9CUzf9jk8n9SZgqxkAyJKFrUKtTtMEpTs6",
+    "8tDJtBDfjZ3qFRJJobowSHcZ3Sj7dDYJZ6RN8B3c5z9z",
+    "5cwe13PXie547oqxvZA6mB1EkjHmbo3vBGR1BqBiTHPx",
+    "4gY16scg5gkhvFASparesB1LSevWgBHqNNG111ykLEBC",
+    "5JSzZB1bnVqZebb1DuvYU2TBHKSMDM8mUcE4JJGWWn3Z",
+    "5PS3Y2dmdwJwCaYz5h2WJG37FVT2MNMneJ2X3jwUzpzQ",
+    "iLs4doNLvUSXRvJFc8YtVAGCjxQbSbWXbX9Sxi9WL9X",
+    "7VpsxCSyZdCpJFzFjAiiyzzsrwzD4AUFsDJHXT8ywNwr",
+    "ENk6kP5TYq79AKofmYQrptDkHvMZxRuxH4BAEzzf4jZP",
+    "Ed7sSGM8odwhxkVdy9ranz52Nx6TKUV6FkKbwKxJ6ef",
+    "9eDs224U9XrChTj4RaqFQPWkKkpukgmUMAeeB2Fkb7kU",
+    "E2T6tKsyePwZBCfwZGMqcdyFtqRMwBKp6tfYZanpTRqM",
+    "GrUWsnrSZisJGdTDD2drn93SCZiMShXvzYLiq7D4oN66",
+    "Gay8c9eBAaYvM1FvEACkcoU5pAGQCh4TLBaRsLqyaXi2",
+    "DRC4uTSU97ZyREgscKHuS9oe6ewViQzbLnoCmCeqtSUY",
+    "77xr8FGBgDDc9PVhqsv8oy7Q5WuXGdP4vV5h3iQZCunQ",
+    "572K14tpmzqSd7htA4TRrRqRjneqN32KgTNc22F9deR2",
+    "4ktQWrEADJGh2LS97hy4QbY15cSFudu23DeM3Axe96Ct",
+    "DG75X7zF5EUxyEjDC4M4ybiFaa7U2msJkhr3KwvSFdNm",
+    "4935Rb5XsaYkjuSWGuKNLBn4taBF7JuFufRCuefvbXG8",
+    "41iRVE6umuNh2eZ5TRY8yTSB62qWs24po51foY97DLw2",
+    "G5rt7Dznzikb8Xyxnw6EXCevt71uuXeqx52sChEx8ZUR",
+    "DeppRr9Czcdj3W6i8HGdvszmev99YnfcqR4FMMrwBTMf",
+    "4sKLJ1Qoudh8PJyqBeuKocYdsZvxTcRShUt9aKqwhgvC",
+    "Cf4eEgDwevuMjX5XbxmU7JHidBs7TK4UBisEqyPPrr4n",
+    "4VCEWTrP5nsjcLgAauwoWkduN4WmU79pxGH2DRv6tmB3",
+    "5JdRRcpGQejv7JGhoXepcUFrbSZn9HJYb9AjLkAcgPGx",
+    "Eumcjb7Difou61Xtu9QamrBEyjYUjnoVArCuk7UaiZmE",
+    "4yRzzxU6brZsY9CTZ2Jp9QWhnRftYP6RyZ8FGugVEXN8",
+    "Fgbo36mESnrcgJ4smCRoX9vZMkqGAEuXaxABfw2Xg5wx",
+]
+
+[[group]]
+markets = [
+    "4FmMVi6EAGoBerCgv7YwR9Z58bmtxrvS4UTEPzSs3atL",
+    "x8pgCzCi2Uoq7agP8DuSCs84gMVcG87V2LhjAg21a23",
+]
+luts = [
+    "Gay8c9eBAaYvM1FvEACkcoU5pAGQCh4TLBaRsLqyaXi2",
+    "BaXRNenZGDrZkvYjjPqsfx24QHWb6UEnF7b6H2QVam8e",
+    "6YpHhDtrd6UqTVo65HxGhzUC8MTmz9Z6opqDcnZUkpL",
+    "AoXDW3Rf4TgAGTeXDvNy73jH5cRFqseAjNYJoas8mZ9o",
+    "4gY16scg5gkhvFASparesB1LSevWgBHqNNG111ykLEBC",
+    "9fdT9EkPRUyxnbZdK7sbgPJ7GWCjB2Lo6qW46D9wSRYw",
+    "Cf7nNjxvz3JMyGnhdbXkepuznZwC7drSXcmrsXEh7dTL",
+    "4yRzzxU6brZsY9CTZ2Jp9QWhnRftYP6RyZ8FGugVEXN8",
+    "J7sGRjdoJKgcBJdcx77yZzqGcEFHha2PNT2jZJAFtqMi",
+    "A4GnTfeRJXLDahSebxNB5gVE5Be2koi2PXk7jmdyjh7D",
+    "CwSSQ8ge5TMGPGgwGzz1QvnSRSYp7HRLzJv3gDAx4Nka",
+    "C4AYafMQ4aQ2JBBQUn9PuaNQtjAUSiHJFgtscoZsjQFR",
+    "77xr8FGBgDDc9PVhqsv8oy7Q5WuXGdP4vV5h3iQZCunQ",
+    "AsQLhBq3xodjpZfpqoY4hZb5YmEM9HzoE9FjUnv7z2Qw",
+]
+
+[[group]]
+markets = [
+    "3Up5Za139LNiLabSVGnKoEhYVMqx4GWTRKVDNiVYvR9B",
+    "37BZSp4SKVDdC5y8vknW8iKMfoUKQ8JCSpywi3xYkRaD",
+]
+luts = [
+    "6YpHhDtrd6UqTVo65HxGhzUC8MTmz9Z6opqDcnZUkpL",
+    "SvPE6qDABZYYzbVXfXfy5Fy7TcKPcfkA3KUuqMMFsZ8",
+    "FSGBpXZGjw21kq3jDtonUccrvYRyGtJFZNX3sUtHFEq3",
+    "4yRzzxU6brZsY9CTZ2Jp9QWhnRftYP6RyZ8FGugVEXN8",
+]
+
+[[group]]
+markets = [
+    "AJxm68TtYrMBez1C1ghDLK3kDXkfyUrzfrfdntYj2X9b",
+    "4KfHWqcSJWsrTq19FLzFYm3cGN4oASAj7ZCiUoFx16KS",
+    "CtmQdWmcPvaYNu5VYqt9ZHGD2hdCAnTXJZcaAkXEeLTR",
+    "7Y9uRQ7Q3tw2MfSwXTE9UPDUpA5WTd9BXNrTCgSN62uP",
+]
+luts = [
+    "Cn84DeCaiYBwNuofyAWoaB1vyFfgqzmCRVyFqUhjqjGm",
+    "673dP9BfXgJxYyH9mVcxpZyzWA7YjqvWD3sFFJVLjf6W",
+    "CwSSQ8ge5TMGPGgwGzz1QvnSRSYp7HRLzJv3gDAx4Nka",
+    "4yRzzxU6brZsY9CTZ2Jp9QWhnRftYP6RyZ8FGugVEXN8",
+    "Ed7sSGM8odwhxkVdy9ranz52Nx6TKUV6FkKbwKxJ6ef",
+    "CXh2s3cJVwJxZBa7q2ur3paKsWrrznZfApmvjQCPQJpc",
+    "Fe8YeAot3SZQ6CgXDcXcPfArjn2TmW9Z9Ddm2rGy7qmA",
+    "77xr8FGBgDDc9PVhqsv8oy7Q5WuXGdP4vV5h3iQZCunQ",
+    "E2T6tKsyePwZBCfwZGMqcdyFtqRMwBKp6tfYZanpTRqM",
+    "AsQLhBq3xodjpZfpqoY4hZb5YmEM9HzoE9FjUnv7z2Qw",
+    "4935Rb5XsaYkjuSWGuKNLBn4taBF7JuFufRCuefvbXG8",
+]
+
+[[group]]
+markets = [
+    "CG3n7Wz7JrBhGg7H7qSmU8qXYZo1FvWSgjssKdxfgXJM",
+    "4ZotbqiuwLKaAd9URshB1rLDSPpLasj6uSNGsBxFAKHg",
+    "8JeNALBDraAydwMPfLthCcvd5An2Fp5iRzu8CMMPKc7q",
+]
+luts = [
+    "DeppRr9Czcdj3W6i8HGdvszmev99YnfcqR4FMMrwBTMf",
+    "Dhq8Ay7z9ao1VgMgQk5AD8qU9YwVvt1euBE3xhh5pKm9",
+    "3opUWXTJQb9hd56BRxJMPRKFAGVEkT8jSsLkxNws8vEd",
+    "4935Rb5XsaYkjuSWGuKNLBn4taBF7JuFufRCuefvbXG8",
+    "A5gjMgtEE8fzNB2AaSyZKPBtz4CbiDm7QQQe6aMWuXSb",
+    "4sKLJ1Qoudh8PJyqBeuKocYdsZvxTcRShUt9aKqwhgvC",
+    "E2T6tKsyePwZBCfwZGMqcdyFtqRMwBKp6tfYZanpTRqM",
+    "AsQLhBq3xodjpZfpqoY4hZb5YmEM9HzoE9FjUnv7z2Qw",
+    "3H1ngYvuWWZyrJC87pVJVtncbXnc9ghNx8Uo5yWuCUyH",
+    "9o4sjWDhw5cujvBtYbG6amKi9znEpJzo8EAGR5TXmPdj",
+    "4bN9a9PJ81KJkeU5SHiFJmKpvxWQSQFJimwCy6UTzMh8",
+    "5JSzZB1bnVqZebb1DuvYU2TBHKSMDM8mUcE4JJGWWn3Z",
+]

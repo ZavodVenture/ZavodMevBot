@@ -1,32 +1,23 @@
 # Example configuration file for simplified onchain bot
 [stop]
 min_balance_lamports = 100_000_000
-should_unwrap = true # If set to false, then the bot stops when sol balance is lower than min_balance_lamports.
-unwrap_amount_lamports = 100_000_000
+should_unwrap = true # If set to false, then the bot stops.
+unwrap_amount_lamports = 200_000_000
 
-[routing]
-[[routing.mint_config_list]]
-mint = "8hmFgiKHjgPaFvntHqj2bLm1JAP11V6Fxkm6Tekepump"
-pump_pool_list = ["EUabMnyQkcomQDcknKyFpFPdKGfFyGe361b9w2Nz5wCV"]
-meteora_dlmm_pool_list = [
-    "GHgncxJD5cVzgwKnTG2FdVi8VMiNoeZqCWfTstg5uTFk",
-    "AySVrKXTBJG9BYqJLqeDtrGXNhtbx6jGdzDB1QvW4ezs",
-    "BcTVDCa3MyE2kicK63Sb2Z1Vwrx5Y2fp6zSkNbU8Kvws",
-]
-raydium_pool_list = []
-raydium_cp_pool_list = []
-meteora_damm_v2_pool_list = []
-lookup_table_accounts = [
-    "AoJkQTdqX1RjXuuZZTKZgbn47nEncdUnBucXtujgTDwB",
-    "AC8TnwrENt7AuDmmQWPaGfk4MEpWRY1DKzRJ6bD5WNwf",
-    "AcrvSRubF1SeirF3NmecjzVhhq8CcyVb1zHa61fWXD2g",
-    "Ed7sSGM8odwhxkVdy9ranz52Nx6TKUV6FkKbwKxJ6ef"
-]
+[[markets_file]]
+enabled=true
+path="markets.toml" # only support toml.
+update_seconds=60
+
+[[lookup_tables_file]]
+enabled=true
+path="lookup-tables.toml" # only support toml.
+update_seconds=30
 
 [bot]
 # Max compute unit limit per transaction
-compute_unit_limit = 288_181
-no_failure_mode = true
+compute_unit_limit = 328_181
+no_failure_mode = true # Optional. DO NOT ENABLE THIS IF YOU DON'T KNOW WHAT THIS IS.
 run_after_simulation_profit = true # If true, the bot only sends real transactions after it finds profitable route through simulation. Only works in Non-Jito Mode
 
 [jito]
@@ -41,31 +32,28 @@ tip_config = {from = 5000, to = 20000}
 [spam]
 # Enable spam transactions
 enabled = true
-process_delay = 333
+process_delay = 400
 max_spam_tx_len_after_simulation_success = 100
 # List of RPC URLs to use for sending transactions
 sending_rpc_urls = [
   "https://solana-rpc.publicnode.com",
 ]
 # Fixed compute unit price
-priority_fee = {from = 1111, to = 5555}
+priority_fee = {from = 2222, to = 3333}
 # Maximum retries
 max_retries = 1
 
 [auto]
-enabled = true # if true, the bot imports routing.mint_config_list from routing.toml file.
-refresh_interval_in_secs = 300
+enabled = true
+refresh_interval_in_secs = 60
 [auto.filters]
 limit = 5
 max_pool_len = 4
 min_tx_len = 3
-min_pool_wsol_liquidity = 10
-max_pool_wsol_liquidity = 2000
+min_pool_wsol_liquidity = 20
+max_pool_wsol_liquidity = 5000
 duration = 600
 min_profit = 1000000
-
-
-
 
 
 [flashloan]
