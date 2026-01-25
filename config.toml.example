@@ -4,21 +4,23 @@ min_balance_lamports = 100_000_000
 should_unwrap = true # If set to false, then the bot stops.
 unwrap_amount_lamports = 200_000_000
 
-[[markets_file]]
-enabled=true
-path="markets.toml" # only support toml.
-update_seconds=60
+# [[markets_file]]
+# enabled=false
+# path="markets.toml" # also supports json, but must be a 2d array of market addresses
+# update_seconds=0
 
-[[lookup_tables_file]]
-enabled=true
-path="lookup-tables.toml" # only support toml.
-update_seconds=30
+# [[lookup_tables_file]]
+# enabled=false
+# path="lookup-tables.txt" # also supports json, but must be 1d array of market addresses
+# update_seconds=100
 
 [bot]
 # Max compute unit limit per transaction
-compute_unit_limit = 328_181
+compute_unit_limit = 358_182
 no_failure_mode = true # Optional. DO NOT ENABLE THIS IF YOU DON'T KNOW WHAT THIS IS.
-run_after_simulation_profit = true # If true, the bot only sends real transactions after it finds profitable route through simulation. Only works in Non-Jito Mode
+# run_after_simulation_profit = false # If true, the bot only sends real transactions after it finds profitable route through simulation. Only works in Non-Jito Mode
+new_version = true
+merge_mints = true
 
 [jito]
 process_delay = 1000
@@ -27,33 +29,34 @@ enabled = false
 block_engine_urls = [
   "https://frankfurt.mainnet.block-engine.jito.wtf/api/v1",
 ]
-tip_config = {from = 5000, to = 20000}
+tip_config = {from = 1111, to = 3333}
 
 [spam]
 # Enable spam transactions
 enabled = true
-process_delay = 400
-max_spam_tx_len_after_simulation_success = 100
+process_delay = 150
+# max_spam_tx_len_after_simulation_success = 100
 # List of RPC URLs to use for sending transactions
 sending_rpc_urls = [
-  "https://solana-rpc.publicnode.com",
+  "",
 ]
 # Fixed compute unit price
-priority_fee = {from = 2222, to = 3333}
+priority_fee = {from = 1111, to = 3333}
 # Maximum retries
 max_retries = 1
 
 [auto]
 enabled = true
-refresh_interval_in_secs = 60
+refresh_interval_in_secs = 10
 [auto.filters]
-limit = 5
-max_pool_len = 4
-min_tx_len = 3
-min_pool_wsol_liquidity = 20
-max_pool_wsol_liquidity = 5000
-duration = 600
-min_profit = 1000000
+limit = 2
+min_tx_len = 1
+min_pool_wsol_liquidity = 10
+max_pool_wsol_liquidity = 36000
+duration = 10
+min_profit = 50000000
+
+
 
 
 [flashloan]
@@ -61,7 +64,7 @@ enabled = true
 
 [rpc]
 # RPC URL for the Solana network
-url = "https://solana-rpc.publicnode.com"
+url = ""
 
 [wallet]
 # Private key (can be path or environment variable)
