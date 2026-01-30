@@ -34,27 +34,27 @@ tip_config = {from = 1111, to = 3333}
 [spam]
 # Enable spam transactions
 enabled = true
-process_delay = 250
+process_delay = 350
 # max_spam_tx_len_after_simulation_success = 200
 # List of RPC URLs to use for sending transactions
 sending_rpc_urls = [
   "",
 ]
 # Fixed compute unit price
-priority_fee = {from = 1111, to = 10333}
+priority_fee = {from = 111, to = 6633}
 # Maximum retries
 max_retries = 1
 
 [auto]
 enabled = true
-refresh_interval_in_secs = 30
+refresh_interval_in_secs = 50
 [auto.filters]
 limit = 2
-min_tx_len = 15
+min_tx_len = 2
 min_pool_wsol_liquidity = 5
 max_pool_wsol_liquidity = 76000
-duration = 80
-min_profit = 300000000
+duration = 100
+min_profit = 100000000
 
 
 
