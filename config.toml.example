@@ -21,6 +21,7 @@ no_failure_mode = true # Optional. DO NOT ENABLE THIS IF YOU DON'T KNOW WHAT THI
 # run_after_simulation_profit = false # If true, the bot only sends real transactions after it finds profitable route through simulation. Only works in Non-Jito Mode
 new_version = true
 merge_mints = true
+# log = true
 
 [jito]
 process_delay = 1000
