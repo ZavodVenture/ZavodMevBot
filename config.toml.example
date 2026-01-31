@@ -56,8 +56,8 @@ min_pool_wsol_liquidity = 5
 max_pool_wsol_liquidity = 76000
 duration = 100
 min_profit = 100000000
-# min_profit_per_arb = 100000
-# min_roi = 10.0
+min_profit_per_arb = 100000
+min_roi = 10.0
 
 [flashloan]
 enabled = true
