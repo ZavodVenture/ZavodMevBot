@@ -28,7 +28,14 @@ process_delay = 1000
 uuid=""
 enabled = false
 block_engine_urls = [
+ "https://ny.mainnet.block-engine.jito.wtf/api/v1",
+  "https://tokyo.mainnet.block-engine.jito.wtf/api/v1",
+  "https://slc.mainnet.block-engine.jito.wtf/api/v1",
+  "https://amsterdam.mainnet.block-engine.jito.wtf/api/v1",
   "https://frankfurt.mainnet.block-engine.jito.wtf/api/v1",
+  "https://singapore.mainnet.block-engine.jito.wtf/api/v1",
+  "https://london.mainnet.block-engine.jito.wtf/api/v1",
+]
 ]
 tip_config = {from = 1111, to = 3333}
 
