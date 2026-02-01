@@ -58,13 +58,13 @@ enabled = true
 refresh_interval_in_secs = 50
 [auto.filters]
 limit = 2
-min_tx_len = 2
+min_tx_len = 4
 min_pool_wsol_liquidity = 5
 max_pool_wsol_liquidity = 76000
-duration = 100
+duration = 50
 min_profit = 100000000
-min_profit_per_arb = 100000
-min_roi = 10.0
+min_profit_per_arb = 1000000
+min_roi = 1.0
 
 [flashloan]
 enabled = true
