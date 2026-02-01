@@ -55,10 +55,10 @@ max_retries = 1
 
 [auto]
 enabled = true
-refresh_interval_in_secs = 50
+refresh_interval_in_secs = 10
 [auto.filters]
 limit = 2
-min_tx_len = 4
+min_tx_len = 10
 min_pool_wsol_liquidity = 5
 max_pool_wsol_liquidity = 76000
 duration = 50
