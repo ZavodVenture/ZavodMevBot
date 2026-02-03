@@ -64,6 +64,7 @@ duration = 50
 min_profit = 100000000
 min_profit_per_arb = 1000000
 min_roi = 1.0
+whitelist_only = true
 
 [flashloan]
 enabled = true
