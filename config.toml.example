@@ -55,6 +55,7 @@ max_retries = 1
 [auto]
 enabled = true
 refresh_interval_in_secs = 10
+force_two_mints = true
 [auto.filters]
 limit = 2
 min_tx_len = 10
