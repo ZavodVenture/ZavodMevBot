@@ -1,5 +1,5 @@
 # **ZavodMevBot**
-https://zavod-venture.gitbook.io/zavod-venture-docs
+https://zavod-venture.gitbook.io/zavod-venture-docs/zavod-mev-bot/kak-rabotaet-nash-bot
 
 Automated Solana On-Chain Arbitrage Bot
 
