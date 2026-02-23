@@ -19,7 +19,6 @@ unwrap_amount_lamports = 200_000_000
 compute_unit_limit = 358_182
 no_failure_mode = true # keep always true
 # run_after_simulation_profit = false # If true, the bot only sends real transactions after it finds profitable route through simulation. Only works in Non-Jito Mode
-new_version = true
 merge_mints = true
 # log = true
 
@@ -51,6 +50,25 @@ sending_rpc_urls = [
 priority_fee = {from = 111, to = 6633}
 # Maximum retries
 max_retries = 1
+
+[helius]
+enabled = false
+process_delay = 150
+priority_fee_lamports = {from = 1000, to = 3000}
+tip_lamports = {from = 1_000_000, to = 3_000_000} # min 0.0002 Sol tip
+
+[helius_swqos]
+enabled = false
+process_delay = 150
+priority_fee_lamports = {from = 500, to = 1000}
+tip_lamports = {from = 100_000, to = 200_000} # min 0.000005 Sol tip
+
+[temporal]
+enabled = false
+uuid="" # necessary api key
+process_delay = 150
+priority_fee_lamports = {from = 500, to = 1000}
+tip_lamports = {from = 10_000_000, to = 50_000_000} # min 0.001 Sol tip
 
 [auto]
 enabled = true
