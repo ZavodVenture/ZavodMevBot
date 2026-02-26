@@ -17,6 +17,7 @@ unwrap_amount_lamports = 200_000_000
 [bot]
 # Max compute unit limit per transaction
 compute_unit_limit = 358_182
+dlmm_bin_range_to_search = 12 # default is 12
 no_failure_mode = true # keep always true
 # run_after_simulation_profit = false # If true, the bot only sends real transactions after it finds profitable route through simulation. Only works in Non-Jito Mode
 merge_mints = true
