@@ -71,6 +71,13 @@ process_delay = 150
 priority_fee_lamports = {from = 500, to = 1000}
 tip_lamports = {from = 10_000_000, to = 50_000_000} # min 0.001 Sol tip
 
+[falcon]
+enabled = false
+uuid=""
+process_delay = 300
+priority_fee_lamports = {from = 5000, to = 10000}
+tip_lamports = {from = 10_000_000, to = 50_000_000} # min 0.001 Sol tip
+
 [auto]
 enabled = true
 refresh_interval_in_secs = 10
