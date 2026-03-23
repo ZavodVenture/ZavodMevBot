@@ -3,4 +3,3 @@ config.toml
 routing.json
 routing.toml
 *.zip
-*.sh
