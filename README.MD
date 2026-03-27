@@ -1,8 +1,11 @@
 # **ZavodMevBot**
+ZavodMevBot — Solana MEV Bot and Automated Solana On-Chain Arbitrage Bot
+
+Documentation:  
 https://zavod-venture.gitbook.io/zavod-venture-docs/zavod-mev-bot/kak-rabotaet-nash-bot
 
-Solana MEV Bot — Automated Solana On-Chain Arbitrage Bot  
-Program address: `4Qv3mbzcq1bKmrhGG4voS3EemfPd7f838FLUU7wBHSyi`
+On-chain program address:  
+`4Qv3mbzcq1bKmrhGG4voS3EemfPd7f838FLUU7wBHSyi`
 ---
 
 ## 🚀 Introduction
