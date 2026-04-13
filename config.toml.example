@@ -4,6 +4,11 @@ min_balance_lamports = 100_000_000
 should_unwrap = true # If set to false, then the bot stops.
 unwrap_amount_lamports = 200_000_000
 
+[cashback_autoclaim]
+enabled = true
+claim_threshold_lamports = 100_000_000
+check_interval_secs = 3600
+
 # [[markets_file]]
 # enabled=false
 # path="markets.toml" # also supports json, but must be a 2d array of market addresses
@@ -28,13 +33,7 @@ process_delay = 1000
 uuid=""
 enabled = false
 block_engine_urls = [
- "https://ny.mainnet.block-engine.jito.wtf/api/v1",
-  "https://tokyo.mainnet.block-engine.jito.wtf/api/v1",
-  "https://slc.mainnet.block-engine.jito.wtf/api/v1",
-  "https://amsterdam.mainnet.block-engine.jito.wtf/api/v1",
   "https://frankfurt.mainnet.block-engine.jito.wtf/api/v1",
-  "https://singapore.mainnet.block-engine.jito.wtf/api/v1",
-  "https://london.mainnet.block-engine.jito.wtf/api/v1",
 ]
 tip_config = {from = 1111, to = 3333}
 
@@ -51,32 +50,6 @@ sending_rpc_urls = [
 priority_fee = {from = 111, to = 6633}
 # Maximum retries
 max_retries = 1
-
-[helius]
-enabled = false
-process_delay = 150
-priority_fee_lamports = {from = 1000, to = 3000}
-tip_lamports = {from = 1_000_000, to = 3_000_000} # min 0.0002 Sol tip
-
-[helius_swqos]
-enabled = false
-process_delay = 150
-priority_fee_lamports = {from = 500, to = 1000}
-tip_lamports = {from = 100_000, to = 200_000} # min 0.000005 Sol tip
-
-[temporal]
-enabled = false
-uuid="" # necessary api key
-process_delay = 150
-priority_fee_lamports = {from = 500, to = 1000}
-tip_lamports = {from = 10_000_000, to = 50_000_000} # min 0.001 Sol tip
-
-[falcon]
-enabled = false
-uuid=""
-process_delay = 300
-priority_fee_lamports = {from = 5000, to = 10000}
-tip_lamports = {from = 10_000_000, to = 50_000_000} # min 0.001 Sol tip
 
 [auto]
 enabled = true
