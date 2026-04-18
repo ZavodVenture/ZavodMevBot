@@ -1,7 +1,9 @@
-# Example configuration file for simplified onchain bot
+# Example bot configuration.
+# Copy this into config.toml and fill in your RPC / key / sender modes.
+
 [stop]
 min_balance_lamports = 100_000_000
-should_unwrap = true # If set to false, then the bot stops.
+should_unwrap = true
 unwrap_amount_lamports = 200_000_000
 
 [cashback_autoclaim]
@@ -9,52 +11,86 @@ enabled = true
 claim_threshold_lamports = 100_000_000
 check_interval_secs = 3600
 
+# Markets sources from file.
+# File format: TOML like `group = [{ mint = "...", markets = ["..."], luts = ["..."] }]`
+# If `update_seconds = 0`, the file is read once at startup.
 # [[markets_file]]
-# enabled=false
-# path="markets.toml" # also supports json, but must be a 2d array of market addresses
-# update_seconds=0
+# enabled = false
+# path = "markets.toml"
+# update_seconds = 0
 
+# LUT sources from file.
+# Supported formats:
+# 1. TOML like `luts = ["..."]`
+# 2. TXT where the first token on each line is a LUT address
+# If `update_seconds = 0`, the file is read once at startup.
 # [[lookup_tables_file]]
-# enabled=false
-# path="lookup-tables.txt" # also supports json, but must be 1d array of market addresses
-# update_seconds=100
+# enabled = false
+# path = "lookup-tables.txt"
+# update_seconds = 0
 
 [bot]
-# Max compute unit limit per transaction
+# Compute unit limit per transaction
 compute_unit_limit = 358_182
-dlmm_bin_range_to_search = 12 # default is 12
-no_failure_mode = true # keep always true
-# run_after_simulation_profit = false # If true, the bot only sends real transactions after it finds profitable route through simulation. Only works in Non-Jito Mode
+dlmm_bin_range_to_search = 20
+no_failure_mode = true
 merge_mints = true
-# log = true
-
-[jito]
-process_delay = 1000
-uuid=""
-enabled = false
-block_engine_urls = [
-  "https://frankfurt.mainnet.block-engine.jito.wtf/api/v1",
-]
-tip_config = {from = 1111, to = 3333}
+run_after_simulation_profit = false
+log = false
+test_mode = false
 
 [spam]
-# Enable spam transactions
 enabled = true
-process_delay = 350
-# max_spam_tx_len_after_simulation_success = 200
-# List of RPC URLs to use for sending transactions
+process_delay = 300
 sending_rpc_urls = [
   "",
 ]
-# Fixed compute unit price
-priority_fee = {from = 111, to = 6633}
-# Maximum retries
+priority_fee = { from = 1111, to = 3333 }
+# If omitted, 100 is used
+max_spam_tx_len_after_simulation_success = 100
+# If omitted, 1 is used
 max_retries = 1
+
+[jito]
+enabled = false
+process_delay = 1000
+uuid = ""
+block_engine_urls = [
+  "https://frankfurt.mainnet.block-engine.jito.wtf/api/v1",
+]
+tip_config = { from = 1111, to = 3333 }
+
+[helius]
+enabled = false
+process_delay = 300
+priority_fee_lamports = { from = 1111, to = 3333 }
+tip_lamports = { from = 1111, to = 3333 }
+
+[helius_swqos]
+enabled = false
+process_delay = 300
+priority_fee_lamports = { from = 1111, to = 3333 }
+tip_lamports = { from = 1111, to = 3333 }
+
+[temporal]
+enabled = false
+uuid = ""
+process_delay = 300
+priority_fee_lamports = { from = 1111, to = 3333 }
+tip_lamports = { from = 1111, to = 3333 }
+
+[falcon]
+enabled = false
+uuid = ""
+process_delay = 300
+priority_fee_lamports = { from = 1111, to = 3333 }
+tip_lamports = { from = 1111, to = 3333 }
 
 [auto]
 enabled = true
 refresh_interval_in_secs = 10
 force_two_mints = true
+
 [auto.filters]
 limit = 2
 min_tx_len = 10
@@ -70,9 +106,9 @@ ignore_offchain_bots = true
 enabled = true
 
 [rpc]
-# RPC URL for the Solana network
+# You can pass the value directly or via environment variable, for example "$RPC_URL"
 url = ""
 
 [wallet]
-# Private key (can be path or environment variable)
+# You can pass the private key directly or via environment variable, for example "$PRIVATE_KEY"
 private_key = ""
