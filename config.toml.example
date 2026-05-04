@@ -85,6 +85,16 @@ process_delay = 300
 priority_fee_lamports = { from = 1111, to = 3333 }
 tip_lamports = { from = 1111, to = 3333 }
 
+[circular]
+# min tip - 100_000
+# api-key at https://circular.fi/account
+enabled = false
+api-key = ""
+endpoint = "https://fast.circular.fi/transactions"
+process_delay = 300
+priority_fee_lamports = { from = 1111, to = 3333 }
+tip_lamports = { from = 100_000, to = 111_111 }
+
 [auto]
 enabled = true
 refresh_interval_in_secs = 10
