@@ -37,6 +37,7 @@ no_failure_mode = true
 merge_mints = true
 run_after_simulation_profit = false
 log = false
+gas_file = false
 
 [spam]
 enabled = true
