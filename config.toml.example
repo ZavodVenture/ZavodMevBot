@@ -6,6 +6,11 @@ min_balance_lamports = 100_000_000
 should_unwrap = true
 unwrap_amount_lamports = 200_000_000
 
+[DataSizeEstimation]
+# If true, DataSizeLimit is estimated by simulation and added to transactions.
+# If false, estimation is skipped and the instruction is not added.
+enable = true
+
 [cashback_autoclaim]
 enabled = true
 claim_threshold_lamports = 100_000_000
