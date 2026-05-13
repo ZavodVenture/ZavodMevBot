@@ -6,11 +6,6 @@ min_balance_lamports = 100_000_000
 should_unwrap = true
 unwrap_amount_lamports = 200_000_000
 
-[DataSizeEstimation]
-# If true, DataSizeLimit is estimated by simulation and added to transactions.
-# If false, estimation is skipped and the instruction is not added.
-enable = true
-
 [cashback_autoclaim]
 enabled = true
 claim_threshold_lamports = 100_000_000
@@ -39,10 +34,16 @@ check_interval_secs = 3600
 compute_unit_limit = 358_182
 dlmm_bin_range_to_search = 20
 no_failure_mode = true
+gas_file = false
 merge_mints = true
 run_after_simulation_profit = false
 log = false
-gas_file = false
+test_mode = false
+
+[DataSizeEstimation]
+# If true, DataSizeLimit is estimated by simulation and added to transactions.
+# If false, estimation is skipped and the instruction is not added.
+enable = true
 
 [spam]
 enabled = true
@@ -92,30 +93,36 @@ priority_fee_lamports = { from = 1111, to = 3333 }
 tip_lamports = { from = 1111, to = 3333 }
 
 [circular]
-# min tip - 100_000
-# api-key at https://circular.fi/account
 enabled = false
 api-key = ""
 endpoint = "https://fast.circular.fi/transactions"
 process_delay = 300
 priority_fee_lamports = { from = 1111, to = 3333 }
-tip_lamports = { from = 100_000, to = 111_111 }
+# Minimum tip_lamports.from is 100_000 lamports.
+tip_lamports = { from = 100_000, to = 333_333 }
 
 [auto]
 enabled = true
-refresh_interval_in_secs = 10
+refresh_interval_in_secs = 10.0
 force_two_mints = true
 
 [auto.filters]
 limit = 2
-min_tx_len = 10
-min_pool_wsol_liquidity = 5
-max_pool_wsol_liquidity = 76000
-duration = 50
-min_profit = 100000000
-min_profit_per_arb = 1000000
-min_roi = 1.0
-ignore_offchain_bots = true
+min_tx_len = 20
+duration = 60
+min_profit = 200_000_000
+min_profit_per_arb = 100000
+min_roi = 0.0
+ignore_offchain_bots = false
+
+[auto.markets]
+max_pool_len = 4
+min_pool_liquidity_lamports = 6_000_000_000
+max_pool_liquidity_lamports = 780_000_000_000_000
+route_relevance_max_window_secs = 120
+route_relevance_half_life_secs = 20
+profit_weight = 0.75
+count_weight = 0.25
 
 [flashloan]
 enabled = true
