@@ -113,6 +113,8 @@ duration = 60
 min_profit = 200_000_000
 min_profit_per_arb = 100000
 min_roi = 0.0
+min_volume_lamports = 0
+max_volume_lamports = 9_223_372_036_854_775_807
 ignore_offchain_bots = false
 
 [auto.markets]
