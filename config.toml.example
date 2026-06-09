@@ -12,12 +12,21 @@ claim_threshold_lamports = 100_000_000
 check_interval_secs = 3600
 
 # Markets sources from file.
-# File format: TOML like `group = [{ mint = "...", markets = ["..."], luts = ["..."] }]`
+# File format: TOML where each [[group]] is one transaction:
+# [[group]]
+# mint_a = "..."
+# markets_a = ["...", "..."]
+# mint_b = "..."              # optional
+# markets_b = ["...", "..."]  # required when mint_b is set
+# luts = ["..."]
+#
 # If `update_seconds = 0`, the file is read once at startup.
 # [[markets_file]]
 # enabled = false
 # path = "markets.toml"
 # update_seconds = 0
+# If true, LUTs from markets.toml are ignored and fresh LUTs are resolved through Arb-Assist every 5 seconds.
+# auto_luts = false
 
 # LUT sources from file.
 # Supported formats:
@@ -33,17 +42,20 @@ check_interval_secs = 3600
 # Compute unit limit per transaction
 compute_unit_limit = 358_182
 dlmm_bin_range_to_search = 20
-no_failure_mode = true
 gas_file = false
 merge_mints = true
-run_after_simulation_profit = false
 log = false
-test_mode = false
 
 [DataSizeEstimation]
 # If true, DataSizeLimit is estimated by simulation and added to transactions.
 # If false, estimation is skipped and the instruction is not added.
 enable = true
+
+[dynamic_fees]
+enabled = false
+window_ms = 5_000
+min_samples = 50
+sample_scope = "all"
 
 [spam]
 enabled = true
@@ -51,11 +63,8 @@ process_delay = 300
 sending_rpc_urls = [
   "",
 ]
-priority_fee = { from = 1111, to = 3333 }
-# If omitted, 100 is used
-max_spam_tx_len_after_simulation_success = 100
-# If omitted, 1 is used
-max_retries = 1
+priority_fee = { from = 1111, to = 10333 }
+dynamic_priority_fee = { enable = true, min_percentile = 10, max_percentile = 85, min = 1111, max = 23333 }
 
 [jito]
 enabled = false
@@ -64,42 +73,53 @@ uuid = ""
 block_engine_urls = [
   "https://frankfurt.mainnet.block-engine.jito.wtf/api/v1",
 ]
-tip_config = { from = 1111, to = 3333 }
+tip_config = { from = 1111, to = 8333 }
+dynamic_tip = { enable = true, min_percentile = 10, max_percentile = 85, min = 111, max = 20333 }
 
 [helius]
 enabled = false
 process_delay = 300
-priority_fee_lamports = { from = 1111, to = 3333 }
-tip_lamports = { from = 1111, to = 3333 }
+priority_fee_lamports = { from = 111, to = 3333 }
+tip_lamports = { from = 200_000, to = 30_000_000 }
+dynamic_priority_fee = { enable = true, min_percentile = 10, max_percentile = 85, min = 111, max = 8333 }
+dynamic_tip = { enable = true, min_percentile = 10, max_percentile = 85, min = 200_000, max = 100_000_333 }
 
 [helius_swqos]
 enabled = false
 process_delay = 300
-priority_fee_lamports = { from = 1111, to = 3333 }
-tip_lamports = { from = 1111, to = 3333 }
+priority_fee_lamports = { from = 100, to = 3333 }
+tip_lamports = { from = 5000, to = 5_000_333 }
+dynamic_priority_fee = { enable = true, min_percentile = 10, max_percentile = 85, min = 111, max = 6333 }
+dynamic_tip = { enable = true, min_percentile = 10, max_percentile = 85, min = 5111, max = 10_000_333 }
 
 [temporal]
 enabled = false
 uuid = ""
 process_delay = 300
 priority_fee_lamports = { from = 1111, to = 3333 }
-tip_lamports = { from = 1111, to = 3333 }
+tip_lamports = { from = 1_000_000, to = 20_000_333 }
+dynamic_priority_fee = { enable = true, min_percentile = 10, max_percentile = 85, min = 111, max = 6333 }
+dynamic_tip = { enable = true, min_percentile = 10, max_percentile = 85, min = 1_000_011, max = 30_000_333 }
 
 [falcon]
 enabled = false
 uuid = ""
 process_delay = 300
-priority_fee_lamports = { from = 1111, to = 3333 }
-tip_lamports = { from = 1111, to = 3333 }
+priority_fee_lamports = { from = 111, to = 3333 }
+tip_lamports = { from = 1_000_000, to = 10_000_333 }
+dynamic_priority_fee = { enable = true, min_percentile = 10, max_percentile = 85, min = 111, max = 6333 }
+dynamic_tip = { enable = true, min_percentile = 10, max_percentile = 85, min = 1_000_011, max = 30_000_333 }
 
 [circular]
 enabled = false
 api-key = ""
 endpoint = "https://fast.circular.fi/transactions"
 process_delay = 300
-priority_fee_lamports = { from = 1111, to = 3333 }
+priority_fee_lamports = { from = 111, to = 3333 }
 # Minimum tip_lamports.from is 100_000 lamports.
-tip_lamports = { from = 100_000, to = 333_333 }
+tip_lamports = { from = 1_000_000, to = 10_033_333 }
+dynamic_priority_fee = { enable = true, min_percentile = 10, max_percentile = 85, min = 111, max = 6333 }
+dynamic_tip = { enable = true, min_percentile = 10, max_percentile = 85, min = 1_000_011, max = 30_000_333 }
 
 [auto]
 enabled = true
@@ -108,10 +128,10 @@ force_two_mints = true
 
 [auto.filters]
 limit = 2
-min_tx_len = 20
+min_tx_len = 5
 duration = 60
 min_profit = 200_000_000
-min_profit_per_arb = 100000
+min_profit_per_arb = 10000000
 min_roi = 0.0
 min_volume_lamports = 0
 max_volume_lamports = 9_223_372_036_854_775_807
