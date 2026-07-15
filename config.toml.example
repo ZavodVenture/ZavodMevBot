@@ -125,6 +125,7 @@ dynamic_tip = { enable = true, min_percentile = 10, max_percentile = 85, min = 1
 enabled = true
 refresh_interval_in_secs = 10.0
 force_two_mints = true
+enable_three_hop = true
 
 [auto.filters]
 limit = 2
