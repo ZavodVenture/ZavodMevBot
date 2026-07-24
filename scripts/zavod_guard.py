@@ -481,6 +481,12 @@ def _shutdown_child(
             interrupted |= was_interrupted
         except ProcessLookupError:
             pass
+        except OSError:
+            return {
+                "exit_code": exit_code,
+                "group_absent": False,
+                "interrupted": interrupted,
+            }
         except GuardError:
             interrupted = True
             continue
@@ -543,9 +549,9 @@ def _verified_shutdown(child, **kwargs):
         cleanup, interrupted = _retry_keyboard_interrupt(
             lambda: _shutdown_child(child, **kwargs)
         )
-    except GuardError:
+    except (GuardError, OSError):
         return {
-            "exit_code": None,
+            "exit_code": getattr(child, "returncode", None),
             "group_absent": False,
             "interrupted": True,
         }
@@ -701,14 +707,21 @@ def run_guarded(config_path, timeout_seconds=DEFAULT_TIMEOUT_SECONDS, profile="d
     result = None
     finalization_interrupted = False
     pump_alive = False
+    pump_started = False
+    log_handle = None
+    cleanup = {
+        "exit_code": None,
+        "group_absent": True,
+        "interrupted": False,
+    }
     prior_sigterm = signal.getsignal(signal.SIGTERM)
 
     def interrupt_handler(signum, frame):
         raise KeyboardInterrupt
 
-    signal.signal(signal.SIGTERM, interrupt_handler)
-    log_handle = os.fdopen(fd, "w", buffering=1)
     try:
+        log_handle = os.fdopen(fd, "w", buffering=1)
+        signal.signal(signal.SIGTERM, interrupt_handler)
         child = subprocess.Popen(
             [str(root / "zavod-mev-bot-rust-version-cli"), "run"],
             cwd=root,
@@ -717,17 +730,29 @@ def run_guarded(config_path, timeout_seconds=DEFAULT_TIMEOUT_SECONDS, profile="d
             start_new_session=True,
         )
         pump = OutputPump(child.stdout, log_handle, config)
-        pump.start()
-        result = supervise(
-            child=child,
-            start_balance=start_balance,
-            balance_reader=lambda: get_balance_lamports(rpc_url, public_key),
-            monotonic=time.monotonic,
-            sleep=time.sleep,
-            output_error_event=pump.output_error_event,
-            timeout_seconds=timeout_seconds,
-            cleanup_child=False,
-        )
+        try:
+            pump.start()
+        except Exception:
+            pump.output_error_event.set()
+            result = {
+                "reason": "output_error",
+                "start_balance": start_balance,
+                "end_balance": start_balance,
+                "observed_loss": 0,
+                "child_exit_code": None,
+            }
+        else:
+            pump_started = True
+            result = supervise(
+                child=child,
+                start_balance=start_balance,
+                balance_reader=lambda: get_balance_lamports(rpc_url, public_key),
+                monotonic=time.monotonic,
+                sleep=time.sleep,
+                output_error_event=pump.output_error_event,
+                timeout_seconds=timeout_seconds,
+                cleanup_child=False,
+            )
     except KeyboardInterrupt:
         result = {
             "reason": "operator_signal",
@@ -742,7 +767,7 @@ def run_guarded(config_path, timeout_seconds=DEFAULT_TIMEOUT_SECONDS, profile="d
             if child is not None
             else {"exit_code": None, "group_absent": True, "interrupted": False}
         )
-        if pump is not None:
+        if pump_started:
             try:
                 _, interrupted = _retry_keyboard_interrupt(
                     lambda: pump.join(5)
@@ -767,9 +792,12 @@ def run_guarded(config_path, timeout_seconds=DEFAULT_TIMEOUT_SECONDS, profile="d
         try:
             if not pump_alive:
                 try:
-                    _, interrupted = _retry_keyboard_interrupt(
+                    close_log = (
                         log_handle.close
+                        if log_handle is not None
+                        else lambda: os.close(fd)
                     )
+                    _, interrupted = _retry_keyboard_interrupt(close_log)
                     finalization_interrupted |= interrupted
                 except GuardError:
                     finalization_interrupted = True
@@ -799,7 +827,10 @@ def run_guarded(config_path, timeout_seconds=DEFAULT_TIMEOUT_SECONDS, profile="d
         result["child_exit_code"] = cleanup["exit_code"]
     if not cleanup["group_absent"]:
         result["reason"] = "cleanup_failed"
-    elif pump is not None and (pump.output_error_event.is_set() or pump.is_alive()):
+    elif pump is not None and (
+        pump.output_error_event.is_set()
+        or (pump_started and pump.is_alive())
+    ):
         result["reason"] = "output_error"
     elif cleanup["interrupted"] or finalization_interrupted:
         result["reason"] = "operator_signal"

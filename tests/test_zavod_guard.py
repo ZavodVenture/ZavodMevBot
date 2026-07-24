@@ -643,6 +643,39 @@ class HardenedCleanupTests(unittest.TestCase):
         self.assertEqual(shutdown.call_count, 2)
         self.assertEqual(result["reason"], "operator_signal")
 
+    def test_signal_delivery_oserror_returns_failed_cleanup(self):
+        child = Mock(pid=123, returncode=None)
+        child.poll.return_value = None
+        result = zavod_guard._shutdown_child(
+            child,
+            killpg=Mock(side_effect=PermissionError("not permitted")),
+            group_exists=lambda pgid: True,
+            signal_grace=((signal.SIGINT, 0),),
+        )
+        self.assertEqual(
+            result,
+            {
+                "exit_code": None,
+                "group_absent": False,
+                "interrupted": False,
+            },
+        )
+
+    def test_signal_delivery_oserror_makes_supervisor_cleanup_failed(self):
+        child = Mock(pid=123, returncode=2)
+        child.poll.return_value = 2
+        result = zavod_guard.supervise(
+            child=child,
+            start_balance=100,
+            balance_reader=lambda: 100,
+            monotonic=lambda: 0,
+            sleep=lambda _: None,
+            killpg=Mock(side_effect=OSError("signal failed")),
+            group_exists=lambda pgid: True,
+            signal_grace=((signal.SIGINT, 0),),
+        )
+        self.assertEqual(result["reason"], "cleanup_failed")
+
 
 class RunGuardedHardeningTests(unittest.TestCase):
     def run_with_mocks(self, pump=None, cleanup=None):
@@ -776,6 +809,42 @@ class RunGuardedHardeningTests(unittest.TestCase):
         result = self.run_with_mocks(pump=pump)
         self.assertEqual(pump.join.call_count, 2)
         self.assertEqual(result["reason"], "operator_signal")
+
+    def test_interrupt_during_pump_start_never_joins_unstarted_pump(self):
+        prior_sigterm = signal.getsignal(signal.SIGTERM)
+        pump = Mock()
+        pump.output_error_event = threading.Event()
+        pump.start.side_effect = KeyboardInterrupt()
+        pump.join.side_effect = RuntimeError(
+            "cannot join thread before it is started"
+        )
+        restored_sigterm = None
+        try:
+            result = self.run_with_mocks(pump=pump)
+            restored_sigterm = signal.getsignal(signal.SIGTERM)
+        finally:
+            signal.signal(signal.SIGTERM, prior_sigterm)
+        self.assertEqual(result["reason"], "operator_signal")
+        pump.join.assert_not_called()
+        self.assertIs(restored_sigterm, prior_sigterm)
+
+    def test_output_error_during_pump_start_restores_handler(self):
+        prior_sigterm = signal.getsignal(signal.SIGTERM)
+        pump = Mock()
+        pump.output_error_event = threading.Event()
+        pump.start.side_effect = OSError("thread start failed")
+        pump.join.side_effect = RuntimeError(
+            "cannot join thread before it is started"
+        )
+        restored_sigterm = None
+        try:
+            result = self.run_with_mocks(pump=pump)
+            restored_sigterm = signal.getsignal(signal.SIGTERM)
+        finally:
+            signal.signal(signal.SIGTERM, prior_sigterm)
+        self.assertEqual(result["reason"], "output_error")
+        pump.join.assert_not_called()
+        self.assertIs(restored_sigterm, prior_sigterm)
 
 
 class RunGuardedWrapperTests(unittest.TestCase):
