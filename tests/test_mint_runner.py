@@ -1,4 +1,5 @@
 import contextlib
+import copy
 import io
 import json
 import shutil
@@ -575,7 +576,7 @@ class FinalizationTests(MintRunnerTestCase):
 
     def write_guard_result(self, prepared, content=None):
         log = self.root / "logs" / "run.log"
-        log.parent.mkdir()
+        log.parent.mkdir(exist_ok=True)
         log.write_text("Payer WSOL account exists\n")
         log.chmod(0o600)
         guard_result = prepared.result_dir / "guard-result.txt"
@@ -589,6 +590,47 @@ class FinalizationTests(MintRunnerTestCase):
         )
         guard_result.chmod(0o600)
         return log
+
+    @staticmethod
+    def target_transaction(
+        mint=TARGET_MINT,
+        fee=1,
+        pre_balance=10,
+        post_balance=9,
+        token_amount="1",
+    ):
+        return {
+            "meta": {
+                "err": None,
+                "fee": fee,
+                "preBalances": [pre_balance, 0],
+                "postBalances": [post_balance, 0],
+                "preTokenBalances": [
+                    {
+                        "owner": "wallet",
+                        "mint": mint,
+                        "uiTokenAmount": {"amount": token_amount},
+                    }
+                ],
+                "postTokenBalances": [
+                    {
+                        "owner": "wallet",
+                        "mint": mint,
+                        "uiTokenAmount": {"amount": token_amount},
+                    }
+                ],
+                "innerInstructions": [],
+            },
+            "transaction": {
+                "message": {
+                    "accountKeys": [
+                        {"pubkey": "wallet"},
+                        {"pubkey": mint},
+                    ],
+                    "instructions": [],
+                }
+            },
+        }
 
     def test_log_aggregation_counts_only_fixed_categories(self):
         log = self.root / "log.txt"
@@ -646,8 +688,8 @@ class FinalizationTests(MintRunnerTestCase):
                     "meta": {
                         "err": None,
                         "fee": 1,
-                        "preBalances": [1],
-                        "postBalances": [1],
+                        "preBalances": [1, 0],
+                        "postBalances": [1, 0],
                         "preTokenBalances": [],
                         "postTokenBalances": [],
                     },
@@ -788,8 +830,8 @@ class FinalizationTests(MintRunnerTestCase):
                 "meta": {
                     "err": {"InstructionError": [0, "failed"]},
                     "fee": 7000,
-                    "preBalances": [80000],
-                    "postBalances": [79000],
+                    "preBalances": [80000, 0],
+                    "postBalances": [79000, 0],
                     "preTokenBalances": [
                         token_balance("wallet", wsol_mint, 5),
                     ],
@@ -822,8 +864,8 @@ class FinalizationTests(MintRunnerTestCase):
                 "meta": {
                     "err": None,
                     "fee": 999999,
-                    "preBalances": [79000],
-                    "postBalances": [1],
+                    "preBalances": [79000, 0],
+                    "postBalances": [1, 0],
                     "preTokenBalances": [],
                     "postTokenBalances": [],
                 },
@@ -850,6 +892,12 @@ class FinalizationTests(MintRunnerTestCase):
                             "confirmationStatus": "finalized",
                         }
                         for signature in transactions
+                    ] + [
+                        {
+                            "signature": "older",
+                            "blockTime": 89,
+                            "confirmationStatus": "finalized",
+                        }
                     ]
                 }
             return {"result": transactions[payload["params"][0]]}
@@ -888,7 +936,12 @@ class FinalizationTests(MintRunnerTestCase):
                         {
                             "signature": "must-not-survive",
                             "blockTime": 100,
-                        }
+                        },
+                        {
+                            "signature": "older",
+                            "blockTime": 89,
+                            "confirmationStatus": "finalized",
+                        },
                     ]
                 }
             return {
@@ -959,6 +1012,309 @@ class FinalizationTests(MintRunnerTestCase):
         self.assertNotIn("signature", json.dumps(result).lower())
         self.assertNotIn("https://secret.invalid", json.dumps(result))
 
+    def test_chain_aggregation_paginates_past_newer_signatures(self):
+        calls = []
+        first_page = [
+            {
+                "signature": f"newer-{index}",
+                "blockTime": 200,
+                "confirmationStatus": "finalized",
+            }
+            for index in range(200)
+        ]
+
+        def transport(url, payload, timeout):
+            del url, timeout
+            calls.append(payload)
+            if payload["method"] == "getSignaturesForAddress":
+                before = payload["params"][1].get("before")
+                if before is None:
+                    return {"result": first_page}
+                if before == "newer-199":
+                    return {
+                        "result": [
+                            {
+                                "signature": "in-window",
+                                "blockTime": 100,
+                                "confirmationStatus": "finalized",
+                            },
+                            {
+                                "signature": "older",
+                                "blockTime": 89,
+                                "confirmationStatus": "finalized",
+                            },
+                        ]
+                    }
+                self.fail(f"unexpected pagination cursor: {before}")
+            return {"result": self.target_transaction()}
+
+        result = mint_runner.aggregate_chain(
+            {"rpc": {"url": "unused"}},
+            TARGET_MINT,
+            90,
+            110,
+            transport=transport,
+            pubkey_resolver=lambda config: "wallet",
+        )
+
+        signature_calls = [
+            call for call in calls
+            if call["method"] == "getSignaturesForAddress"
+        ]
+        transaction_calls = [
+            call for call in calls
+            if call["method"] == "getTransaction"
+        ]
+        self.assertEqual(len(signature_calls), 2)
+        self.assertNotIn("before", signature_calls[0]["params"][1])
+        self.assertEqual(
+            signature_calls[1]["params"][1]["before"],
+            "newer-199",
+        )
+        self.assertEqual(
+            [call["params"][0] for call in transaction_calls],
+            ["in-window"],
+        )
+        self.assertEqual(result["landed"], 1)
+
+    def test_chain_aggregation_deduplicates_signatures_across_pages(self):
+        transaction_signatures = []
+
+        def entry(signature):
+            return {
+                "signature": signature,
+                "blockTime": 100,
+                "confirmationStatus": "finalized",
+            }
+
+        def transport(url, payload, timeout):
+            del url, timeout
+            if payload["method"] == "getSignaturesForAddress":
+                before = payload["params"][1].get("before")
+                if before is None:
+                    return {"result": [entry("a"), entry("b")]}
+                if before == "b":
+                    return {"result": [entry("a"), entry("c")]}
+                if before == "c":
+                    return {"result": []}
+                self.fail(f"unexpected pagination cursor: {before}")
+            transaction_signatures.append(payload["params"][0])
+            return {"result": self.target_transaction()}
+
+        result = mint_runner.aggregate_chain(
+            {"rpc": {"url": "unused"}},
+            TARGET_MINT,
+            90,
+            110,
+            transport=transport,
+            pubkey_resolver=lambda config: "wallet",
+        )
+
+        self.assertEqual(transaction_signatures, ["a", "b", "c"])
+        self.assertEqual(result["landed"], 3)
+
+    def test_chain_aggregation_rejects_rpc_errors_and_repeated_cursor(self):
+        protected = "protected-rpc-detail"
+
+        def rpc_error_transport(url, payload, timeout):
+            del url, payload, timeout
+            return {"error": {"message": protected}}
+
+        with self.assertRaises(mint_runner.RunnerError) as raised:
+            mint_runner.aggregate_chain(
+                {"rpc": {"url": "unused"}},
+                TARGET_MINT,
+                90,
+                110,
+                transport=rpc_error_transport,
+                pubkey_resolver=lambda config: "wallet",
+            )
+        self.assertNotIn(protected, str(raised.exception))
+
+        calls = 0
+
+        def repeated_cursor_transport(url, payload, timeout):
+            nonlocal calls
+            del url, timeout
+            calls += 1
+            self.assertEqual(payload["method"], "getSignaturesForAddress")
+            return {
+                "result": [
+                    {
+                        "signature": "same-cursor",
+                        "blockTime": 100,
+                        "confirmationStatus": "finalized",
+                    }
+                ]
+            }
+
+        with self.assertRaises(mint_runner.RunnerError):
+            mint_runner.aggregate_chain(
+                {"rpc": {"url": "unused"}},
+                TARGET_MINT,
+                90,
+                110,
+                transport=repeated_cursor_transport,
+                pubkey_resolver=lambda config: "wallet",
+            )
+        self.assertEqual(calls, 2)
+
+    def test_chain_aggregation_rejects_malformed_transactions_without_partials(self):
+        protected = "unsupported-version-protected-detail"
+        malformed_bodies = {
+            "rpc-error": {"error": {"message": protected}},
+            "null-result": {"result": None},
+            "non-dict-result": {"result": []},
+            "missing-meta": {
+                "result": {
+                    "transaction": self.target_transaction()["transaction"],
+                }
+            },
+            "missing-message": {
+                "result": {
+                    "meta": self.target_transaction()["meta"],
+                    "transaction": {},
+                }
+            },
+            "invalid-account-keys": {
+                "result": {
+                    "meta": self.target_transaction()["meta"],
+                    "transaction": {
+                        "message": {
+                            "accountKeys": "wallet",
+                            "instructions": [],
+                        }
+                    },
+                }
+            },
+        }
+
+        for name, malformed_body in malformed_bodies.items():
+            with self.subTest(name=name):
+                transaction_calls = 0
+
+                def transport(url, payload, timeout):
+                    nonlocal transaction_calls
+                    del url, timeout
+                    if payload["method"] == "getSignaturesForAddress":
+                        return {
+                            "result": [
+                                {
+                                    "signature": "valid-first",
+                                    "blockTime": 100,
+                                    "confirmationStatus": "finalized",
+                                },
+                                {
+                                    "signature": "malformed-second",
+                                    "blockTime": 100,
+                                    "confirmationStatus": "finalized",
+                                },
+                                {
+                                    "signature": "older",
+                                    "blockTime": 89,
+                                    "confirmationStatus": "finalized",
+                                },
+                            ]
+                        }
+                    transaction_calls += 1
+                    if payload["params"][0] == "valid-first":
+                        return {"result": self.target_transaction()}
+                    return malformed_body
+
+                with self.assertRaises(mint_runner.RunnerError) as raised:
+                    mint_runner.aggregate_chain(
+                        {"rpc": {"url": "unused"}},
+                        TARGET_MINT,
+                        90,
+                        110,
+                        transport=transport,
+                        pubkey_resolver=lambda config: "wallet",
+                    )
+                self.assertNotIn(protected, str(raised.exception))
+                self.assertEqual(transaction_calls, 2)
+
+    def test_chain_aggregation_rejects_invalid_required_numeric_fields(self):
+        base = self.target_transaction()
+        cases = {}
+        for value in (True, "1", -1):
+            transaction = copy.deepcopy(base)
+            transaction["meta"]["fee"] = value
+            cases[f"fee-{value!r}"] = transaction
+        for value in (True, "10", -1):
+            transaction = copy.deepcopy(base)
+            transaction["meta"]["preBalances"][0] = value
+            cases[f"balance-{value!r}"] = transaction
+        for value in (True, 1, "-1", "not-an-integer"):
+            transaction = copy.deepcopy(base)
+            transaction["meta"]["preTokenBalances"][0]["uiTokenAmount"][
+                "amount"
+            ] = value
+            cases[f"token-{value!r}"] = transaction
+
+        for name, transaction in cases.items():
+            with self.subTest(name=name):
+                def transport(url, payload, timeout):
+                    del url, timeout
+                    if payload["method"] == "getSignaturesForAddress":
+                        return {
+                            "result": [
+                                {
+                                    "signature": "malformed",
+                                    "blockTime": 100,
+                                    "confirmationStatus": "finalized",
+                                },
+                                {
+                                    "signature": "older",
+                                    "blockTime": 89,
+                                    "confirmationStatus": "finalized",
+                                },
+                            ]
+                        }
+                    return {"result": transaction}
+
+                with self.assertRaises(mint_runner.RunnerError):
+                    mint_runner.aggregate_chain(
+                        {"rpc": {"url": "unused"}},
+                        TARGET_MINT,
+                        90,
+                        110,
+                        transport=transport,
+                        pubkey_resolver=lambda config: "wallet",
+                    )
+
+    def test_chain_aggregation_rejects_balance_vector_length_mismatch(self):
+        transaction = self.target_transaction()
+        transaction["meta"]["postBalances"] = [9]
+
+        def transport(url, payload, timeout):
+            del url, timeout
+            if payload["method"] == "getSignaturesForAddress":
+                return {
+                    "result": [
+                        {
+                            "signature": "malformed",
+                            "blockTime": 100,
+                            "confirmationStatus": "finalized",
+                        },
+                        {
+                            "signature": "older",
+                            "blockTime": 89,
+                            "confirmationStatus": "finalized",
+                        },
+                    ]
+                }
+            return {"result": transaction}
+
+        with self.assertRaises(mint_runner.RunnerError):
+            mint_runner.aggregate_chain(
+                {"rpc": {"url": "unused"}},
+                TARGET_MINT,
+                90,
+                110,
+                transport=transport,
+                pubkey_resolver=lambda config: "wallet",
+            )
+
     def test_finalize_copies_generated_artifacts_then_restores(self):
         (self.root / "hot_tokens.json").write_bytes(b'{"original": true}\n')
         (self.root / "routing.json").write_bytes(b"original routing\n")
@@ -1013,6 +1369,371 @@ class FinalizationTests(MintRunnerTestCase):
         )
         self.assertEqual(len(state_backups), 1)
         self.assertEqual(stat.S_IMODE(state_backups[0].stat().st_mode), 0o600)
+
+    def test_finalize_rejects_stale_marker_without_restoring(self):
+        prepared = self.prepare()
+        self.write_guard_result(prepared)
+        marker = self.root / "state" / ".mint-run-active"
+        marker.write_text("20260724T183001Z\n")
+        marker.chmod(0o600)
+        temporary_tokens = (self.root / "tokens.toml").read_bytes()
+
+        with self.assertRaises(mint_runner.RunnerError):
+            mint_runner.finalize_run(
+                self.root,
+                prepared.run_id,
+                guard_exit=0,
+                started_at=100,
+                ended_at=400,
+                chain_aggregator=lambda *args, **kwargs: self.zero_chain(),
+            )
+
+        self.assertEqual((self.root / "tokens.toml").read_bytes(), temporary_tokens)
+        self.assertEqual(marker.read_text(), "20260724T183001Z\n")
+        self.assertFalse((prepared.backup_dir / "restored").exists())
+
+    def test_finalize_rejects_marker_symlink_without_restoring(self):
+        prepared = self.prepare()
+        self.write_guard_result(prepared)
+        marker = self.root / "state" / ".mint-run-active"
+        marker.unlink()
+        outside = self.root / "outside-marker"
+        outside.write_text(f"{prepared.run_id}\n")
+        outside.chmod(0o600)
+        marker.symlink_to(outside)
+        temporary_tokens = (self.root / "tokens.toml").read_bytes()
+
+        with self.assertRaises(mint_runner.RunnerError):
+            mint_runner.finalize_run(
+                self.root,
+                prepared.run_id,
+                guard_exit=0,
+                started_at=100,
+                ended_at=400,
+                chain_aggregator=lambda *args, **kwargs: self.zero_chain(),
+            )
+
+        self.assertEqual((self.root / "tokens.toml").read_bytes(), temporary_tokens)
+        self.assertFalse((prepared.backup_dir / "restored").exists())
+
+    def test_finalize_rejects_result_directory_mode_without_restoring(self):
+        prepared = self.prepare()
+        self.write_guard_result(prepared)
+        prepared.result_dir.chmod(0o755)
+        temporary_tokens = (self.root / "tokens.toml").read_bytes()
+
+        with self.assertRaises(mint_runner.RunnerError):
+            mint_runner.finalize_run(
+                self.root,
+                prepared.run_id,
+                guard_exit=0,
+                started_at=100,
+                ended_at=400,
+                chain_aggregator=lambda *args, **kwargs: self.zero_chain(),
+            )
+
+        self.assertEqual((self.root / "tokens.toml").read_bytes(), temporary_tokens)
+        self.assertTrue((self.root / "state" / ".mint-run-active").exists())
+        self.assertFalse((prepared.backup_dir / "restored").exists())
+
+    def test_finalize_rejects_result_directory_symlink_without_restoring(self):
+        prepared = self.prepare()
+        prepared.result_dir.rmdir()
+        outside = self.root / "outside-results"
+        outside.mkdir(mode=0o700)
+        prepared.result_dir.symlink_to(outside, target_is_directory=True)
+        temporary_tokens = (self.root / "tokens.toml").read_bytes()
+
+        with self.assertRaises(mint_runner.RunnerError):
+            mint_runner.finalize_run(
+                self.root,
+                prepared.run_id,
+                guard_exit=0,
+                started_at=100,
+                ended_at=400,
+                chain_aggregator=lambda *args, **kwargs: self.zero_chain(),
+            )
+
+        self.assertEqual((self.root / "tokens.toml").read_bytes(), temporary_tokens)
+        self.assertTrue((self.root / "state" / ".mint-run-active").exists())
+        self.assertFalse((prepared.backup_dir / "restored").exists())
+
+    def test_cli_invalid_log_mode_restores_and_records_generic_failure(self):
+        prepared = self.prepare()
+        log = self.write_guard_result(prepared)
+        log.chmod(0o644)
+        stderr = io.StringIO()
+
+        with contextlib.redirect_stderr(stderr):
+            status = mint_runner.main(
+                [
+                    "--root",
+                    str(self.root),
+                    "finalize",
+                    "--run-id",
+                    prepared.run_id,
+                    "--guard-exit",
+                    "0",
+                    "--started-at",
+                    "100",
+                    "--ended-at",
+                    "400",
+                ]
+            )
+
+        self.assertEqual(status, 1)
+        self.assertEqual(stderr.getvalue(), "status=failed\nerror=operation failed\n")
+        self.assertEqual((self.root / "tokens.toml").read_bytes(), self.original_tokens)
+        self.assertFalse((self.root / "state" / ".mint-run-active").exists())
+        for name in ("CURRENT.md", "EXPERIMENTS.md"):
+            self.assertIn(
+                "single-mint finalization failed",
+                (self.root / "state" / name).read_text(),
+            )
+
+    def test_finalize_rejects_guard_result_symlink_and_mode_and_restores(self):
+        cases = ("symlink", "mode")
+        for index, case in enumerate(cases, start=20):
+            with self.subTest(case=case):
+                prepared = self.prepare(
+                    now=lambda second=index: datetime(
+                        2026,
+                        7,
+                        24,
+                        18,
+                        30,
+                        second,
+                        tzinfo=timezone.utc,
+                    )
+                )
+                self.write_guard_result(prepared)
+                guard_result = prepared.result_dir / "guard-result.txt"
+                if case == "symlink":
+                    outside = self.root / f"outside-guard-{index}"
+                    outside.write_text(
+                        "reason=timeout\n"
+                        "duration_seconds=1\n"
+                        "log_path=logs/run.log\n"
+                    )
+                    outside.chmod(0o600)
+                    guard_result.unlink()
+                    guard_result.symlink_to(outside)
+                else:
+                    guard_result.chmod(0o644)
+
+                with self.assertRaises(mint_runner.RunnerError):
+                    mint_runner.finalize_run(
+                        self.root,
+                        prepared.run_id,
+                        guard_exit=0,
+                        started_at=100,
+                        ended_at=400,
+                        chain_aggregator=lambda *args, **kwargs: self.zero_chain(),
+                    )
+
+                self.assertEqual(
+                    (self.root / "tokens.toml").read_bytes(),
+                    self.original_tokens,
+                )
+                self.assertFalse(
+                    (self.root / "state" / ".mint-run-active").exists()
+                )
+
+    def test_finalize_rejects_log_symlink_and_restores(self):
+        prepared = self.prepare()
+        log = self.write_guard_result(prepared)
+        outside = self.root / "outside-log"
+        outside.write_text("Transaction sent successfully\n")
+        outside.chmod(0o600)
+        log.unlink()
+        log.symlink_to(outside)
+
+        with self.assertRaises(mint_runner.RunnerError):
+            mint_runner.finalize_run(
+                self.root,
+                prepared.run_id,
+                guard_exit=0,
+                started_at=100,
+                ended_at=400,
+                chain_aggregator=lambda *args, **kwargs: self.zero_chain(),
+            )
+
+        self.assertEqual((self.root / "tokens.toml").read_bytes(), self.original_tokens)
+        self.assertFalse((self.root / "state" / ".mint-run-active").exists())
+
+    def test_finalize_rejects_artifact_symlink_and_restores(self):
+        prepared = self.prepare()
+        self.write_guard_result(prepared)
+        outside = self.root / "outside-artifact"
+        outside.write_bytes(b"protected artifact")
+        generated = self.root / "hot_tokens.json"
+        generated.symlink_to(outside)
+
+        with self.assertRaises(mint_runner.RunnerError):
+            mint_runner.finalize_run(
+                self.root,
+                prepared.run_id,
+                guard_exit=0,
+                started_at=100,
+                ended_at=400,
+                chain_aggregator=lambda *args, **kwargs: self.zero_chain(),
+            )
+
+        self.assertEqual(outside.read_bytes(), b"protected artifact")
+        self.assertEqual((self.root / "tokens.toml").read_bytes(), self.original_tokens)
+        self.assertFalse((self.root / "state" / ".mint-run-active").exists())
+        self.assertFalse(
+            (prepared.result_dir / "generated-hot_tokens.json").exists()
+        )
+
+    def test_finalize_rejects_dangling_artifact_symlink_and_restores(self):
+        prepared = self.prepare()
+        self.write_guard_result(prepared)
+        generated = self.root / "hot_tokens.json"
+        generated.symlink_to(self.root / "missing-artifact-target")
+
+        with self.assertRaises(mint_runner.RunnerError):
+            mint_runner.finalize_run(
+                self.root,
+                prepared.run_id,
+                guard_exit=0,
+                started_at=100,
+                ended_at=400,
+                chain_aggregator=lambda *args, **kwargs: self.zero_chain(),
+            )
+
+        self.assertFalse(generated.is_symlink())
+        self.assertFalse(generated.exists())
+        self.assertEqual((self.root / "tokens.toml").read_bytes(), self.original_tokens)
+        self.assertFalse((self.root / "state" / ".mint-run-active").exists())
+
+    def test_finalize_rejects_symlink_destination_without_overwriting_target(self):
+        prepared = self.prepare()
+        self.write_guard_result(prepared)
+        (self.root / "hot_tokens.json").write_bytes(b"generated artifact")
+        outside = self.root / "outside-destination"
+        outside.write_bytes(b"must stay unchanged")
+        destination = prepared.result_dir / "generated-hot_tokens.json"
+        destination.symlink_to(outside)
+
+        with self.assertRaises(mint_runner.RunnerError):
+            mint_runner.finalize_run(
+                self.root,
+                prepared.run_id,
+                guard_exit=0,
+                started_at=100,
+                ended_at=400,
+                chain_aggregator=lambda *args, **kwargs: self.zero_chain(),
+            )
+
+        self.assertEqual(outside.read_bytes(), b"must stay unchanged")
+        self.assertEqual((self.root / "tokens.toml").read_bytes(), self.original_tokens)
+        self.assertFalse((self.root / "state" / ".mint-run-active").exists())
+
+    def test_finalize_rejects_invalid_existing_result_file_mode_and_restores(self):
+        prepared = self.prepare()
+        self.write_guard_result(prepared)
+        manifest = prepared.result_dir / "manifest.json"
+        manifest.write_text("{}\n")
+        manifest.chmod(0o644)
+
+        with self.assertRaises(mint_runner.RunnerError):
+            mint_runner.finalize_run(
+                self.root,
+                prepared.run_id,
+                guard_exit=0,
+                started_at=100,
+                ended_at=400,
+                chain_aggregator=lambda *args, **kwargs: self.zero_chain(),
+            )
+
+        self.assertEqual((self.root / "tokens.toml").read_bytes(), self.original_tokens)
+        self.assertFalse((self.root / "state" / ".mint-run-active").exists())
+        self.assertEqual(stat.S_IMODE(manifest.stat().st_mode), 0o644)
+
+    def test_finalize_rejects_invalid_duration_and_restores(self):
+        values = ("nan", "inf", "-0.1")
+        for index, value in enumerate(values, start=10):
+            with self.subTest(value=value):
+                prepared = self.prepare(
+                    now=lambda second=index: datetime(
+                        2026,
+                        7,
+                        24,
+                        18,
+                        30,
+                        second,
+                        tzinfo=timezone.utc,
+                    )
+                )
+                self.write_guard_result(
+                    prepared,
+                    content=(
+                        "reason=timeout\n"
+                        f"duration_seconds={value}\n"
+                        "log_path=logs/run.log\n"
+                    ),
+                )
+
+                with self.assertRaises(mint_runner.RunnerError):
+                    mint_runner.finalize_run(
+                        self.root,
+                        prepared.run_id,
+                        guard_exit=0,
+                        started_at=100,
+                        ended_at=400,
+                        chain_aggregator=lambda *args, **kwargs: self.zero_chain(),
+                    )
+
+                self.assertEqual(
+                    (self.root / "tokens.toml").read_bytes(),
+                    self.original_tokens,
+                )
+                self.assertFalse(
+                    (self.root / "state" / ".mint-run-active").exists()
+                )
+
+    def test_finalize_rpc_failure_is_generic_and_restores_without_partial_totals(self):
+        prepared = self.prepare()
+        self.write_guard_result(prepared)
+        protected = "protected-unsupported-version-detail"
+
+        def transport(url, payload, timeout):
+            del url, timeout
+            if payload["method"] == "getSignaturesForAddress":
+                return {
+                    "result": [
+                        {
+                            "signature": "must-not-survive",
+                            "blockTime": 100,
+                            "confirmationStatus": "finalized",
+                        },
+                        {
+                            "signature": "older",
+                            "blockTime": 89,
+                            "confirmationStatus": "finalized",
+                        },
+                    ]
+                }
+            return {"error": {"message": protected}}
+
+        result = mint_runner.finalize_run(
+            self.root,
+            prepared.run_id,
+            guard_exit=0,
+            started_at=90,
+            ended_at=110,
+            transport=transport,
+            pubkey_resolver=lambda config: "wallet",
+        )
+
+        rendered = (prepared.result_dir / "manifest.json").read_text()
+        self.assertEqual(result["aggregation_status"], "failed")
+        self.assertEqual(result["chain"], self.zero_chain())
+        self.assertNotIn(protected, rendered)
+        self.assertNotIn("must-not-survive", rendered)
+        self.assertEqual((self.root / "tokens.toml").read_bytes(), self.original_tokens)
+        self.assertFalse((self.root / "state" / ".mint-run-active").exists())
 
     def test_finalize_records_only_generic_aggregation_failure(self):
         prepared = self.prepare()

@@ -2,6 +2,7 @@
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -199,6 +200,64 @@ def _safe_copy(source, destination):
 
 def _atomic_copy(source, destination):
     _atomic_write(destination, Path(source).read_bytes())
+
+
+def _lstat_owned_path(path, expected_type, mode=None):
+    path = Path(path)
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        raise RunnerError("private run paths are invalid") from exc
+    type_matches = (
+        stat.S_ISDIR(info.st_mode)
+        if expected_type == "directory"
+        else stat.S_ISREG(info.st_mode)
+    )
+    if (
+        not type_matches
+        or info.st_uid != os.getuid()
+        or (mode is not None and stat.S_IMODE(info.st_mode) != mode)
+    ):
+        raise RunnerError("private run paths are invalid")
+    return info
+
+
+def _path_exists_no_follow(path):
+    try:
+        Path(path).lstat()
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise RunnerError("private run paths are invalid") from exc
+    return True
+
+
+def _read_owned_file_no_follow(path, mode=None):
+    path = Path(path)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise RunnerError("private run paths are invalid") from exc
+    try:
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.getuid()
+            or (mode is not None and stat.S_IMODE(info.st_mode) != mode)
+        ):
+            raise RunnerError("private run paths are invalid")
+        chunks = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return b"".join(chunks)
+    except OSError as exc:
+        raise RunnerError("private run paths are invalid") from exc
+    finally:
+        os.close(descriptor)
 
 
 def _integrity_record(path):
@@ -463,7 +522,7 @@ def restore_run(root, run_id):
         backup = backup_dir / name
         if existed:
             _atomic_copy(backup, current)
-        elif not existed and current.exists():
+        elif not existed and _path_exists_no_follow(current):
             current.unlink()
     active_marker = root / "state" / ".mint-run-active"
     if active_marker.exists() and active_marker.read_text().strip() == run_id:
@@ -482,7 +541,7 @@ def restore_active(root):
 
 
 def aggregate_log(log_path):
-    text = Path(log_path).read_text(errors="replace")
+    text = _read_owned_file_no_follow(log_path).decode(errors="replace")
     return {
         name: len(pattern.findall(text))
         for name, pattern in LOG_PATTERNS.items()
@@ -502,7 +561,8 @@ def _parse_guard_result(path):
         "log_path",
     }
     result = {}
-    for line in Path(path).read_text(errors="replace").splitlines():
+    text = _read_owned_file_no_follow(path, mode=0o600).decode(errors="replace")
+    for line in text.splitlines():
         key, separator, value = line.partition("=")
         if separator and key in allowed:
             result[key] = value
@@ -521,8 +581,160 @@ def _sanitize_chain_summary(summary):
         value = summary.get(name)
         if type(value) is not int:
             raise ValueError("invalid chain summary")
+        if name not in ("sol_delta_lamports", "wsol_delta_raw") and value < 0:
+            raise ValueError("invalid chain summary")
         sanitized[name] = value
     return sanitized
+
+
+def _rpc_result(body, expected_type):
+    if (
+        not isinstance(body, dict)
+        or body.get("error") is not None
+        or "result" not in body
+        or not isinstance(body["result"], expected_type)
+    ):
+        raise RunnerError("chain aggregation failed")
+    return body["result"]
+
+
+def _require_nonnegative_integer(value):
+    if type(value) is not int or value < 0:
+        raise RunnerError("chain aggregation failed")
+    return value
+
+
+def _parse_token_balances(meta, field):
+    balances = meta.get(field)
+    if not isinstance(balances, list):
+        raise RunnerError("chain aggregation failed")
+    parsed = []
+    for balance in balances:
+        if not isinstance(balance, dict):
+            raise RunnerError("chain aggregation failed")
+        owner = balance.get("owner")
+        mint = balance.get("mint")
+        ui_amount = balance.get("uiTokenAmount")
+        if (
+            (owner is not None and not isinstance(owner, str))
+            or not isinstance(mint, str)
+            or not isinstance(ui_amount, dict)
+        ):
+            raise RunnerError("chain aggregation failed")
+        amount = ui_amount.get("amount")
+        if not isinstance(amount, str) or re.fullmatch(r"[0-9]+", amount) is None:
+            raise RunnerError("chain aggregation failed")
+        parsed.append((owner, mint, int(amount)))
+    return parsed
+
+
+def _parse_account_pubkeys(message):
+    account_keys = message.get("accountKeys")
+    if not isinstance(account_keys, list):
+        raise RunnerError("chain aggregation failed")
+    pubkeys = []
+    for item in account_keys:
+        pubkey = item.get("pubkey") if isinstance(item, dict) else item
+        if not isinstance(pubkey, str) or not pubkey:
+            raise RunnerError("chain aggregation failed")
+        pubkeys.append(pubkey)
+    return pubkeys
+
+
+def _parse_instructions(meta, message):
+    instructions = message.get("instructions")
+    if (
+        not isinstance(instructions, list)
+        or any(not isinstance(item, dict) for item in instructions)
+    ):
+        raise RunnerError("chain aggregation failed")
+    parsed = list(instructions)
+    inner_groups = meta.get("innerInstructions")
+    if inner_groups is None:
+        inner_groups = []
+    if not isinstance(inner_groups, list):
+        raise RunnerError("chain aggregation failed")
+    for group in inner_groups:
+        if not isinstance(group, dict):
+            raise RunnerError("chain aggregation failed")
+        inner = group.get("instructions")
+        if (
+            not isinstance(inner, list)
+            or any(not isinstance(item, dict) for item in inner)
+        ):
+            raise RunnerError("chain aggregation failed")
+        parsed.extend(inner)
+    return parsed
+
+
+def _signature_entries(caller, rpc_url, wallet, started_at, ended_at):
+    entries = []
+    seen_signatures = set()
+    seen_cursors = set()
+    before = None
+    while True:
+        options = {"limit": 200, "commitment": "finalized"}
+        if before is not None:
+            options["before"] = before
+        page = _rpc_result(
+            caller(
+                rpc_url,
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "getSignaturesForAddress",
+                    "params": [wallet, options],
+                },
+                10,
+            ),
+            list,
+        )
+        if not page:
+            break
+        oldest_usable = None
+        for entry in page:
+            if not isinstance(entry, dict):
+                raise RunnerError("chain aggregation failed")
+            signature = entry.get("signature")
+            block_time = entry.get("blockTime")
+            confirmation = entry.get("confirmationStatus")
+            if (
+                not isinstance(signature, str)
+                or not signature
+                or (
+                    block_time is not None
+                    and (
+                        type(block_time) is not int
+                        or block_time < 0
+                    )
+                )
+                or (
+                    confirmation is not None
+                    and not isinstance(confirmation, str)
+                )
+            ):
+                raise RunnerError("chain aggregation failed")
+            is_finalized = confirmation in (None, "finalized")
+            if is_finalized and block_time is not None:
+                oldest_usable = (
+                    block_time
+                    if oldest_usable is None
+                    else min(oldest_usable, block_time)
+                )
+                if (
+                    started_at <= block_time <= ended_at
+                    and signature not in seen_signatures
+                ):
+                    entries.append(signature)
+            seen_signatures.add(signature)
+        cursor = page[-1]["signature"]
+        if cursor in seen_cursors:
+            raise RunnerError("chain aggregation failed")
+        seen_cursors.add(cursor)
+        before = cursor
+        if oldest_usable is not None and oldest_usable < started_at:
+            break
+    return entries
 
 
 def aggregate_chain(
@@ -542,101 +754,129 @@ def aggregate_chain(
         if pubkey_resolver
         else zavod_guard.wallet_pubkey(config["wallet"]["private_key"])
     )
-    signatures_body = caller(
-        rpc_url,
-        {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "getSignaturesForAddress",
-            "params": [wallet, {"limit": 200, "commitment": "finalized"}],
-        },
-        10,
-    )
-    entries = [
-        entry
-        for entry in signatures_body.get("result", [])
-        if isinstance(entry.get("blockTime"), int)
-        and started_at <= entry["blockTime"] <= ended_at
-        and entry.get("confirmationStatus") in (None, "finalized")
-    ]
-    summary = _empty_chain_summary()
-    wsol_mint = "So11111111111111111111111111111111111111112"
-    for entry in entries:
-        body = caller(
+    try:
+        signatures = _signature_entries(
+            caller,
             rpc_url,
-            {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "getTransaction",
-                "params": [
-                    entry["signature"],
+            wallet,
+            started_at,
+            ended_at,
+        )
+        summary = _empty_chain_summary()
+        wsol_mint = "So11111111111111111111111111111111111111112"
+        for signature in signatures:
+            transaction = _rpc_result(
+                caller(
+                    rpc_url,
                     {
-                        "encoding": "jsonParsed",
-                        "commitment": "finalized",
-                        "maxSupportedTransactionVersion": 0,
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "getTransaction",
+                        "params": [
+                            signature,
+                            {
+                                "encoding": "jsonParsed",
+                                "commitment": "finalized",
+                                "maxSupportedTransactionVersion": 0,
+                            },
+                        ],
                     },
-                ],
-            },
-            10,
-        )
-        transaction = body.get("result")
-        if not transaction:
-            continue
-        meta = transaction.get("meta") or {}
-        token_balances = (
-            list(meta.get("preTokenBalances", []) or [])
-            + list(meta.get("postTokenBalances", []) or [])
-        )
-        account_keys = (
-            transaction.get("transaction", {})
-            .get("message", {})
-            .get("accountKeys", [])
-        )
-        account_pubkeys = [
-            item.get("pubkey") if isinstance(item, dict) else item
-            for item in account_keys
-        ]
-        if mint not in account_pubkeys and not any(
-            balance.get("mint") == mint for balance in token_balances
-        ):
-            continue
-        summary["landed"] += 1
-        if meta.get("err") is None:
-            summary["successful"] += 1
-            message = transaction.get("transaction", {}).get("message", {})
-            instructions = list(message.get("instructions", []) or [])
-            for group in meta.get("innerInstructions", []) or []:
-                instructions.extend(group.get("instructions", []) or [])
-            for instruction in instructions:
-                if instruction.get("program") != "system":
-                    continue
-                parsed = instruction.get("parsed") or {}
-                info = parsed.get("info") or {}
-                if info.get("source") != wallet:
-                    continue
-                lamports = info.get("lamports")
-                if not isinstance(lamports, int) or lamports < 0:
-                    continue
-                if parsed.get("type") in ("createAccount", "createAccountWithSeed"):
-                    summary["rent_lamports"] += lamports
-                elif parsed.get("type") in ("transfer", "transferWithSeed"):
-                    summary["transfers_lamports"] += lamports
-        else:
-            summary["failed"] += 1
-        summary["fees_lamports"] += int(meta.get("fee") or 0)
-        if wallet in account_pubkeys:
-            index = account_pubkeys.index(wallet)
-            pre = meta.get("preBalances", [])
-            post = meta.get("postBalances", [])
-            if index < len(pre) and index < len(post):
-                summary["sol_delta_lamports"] += int(post[index]) - int(pre[index])
-        for field, sign in (("preTokenBalances", -1), ("postTokenBalances", 1)):
-            for balance in meta.get(field, []) or []:
-                if balance.get("owner") == wallet and balance.get("mint") == wsol_mint:
-                    amount = balance.get("uiTokenAmount", {}).get("amount", "0")
-                    if isinstance(amount, str) and amount.isdigit():
-                        summary["wsol_delta_raw"] += sign * int(amount)
-    return summary
+                    10,
+                ),
+                dict,
+            )
+            meta = transaction.get("meta")
+            transaction_body = transaction.get("transaction")
+            if not isinstance(meta, dict) or not isinstance(transaction_body, dict):
+                raise RunnerError("chain aggregation failed")
+            message = transaction_body.get("message")
+            if not isinstance(message, dict):
+                raise RunnerError("chain aggregation failed")
+            account_pubkeys = _parse_account_pubkeys(message)
+            pre_balances = meta.get("preBalances")
+            post_balances = meta.get("postBalances")
+            if (
+                not isinstance(pre_balances, list)
+                or not isinstance(post_balances, list)
+            ):
+                raise RunnerError("chain aggregation failed")
+            pre_balances = [
+                _require_nonnegative_integer(value)
+                for value in pre_balances
+            ]
+            post_balances = [
+                _require_nonnegative_integer(value)
+                for value in post_balances
+            ]
+            if (
+                len(pre_balances) != len(account_pubkeys)
+                or len(post_balances) != len(account_pubkeys)
+            ):
+                raise RunnerError("chain aggregation failed")
+            fee = _require_nonnegative_integer(meta.get("fee"))
+            pre_tokens = _parse_token_balances(meta, "preTokenBalances")
+            post_tokens = _parse_token_balances(meta, "postTokenBalances")
+            instructions = _parse_instructions(meta, message)
+            if mint not in account_pubkeys and not any(
+                token_mint == mint
+                for _owner, token_mint, _amount in pre_tokens + post_tokens
+            ):
+                continue
+            if wallet not in account_pubkeys:
+                raise RunnerError("chain aggregation failed")
+            wallet_index = account_pubkeys.index(wallet)
+            if (
+                wallet_index >= len(pre_balances)
+                or wallet_index >= len(post_balances)
+            ):
+                raise RunnerError("chain aggregation failed")
+
+            summary["landed"] += 1
+            if meta.get("err") is None:
+                summary["successful"] += 1
+                for instruction in instructions:
+                    if instruction.get("program") != "system":
+                        continue
+                    parsed = instruction.get("parsed")
+                    if not isinstance(parsed, dict):
+                        raise RunnerError("chain aggregation failed")
+                    info = parsed.get("info")
+                    instruction_type = parsed.get("type")
+                    if not isinstance(info, dict):
+                        raise RunnerError("chain aggregation failed")
+                    if instruction_type in (
+                        "createAccount",
+                        "createAccountWithSeed",
+                        "transfer",
+                        "transferWithSeed",
+                    ):
+                        lamports = _require_nonnegative_integer(
+                            info.get("lamports")
+                        )
+                        if info.get("source") != wallet:
+                            continue
+                        if instruction_type in (
+                            "createAccount",
+                            "createAccountWithSeed",
+                        ):
+                            summary["rent_lamports"] += lamports
+                        else:
+                            summary["transfers_lamports"] += lamports
+            else:
+                summary["failed"] += 1
+            summary["fees_lamports"] += fee
+            summary["sol_delta_lamports"] += (
+                post_balances[wallet_index] - pre_balances[wallet_index]
+            )
+            for balances, sign in ((pre_tokens, -1), (post_tokens, 1)):
+                for owner, token_mint, amount in balances:
+                    if owner == wallet and token_mint == wsol_mint:
+                        summary["wsol_delta_raw"] += sign * amount
+        return summary
+    except RunnerError:
+        raise
+    except Exception as exc:
+        raise RunnerError("chain aggregation failed") from exc
 
 
 def _record_state(root, heading, bullets):
@@ -704,6 +944,94 @@ def record_finalization_failure(root):
     )
 
 
+def _validate_result_directory(result_dir):
+    _lstat_owned_path(result_dir, "directory", mode=0o700)
+
+
+def _validate_finalization_context(root, run_id, backup_dir, result_dir):
+    _validate_result_directory(result_dir)
+    marker = root / "state" / ".mint-run-active"
+    _lstat_owned_path(marker, "file", mode=0o600)
+    expected_marker = f"{run_id}\n".encode()
+    if _read_owned_file_no_follow(marker, mode=0o600) != expected_marker:
+        raise RunnerError("private run paths are invalid")
+    if _path_exists_no_follow(backup_dir / "restored"):
+        raise RunnerError("private run paths are invalid")
+    _validate_recovery_data(backup_dir, run_id)
+    try:
+        metadata = json.loads(
+            _read_owned_file_no_follow(
+                backup_dir / "metadata.json",
+                mode=0o600,
+            )
+        )
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise RunnerError("private recovery data is invalid") from exc
+    return metadata
+
+
+def _validate_guard_result_path(result_dir):
+    _validate_result_directory(result_dir)
+    path = result_dir / "guard-result.txt"
+    if path.parent != result_dir:
+        raise RunnerError("private run paths are invalid")
+    _lstat_owned_path(path, "file", mode=0o600)
+    return path
+
+
+def _validate_log_path(root, value):
+    if not isinstance(value, str) or not value:
+        return None
+    relative = Path(value)
+    if (
+        relative.is_absolute()
+        or not relative.parts
+        or relative.parts[0] != "logs"
+        or any(part in ("", ".", "..") for part in relative.parts)
+    ):
+        raise RunnerError("private run paths are invalid")
+    logs_dir = root / "logs"
+    _lstat_owned_path(logs_dir, "directory")
+    parent = logs_dir
+    for part in relative.parts[1:-1]:
+        parent = parent / part
+        _lstat_owned_path(parent, "directory")
+    candidate = root / relative
+    try:
+        candidate.resolve(strict=True).relative_to(logs_dir.resolve(strict=True))
+    except (OSError, ValueError) as exc:
+        raise RunnerError("private run paths are invalid") from exc
+    _lstat_owned_path(candidate, "file", mode=0o600)
+    return candidate
+
+
+def _validate_result_destination(result_dir, name):
+    _validate_result_directory(result_dir)
+    destination = result_dir / name
+    if destination.parent != result_dir:
+        raise RunnerError("private run paths are invalid")
+    if _path_exists_no_follow(destination):
+        _lstat_owned_path(destination, "file", mode=0o600)
+    return destination
+
+
+def _capture_generated_artifact(root, result_dir, name):
+    source = root / name
+    if source.parent != root:
+        raise RunnerError("private run paths are invalid")
+    if not _path_exists_no_follow(source):
+        return
+    _lstat_owned_path(source, "file")
+    data = _read_owned_file_no_follow(source)
+    destination = _validate_result_destination(
+        result_dir,
+        f"generated-{name}",
+    )
+    _validate_result_directory(result_dir)
+    _atomic_write(destination, data)
+    _lstat_owned_path(destination, "file", mode=0o600)
+
+
 def finalize_run(
     root,
     run_id,
@@ -718,71 +1046,90 @@ def finalize_run(
     run_id = _validate_run_id(run_id)
     backup_dir = root / "state" / "backups" / f"mint-run-{run_id}"
     result_dir = root / "state" / "mint-runs" / run_id
-    _validate_recovery_data(backup_dir, run_id)
-    metadata = json.loads((backup_dir / "metadata.json").read_bytes())
-    guard = _parse_guard_result(result_dir / "guard-result.txt")
-    log_relative = guard.get("log_path")
-    log_path = None
-    if log_relative:
-        candidate = (root / log_relative).resolve()
-        try:
-            candidate.relative_to(root)
-        except ValueError:
-            pass
-        else:
-            log_path = candidate
-    log_summary = (
-        aggregate_log(log_path)
-        if log_path is not None and log_path.is_file()
-        else {name: 0 for name in LOG_PATTERNS}
+    metadata = _validate_finalization_context(
+        root,
+        run_id,
+        backup_dir,
+        result_dir,
     )
-    started_at = int(started_at)
-    ended_at = int(ended_at)
-    if started_at <= 0 or ended_at < started_at:
-        raise RunnerError("run window is invalid")
-    duration = float(guard.get("duration_seconds", "0"))
+    manifest = None
     try:
-        with (backup_dir / "config.toml").open("rb") as handle:
-            config = tomllib.load(handle)
-        chain = _sanitize_chain_summary(
-            (chain_aggregator or aggregate_chain)(
-                config,
-                metadata["mint"],
-                started_at,
-                ended_at,
-                transport=transport,
-                pubkey_resolver=pubkey_resolver,
-            )
+        guard_result_path = _validate_guard_result_path(result_dir)
+        guard = _parse_guard_result(guard_result_path)
+        log_path = _validate_log_path(root, guard.get("log_path"))
+        log_summary = (
+            aggregate_log(log_path)
+            if log_path is not None
+            else {name: 0 for name in LOG_PATTERNS}
         )
-        aggregation_status = "ok"
-    except Exception:
-        chain = _empty_chain_summary()
-        aggregation_status = "failed"
-    for name in OPTIONAL_FILES:
-        generated = root / name
-        if generated.exists():
-            _safe_copy(generated, result_dir / f"generated-{name}")
-    manifest = {
-        "run_id": run_id,
-        "mint": metadata["mint"],
-        "timeout_seconds": metadata["timeout_seconds"],
-        "guard_exit": int(guard_exit),
-        "stop_reason": (
-            guard["reason"]
-            if guard.get("reason") in STOP_REASONS
-            else "unknown"
-        ),
-        "duration_seconds": duration,
-        "started_at": started_at,
-        "ended_at": ended_at,
-        "aggregation_status": aggregation_status,
-        "log_events": log_summary,
-        "chain": chain,
-    }
-    _atomic_write(
-        result_dir / "manifest.json",
-        (json.dumps(manifest, sort_keys=True, indent=2) + "\n").encode(),
-    )
+        if isinstance(started_at, bool) or isinstance(ended_at, bool):
+            raise RunnerError("run window is invalid")
+        started_at = int(started_at)
+        ended_at = int(ended_at)
+        if started_at <= 0 or ended_at < started_at:
+            raise RunnerError("run window is invalid")
+        try:
+            duration = float(guard.get("duration_seconds", "0"))
+        except (TypeError, ValueError) as exc:
+            raise RunnerError("guard result is invalid") from exc
+        if not math.isfinite(duration) or duration < 0:
+            raise RunnerError("guard result is invalid")
+        try:
+            config = tomllib.loads(
+                _read_owned_file_no_follow(
+                    backup_dir / "config.toml",
+                    mode=0o600,
+                ).decode()
+            )
+            chain = _sanitize_chain_summary(
+                (chain_aggregator or aggregate_chain)(
+                    config,
+                    metadata["mint"],
+                    started_at,
+                    ended_at,
+                    transport=transport,
+                    pubkey_resolver=pubkey_resolver,
+                )
+            )
+            aggregation_status = "ok"
+        except Exception:
+            chain = _empty_chain_summary()
+            aggregation_status = "failed"
+        for name in OPTIONAL_FILES:
+            _capture_generated_artifact(root, result_dir, name)
+        if isinstance(guard_exit, bool):
+            raise RunnerError("guard result is invalid")
+        manifest = {
+            "run_id": run_id,
+            "mint": metadata["mint"],
+            "timeout_seconds": metadata["timeout_seconds"],
+            "guard_exit": int(guard_exit),
+            "stop_reason": (
+                guard["reason"]
+                if guard.get("reason") in STOP_REASONS
+                else "unknown"
+            ),
+            "duration_seconds": duration,
+            "started_at": started_at,
+            "ended_at": ended_at,
+            "aggregation_status": aggregation_status,
+            "log_events": log_summary,
+            "chain": chain,
+        }
+        manifest_path = _validate_result_destination(
+            result_dir,
+            "manifest.json",
+        )
+        _validate_result_directory(result_dir)
+        _atomic_write(
+            manifest_path,
+            (json.dumps(manifest, sort_keys=True, indent=2) + "\n").encode(),
+        )
+        _lstat_owned_path(manifest_path, "file", mode=0o600)
+    finally:
+        restore_run(root, run_id)
+    if manifest is None:
+        raise RunnerError("finalization failed")
     heading = f"{run_id} — single-mint guarded run"
     bullets = [
         f"Target mint recorded in private run manifest; timeout `{metadata['timeout_seconds']} s`.",
