@@ -437,6 +437,17 @@ class MintRunnerTestCase(unittest.TestCase):
         cases = (
             ["restore", "--run-id", protected],
             ["result-path", "--run-id", protected],
+            [
+                "finalize",
+                "--run-id",
+                protected,
+                "--guard-exit",
+                "0",
+                "--started-at",
+                "100",
+                "--ended-at",
+                "200",
+            ],
             [protected],
         )
         for index, arguments in enumerate(cases):
@@ -546,6 +557,620 @@ class MintRunnerTestCase(unittest.TestCase):
                 / "guard-result.txt"
             ),
         )
+
+
+class FinalizationTests(MintRunnerTestCase):
+    @staticmethod
+    def zero_chain():
+        return {
+            "landed": 0,
+            "successful": 0,
+            "failed": 0,
+            "fees_lamports": 0,
+            "rent_lamports": 0,
+            "transfers_lamports": 0,
+            "sol_delta_lamports": 0,
+            "wsol_delta_raw": 0,
+        }
+
+    def write_guard_result(self, prepared, content=None):
+        log = self.root / "logs" / "run.log"
+        log.parent.mkdir()
+        log.write_text("Payer WSOL account exists\n")
+        log.chmod(0o600)
+        guard_result = prepared.result_dir / "guard-result.txt"
+        guard_result.write_text(
+            content
+            or (
+                "reason=timeout\n"
+                "duration_seconds=300.1\n"
+                "log_path=logs/run.log\n"
+            )
+        )
+        guard_result.chmod(0o600)
+        return log
+
+    def test_log_aggregation_counts_only_fixed_categories(self):
+        log = self.root / "log.txt"
+        log.write_text(
+            "Payer WSOL account exists\n"
+            "Fetched 1 mint list.\n"
+            "Finding proper luts info...\n"
+            "Transaction sent successfully\n"
+            "Transaction sent successfully\n"
+        )
+        self.assertEqual(
+            mint_runner.aggregate_log(log),
+            {
+                "wsol_exists": 1,
+                "wsol_missing": 0,
+                "wsol_created": 0,
+                "mint_refresh": 1,
+                "pool_events": 0,
+                "lut_events": 1,
+                "sent_events": 2,
+                "error_events": 0,
+            },
+        )
+
+    def test_chain_aggregation_uses_exact_window_and_finalized_entries(self):
+        calls = []
+        signatures = {
+            "before": 89,
+            "at-start": 90,
+            "confirmed": 100,
+            "at-end": 110,
+            "after": 111,
+        }
+
+        def transport(url, payload, timeout):
+            del url, timeout
+            calls.append(payload)
+            if payload["method"] == "getSignaturesForAddress":
+                return {
+                    "result": [
+                        {
+                            "signature": signature,
+                            "blockTime": block_time,
+                            "confirmationStatus": (
+                                "confirmed"
+                                if signature == "confirmed"
+                                else "finalized"
+                            ),
+                        }
+                        for signature, block_time in signatures.items()
+                    ]
+                }
+            return {
+                "result": {
+                    "meta": {
+                        "err": None,
+                        "fee": 1,
+                        "preBalances": [1],
+                        "postBalances": [1],
+                        "preTokenBalances": [],
+                        "postTokenBalances": [],
+                    },
+                    "transaction": {
+                        "message": {
+                            "accountKeys": [
+                                {"pubkey": "wallet"},
+                                {"pubkey": TARGET_MINT},
+                            ],
+                            "instructions": [],
+                        }
+                    },
+                }
+            }
+
+        result = mint_runner.aggregate_chain(
+            {"rpc": {"url": "https://secret.invalid"}},
+            TARGET_MINT,
+            90,
+            110,
+            transport=transport,
+            pubkey_resolver=lambda config: "wallet",
+        )
+
+        signature_request = calls[0]
+        transaction_requests = calls[1:]
+        self.assertEqual(
+            signature_request["params"],
+            ["wallet", {"limit": 200, "commitment": "finalized"}],
+        )
+        self.assertEqual(
+            [
+                request["params"][0]
+                for request in transaction_requests
+            ],
+            ["at-start", "at-end"],
+        )
+        self.assertTrue(
+            all(
+                request["params"][1]["commitment"] == "finalized"
+                for request in transaction_requests
+            )
+        )
+        self.assertEqual(result["landed"], 2)
+        self.assertEqual(result["successful"], 2)
+
+    def test_chain_aggregation_filters_target_and_sums_all_fixed_metrics(self):
+        wsol_mint = "So11111111111111111111111111111111111111112"
+
+        def token_balance(owner, mint, amount):
+            return {
+                "owner": owner,
+                "mint": mint,
+                "uiTokenAmount": {"amount": str(amount)},
+            }
+
+        transactions = {
+            "successful-target": {
+                "meta": {
+                    "err": None,
+                    "fee": 5000,
+                    "preBalances": [100000],
+                    "postBalances": [80000],
+                    "preTokenBalances": [
+                        token_balance("wallet", "target-mint", 1),
+                        token_balance("wallet", wsol_mint, 10),
+                    ],
+                    "postTokenBalances": [
+                        token_balance("wallet", "target-mint", 2),
+                        token_balance("wallet", wsol_mint, 14),
+                    ],
+                    "innerInstructions": [
+                        {
+                            "instructions": [
+                                {
+                                    "program": "system",
+                                    "parsed": {
+                                        "type": "createAccountWithSeed",
+                                        "info": {
+                                            "source": "wallet",
+                                            "lamports": 3000,
+                                        },
+                                    },
+                                },
+                                {
+                                    "program": "system",
+                                    "parsed": {
+                                        "type": "transferWithSeed",
+                                        "info": {
+                                            "source": "wallet",
+                                            "lamports": 4000,
+                                        },
+                                    },
+                                },
+                            ]
+                        }
+                    ],
+                },
+                "transaction": {
+                    "message": {
+                        "accountKeys": [{"pubkey": "wallet"}],
+                        "instructions": [
+                            {
+                                "program": "system",
+                                "parsed": {
+                                    "type": "createAccount",
+                                    "info": {
+                                        "source": "wallet",
+                                        "lamports": 1000,
+                                    },
+                                },
+                            },
+                            {
+                                "program": "system",
+                                "parsed": {
+                                    "type": "transfer",
+                                    "info": {
+                                        "source": "wallet",
+                                        "lamports": 2000,
+                                    },
+                                },
+                            },
+                            {
+                                "program": "system",
+                                "parsed": {
+                                    "type": "transfer",
+                                    "info": {
+                                        "source": "someone-else",
+                                        "lamports": 999999,
+                                    },
+                                },
+                            },
+                        ],
+                    }
+                },
+            },
+            "failed-target": {
+                "meta": {
+                    "err": {"InstructionError": [0, "failed"]},
+                    "fee": 7000,
+                    "preBalances": [80000],
+                    "postBalances": [79000],
+                    "preTokenBalances": [
+                        token_balance("wallet", wsol_mint, 5),
+                    ],
+                    "postTokenBalances": [
+                        token_balance("wallet", wsol_mint, 2),
+                    ],
+                },
+                "transaction": {
+                    "message": {
+                        "accountKeys": [
+                            {"pubkey": "wallet"},
+                            {"pubkey": "target-mint"},
+                        ],
+                        "instructions": [
+                            {
+                                "program": "system",
+                                "parsed": {
+                                    "type": "transfer",
+                                    "info": {
+                                        "source": "wallet",
+                                        "lamports": 500000,
+                                    },
+                                },
+                            }
+                        ],
+                    }
+                },
+            },
+            "unrelated": {
+                "meta": {
+                    "err": None,
+                    "fee": 999999,
+                    "preBalances": [79000],
+                    "postBalances": [1],
+                    "preTokenBalances": [],
+                    "postTokenBalances": [],
+                },
+                "transaction": {
+                    "message": {
+                        "accountKeys": [
+                            {"pubkey": "wallet"},
+                            {"pubkey": "other-mint"},
+                        ],
+                        "instructions": [],
+                    }
+                },
+            },
+        }
+
+        def transport(url, payload, timeout):
+            del url, timeout
+            if payload["method"] == "getSignaturesForAddress":
+                return {
+                    "result": [
+                        {
+                            "signature": signature,
+                            "blockTime": 100,
+                            "confirmationStatus": "finalized",
+                        }
+                        for signature in transactions
+                    ]
+                }
+            return {"result": transactions[payload["params"][0]]}
+
+        result = mint_runner.aggregate_chain(
+            {"rpc": {"url": "https://secret.invalid"}},
+            "target-mint",
+            90,
+            110,
+            transport=transport,
+            pubkey_resolver=lambda config: "wallet",
+        )
+
+        self.assertEqual(
+            result,
+            {
+                "landed": 2,
+                "successful": 1,
+                "failed": 1,
+                "fees_lamports": 12000,
+                "rent_lamports": 4000,
+                "transfers_lamports": 6000,
+                "sol_delta_lamports": -21000,
+                "wsol_delta_raw": 1,
+            },
+        )
+
+    def test_chain_aggregation_never_returns_signatures(self):
+        calls = []
+
+        def transport(url, payload, timeout):
+            calls.append(payload["method"])
+            if payload["method"] == "getSignaturesForAddress":
+                return {
+                    "result": [
+                        {
+                            "signature": "must-not-survive",
+                            "blockTime": 100,
+                        }
+                    ]
+                }
+            return {
+                "result": {
+                    "meta": {
+                        "err": None,
+                        "fee": 5000,
+                        "preBalances": [10000],
+                        "postBalances": [5000],
+                        "preTokenBalances": [
+                            {
+                                "owner": "wallet",
+                                "mint": TARGET_MINT,
+                                "uiTokenAmount": {"amount": "1"},
+                            }
+                        ],
+                        "postTokenBalances": [
+                            {
+                                "owner": "wallet",
+                                "mint": TARGET_MINT,
+                                "uiTokenAmount": {"amount": "2"},
+                            }
+                        ],
+                    },
+                    "transaction": {
+                        "message": {
+                            "accountKeys": [{"pubkey": "wallet"}],
+                            "instructions": [
+                                {
+                                    "program": "system",
+                                    "parsed": {
+                                        "type": "createAccount",
+                                        "info": {
+                                            "source": "wallet",
+                                            "lamports": 2039280,
+                                        },
+                                    },
+                                },
+                                {
+                                    "program": "system",
+                                    "parsed": {
+                                        "type": "transfer",
+                                        "info": {
+                                            "source": "wallet",
+                                            "lamports": 10000,
+                                        },
+                                    },
+                                },
+                            ],
+                        }
+                    },
+                }
+            }
+
+        result = mint_runner.aggregate_chain(
+            {"rpc": {"url": "https://secret.invalid"}},
+            TARGET_MINT,
+            90,
+            110,
+            transport=transport,
+            pubkey_resolver=lambda config: "wallet",
+        )
+        self.assertEqual(result["landed"], 1)
+        self.assertEqual(result["successful"], 1)
+        self.assertEqual(result["fees_lamports"], 5000)
+        self.assertEqual(result["rent_lamports"], 2039280)
+        self.assertEqual(result["transfers_lamports"], 10000)
+        self.assertNotIn("signature", json.dumps(result).lower())
+        self.assertNotIn("https://secret.invalid", json.dumps(result))
+
+    def test_finalize_copies_generated_artifacts_then_restores(self):
+        (self.root / "hot_tokens.json").write_bytes(b'{"original": true}\n')
+        (self.root / "routing.json").write_bytes(b"original routing\n")
+        original_hot = (self.root / "hot_tokens.json").read_bytes()
+        original_routing = (self.root / "routing.json").read_bytes()
+        prepared = self.prepare()
+        self.write_guard_result(prepared)
+        generated_hot = b'{"generated": true}\n'
+        generated_routing = b"generated routing\n"
+        (self.root / "hot_tokens.json").write_bytes(generated_hot)
+        (self.root / "routing.json").write_bytes(generated_routing)
+
+        result = mint_runner.finalize_run(
+            self.root,
+            prepared.run_id,
+            guard_exit=0,
+            started_at=100,
+            ended_at=400,
+            chain_aggregator=lambda *args, **kwargs: self.zero_chain(),
+        )
+
+        manifest = prepared.result_dir / "manifest.json"
+        self.assertTrue(manifest.exists())
+        self.assertEqual(stat.S_IMODE(manifest.stat().st_mode), 0o600)
+        rendered = manifest.read_text()
+        self.assertNotIn("https://secret.invalid", rendered)
+        self.assertNotIn("signature", rendered.lower())
+        self.assertEqual(
+            (prepared.result_dir / "generated-hot_tokens.json").read_bytes(),
+            generated_hot,
+        )
+        self.assertEqual(
+            (prepared.result_dir / "generated-routing.json").read_bytes(),
+            generated_routing,
+        )
+        self.assertEqual(
+            stat.S_IMODE(
+                (prepared.result_dir / "generated-hot_tokens.json").stat().st_mode
+            ),
+            0o600,
+        )
+        self.assertEqual((self.root / "config.toml").read_bytes(), self.original_config)
+        self.assertEqual((self.root / "tokens.toml").read_bytes(), self.original_tokens)
+        self.assertEqual((self.root / "hot_tokens.json").read_bytes(), original_hot)
+        self.assertEqual((self.root / "routing.json").read_bytes(), original_routing)
+        self.assertFalse((self.root / "state" / ".mint-run-active").exists())
+        self.assertEqual(result["stop_reason"], "timeout")
+        self.assertEqual(result["started_at"], 100)
+        self.assertEqual(result["ended_at"], 400)
+        state_backups = list(
+            (self.root / "state" / "backups").glob("state-*/CURRENT.md")
+        )
+        self.assertEqual(len(state_backups), 1)
+        self.assertEqual(stat.S_IMODE(state_backups[0].stat().st_mode), 0o600)
+
+    def test_finalize_records_only_generic_aggregation_failure(self):
+        prepared = self.prepare()
+        self.write_guard_result(prepared)
+        protected = "https://secret.invalid/signature/must-not-survive"
+
+        def fail_aggregation(*args, **kwargs):
+            raise RuntimeError(protected)
+
+        result = mint_runner.finalize_run(
+            self.root,
+            prepared.run_id,
+            guard_exit=7,
+            started_at=100,
+            ended_at=400,
+            chain_aggregator=fail_aggregation,
+        )
+
+        rendered = (prepared.result_dir / "manifest.json").read_text()
+        self.assertEqual(result["aggregation_status"], "failed")
+        self.assertEqual(result["chain"], self.zero_chain())
+        self.assertNotIn(protected, rendered)
+        self.assertNotIn("signature", rendered.lower())
+        self.assertEqual((self.root / "tokens.toml").read_bytes(), self.original_tokens)
+        for name in ("CURRENT.md", "EXPERIMENTS.md"):
+            self.assertNotIn(protected, (self.root / "state" / name).read_text())
+
+    def test_finalize_discards_unexpected_aggregator_fields(self):
+        prepared = self.prepare()
+        self.write_guard_result(prepared)
+        protected = "https://secret.invalid/signature/must-not-survive"
+        aggregate = {
+            **self.zero_chain(),
+            "signature": protected,
+            "rpc_url": protected,
+        }
+
+        result = mint_runner.finalize_run(
+            self.root,
+            prepared.run_id,
+            guard_exit=0,
+            started_at=100,
+            ended_at=400,
+            chain_aggregator=lambda *args, **kwargs: aggregate,
+        )
+
+        rendered = (prepared.result_dir / "manifest.json").read_text()
+        self.assertEqual(result["aggregation_status"], "ok")
+        self.assertEqual(result["chain"], self.zero_chain())
+        self.assertNotIn(protected, rendered)
+        self.assertNotIn("signature", rendered.lower())
+        self.assertNotIn("rpc_url", rendered.lower())
+
+    def test_finalize_sanitizes_unrecognized_guard_reason(self):
+        prepared = self.prepare()
+        protected = "https://secret.invalid/signature/must-not-survive"
+        self.write_guard_result(
+            prepared,
+            content=(
+                f"reason={protected}\n"
+                "duration_seconds=1\n"
+                "log_path=logs/run.log\n"
+            ),
+        )
+
+        result = mint_runner.finalize_run(
+            self.root,
+            prepared.run_id,
+            guard_exit=0,
+            started_at=100,
+            ended_at=400,
+            chain_aggregator=lambda *args, **kwargs: self.zero_chain(),
+        )
+
+        rendered = (prepared.result_dir / "manifest.json").read_text()
+        self.assertEqual(result["stop_reason"], "unknown")
+        self.assertNotIn(protected, rendered)
+        for name in ("CURRENT.md", "EXPERIMENTS.md"):
+            self.assertNotIn(protected, (self.root / "state" / name).read_text())
+
+    def test_finalize_cli_passes_exact_window_and_outputs_only_safe_paths(self):
+        manifest = {
+            "stop_reason": "timeout",
+        }
+        stdout = io.StringIO()
+        with patch.object(
+            mint_runner, "finalize_run", return_value=manifest
+        ) as finalizer:
+            with contextlib.redirect_stdout(stdout):
+                status = mint_runner.main(
+                    [
+                        "--root",
+                        str(self.root),
+                        "finalize",
+                        "--run-id",
+                        "20260724T183000Z",
+                        "--guard-exit",
+                        "7",
+                        "--started-at",
+                        "100",
+                        "--ended-at",
+                        "400",
+                    ]
+                )
+
+        self.assertEqual(status, 0)
+        finalizer.assert_called_once_with(
+            self.root.resolve(),
+            "20260724T183000Z",
+            7,
+            100,
+            400,
+        )
+        rendered = stdout.getvalue()
+        self.assertEqual(
+            rendered,
+            "stop_reason=timeout\n"
+            "manifest=state/mint-runs/20260724T183000Z/manifest.json\n",
+        )
+
+    def test_finalize_cli_failure_is_generic_and_leaves_restore_to_failsafe(self):
+        prepared = self.prepare()
+        changed_tokens = b"generated tokens"
+        (self.root / "tokens.toml").write_bytes(changed_tokens)
+        protected = "https://secret.invalid/signature/must-not-survive"
+        stderr = io.StringIO()
+
+        with patch.object(
+            mint_runner,
+            "finalize_run",
+            side_effect=mint_runner.RunnerError(protected),
+        ):
+            with contextlib.redirect_stderr(stderr):
+                status = mint_runner.main(
+                    [
+                        "--root",
+                        str(self.root),
+                        "finalize",
+                        "--run-id",
+                        prepared.run_id,
+                        "--guard-exit",
+                        "7",
+                        "--started-at",
+                        "100",
+                        "--ended-at",
+                        "400",
+                    ]
+                )
+
+        self.assertEqual(status, 1)
+        self.assertNotIn(protected, stderr.getvalue())
+        self.assertIn("error=operation failed", stderr.getvalue())
+        self.assertEqual((self.root / "tokens.toml").read_bytes(), changed_tokens)
+        self.assertTrue((self.root / "state" / ".mint-run-active").exists())
+        for name in ("CURRENT.md", "EXPERIMENTS.md"):
+            rendered = (self.root / "state" / name).read_text()
+            self.assertIn("single-mint finalization failed", rendered)
+            self.assertNotIn(protected, rendered)
 
 
 if __name__ == "__main__":

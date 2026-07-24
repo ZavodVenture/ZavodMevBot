@@ -27,6 +27,40 @@ EARLY_STOP_LAMPORTS = 25_000_000
 REQUIRED_FILES = ("config.toml", "tokens.toml")
 OPTIONAL_FILES = ("hot_tokens.json", "routing.json")
 RUN_ID_PATTERN = re.compile(r"[0-9]{8}T[0-9]{6}Z")
+LOG_PATTERNS = {
+    "wsol_exists": re.compile(r"WSOL account exists", re.I),
+    "wsol_missing": re.compile(r"WSOL account does not exist", re.I),
+    "wsol_created": re.compile(r"WSOL account created successfully", re.I),
+    "mint_refresh": re.compile(r"Fetched [0-9]+ mint list", re.I),
+    "pool_events": re.compile(
+        r"found [0-9]+ pools?|selected pool|pool selected",
+        re.I,
+    ),
+    "lut_events": re.compile(r"Resolved LUTs|Finding proper luts", re.I),
+    "sent_events": re.compile(r"Transaction sent successfully", re.I),
+    "error_events": re.compile(r"error|failed", re.I),
+}
+CHAIN_SUMMARY_KEYS = (
+    "landed",
+    "successful",
+    "failed",
+    "fees_lamports",
+    "rent_lamports",
+    "transfers_lamports",
+    "sol_delta_lamports",
+    "wsol_delta_raw",
+)
+STOP_REASONS = frozenset(
+    {
+        "child_exit",
+        "cleanup_failed",
+        "loss_threshold",
+        "operator_signal",
+        "output_error",
+        "rpc_error",
+        "timeout",
+    }
+)
 
 
 class RunnerError(RuntimeError):
@@ -447,6 +481,164 @@ def restore_active(root):
     restore_run(root, run_id)
 
 
+def aggregate_log(log_path):
+    text = Path(log_path).read_text(errors="replace")
+    return {
+        name: len(pattern.findall(text))
+        for name, pattern in LOG_PATTERNS.items()
+    }
+
+
+def _parse_guard_result(path):
+    allowed = {
+        "reason",
+        "start_balance",
+        "end_balance",
+        "observed_loss",
+        "duration_seconds",
+        "child_exit_code",
+        "loss_limit_lamports",
+        "early_stop_lamports",
+        "log_path",
+    }
+    result = {}
+    for line in Path(path).read_text(errors="replace").splitlines():
+        key, separator, value = line.partition("=")
+        if separator and key in allowed:
+            result[key] = value
+    return result
+
+
+def _empty_chain_summary():
+    return {name: 0 for name in CHAIN_SUMMARY_KEYS}
+
+
+def _sanitize_chain_summary(summary):
+    if not isinstance(summary, dict):
+        raise ValueError("invalid chain summary")
+    sanitized = {}
+    for name in CHAIN_SUMMARY_KEYS:
+        value = summary.get(name)
+        if type(value) is not int:
+            raise ValueError("invalid chain summary")
+        sanitized[name] = value
+    return sanitized
+
+
+def aggregate_chain(
+    config,
+    mint,
+    started_at,
+    ended_at,
+    transport=None,
+    pubkey_resolver=None,
+):
+    from scripts import zavod_guard
+
+    caller = transport or rpc_call
+    rpc_url = config["rpc"]["url"]
+    wallet = (
+        pubkey_resolver(config)
+        if pubkey_resolver
+        else zavod_guard.wallet_pubkey(config["wallet"]["private_key"])
+    )
+    signatures_body = caller(
+        rpc_url,
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getSignaturesForAddress",
+            "params": [wallet, {"limit": 200, "commitment": "finalized"}],
+        },
+        10,
+    )
+    entries = [
+        entry
+        for entry in signatures_body.get("result", [])
+        if isinstance(entry.get("blockTime"), int)
+        and started_at <= entry["blockTime"] <= ended_at
+        and entry.get("confirmationStatus") in (None, "finalized")
+    ]
+    summary = _empty_chain_summary()
+    wsol_mint = "So11111111111111111111111111111111111111112"
+    for entry in entries:
+        body = caller(
+            rpc_url,
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "getTransaction",
+                "params": [
+                    entry["signature"],
+                    {
+                        "encoding": "jsonParsed",
+                        "commitment": "finalized",
+                        "maxSupportedTransactionVersion": 0,
+                    },
+                ],
+            },
+            10,
+        )
+        transaction = body.get("result")
+        if not transaction:
+            continue
+        meta = transaction.get("meta") or {}
+        token_balances = (
+            list(meta.get("preTokenBalances", []) or [])
+            + list(meta.get("postTokenBalances", []) or [])
+        )
+        account_keys = (
+            transaction.get("transaction", {})
+            .get("message", {})
+            .get("accountKeys", [])
+        )
+        account_pubkeys = [
+            item.get("pubkey") if isinstance(item, dict) else item
+            for item in account_keys
+        ]
+        if mint not in account_pubkeys and not any(
+            balance.get("mint") == mint for balance in token_balances
+        ):
+            continue
+        summary["landed"] += 1
+        if meta.get("err") is None:
+            summary["successful"] += 1
+            message = transaction.get("transaction", {}).get("message", {})
+            instructions = list(message.get("instructions", []) or [])
+            for group in meta.get("innerInstructions", []) or []:
+                instructions.extend(group.get("instructions", []) or [])
+            for instruction in instructions:
+                if instruction.get("program") != "system":
+                    continue
+                parsed = instruction.get("parsed") or {}
+                info = parsed.get("info") or {}
+                if info.get("source") != wallet:
+                    continue
+                lamports = info.get("lamports")
+                if not isinstance(lamports, int) or lamports < 0:
+                    continue
+                if parsed.get("type") in ("createAccount", "createAccountWithSeed"):
+                    summary["rent_lamports"] += lamports
+                elif parsed.get("type") in ("transfer", "transferWithSeed"):
+                    summary["transfers_lamports"] += lamports
+        else:
+            summary["failed"] += 1
+        summary["fees_lamports"] += int(meta.get("fee") or 0)
+        if wallet in account_pubkeys:
+            index = account_pubkeys.index(wallet)
+            pre = meta.get("preBalances", [])
+            post = meta.get("postBalances", [])
+            if index < len(pre) and index < len(post):
+                summary["sol_delta_lamports"] += int(post[index]) - int(pre[index])
+        for field, sign in (("preTokenBalances", -1), ("postTokenBalances", 1)):
+            for balance in meta.get(field, []) or []:
+                if balance.get("owner") == wallet and balance.get("mint") == wsol_mint:
+                    amount = balance.get("uiTokenAmount", {}).get("amount", "0")
+                    if isinstance(amount, str) and amount.isdigit():
+                        summary["wsol_delta_raw"] += sign * int(amount)
+    return summary
+
+
 def _record_state(root, heading, bullets):
     root = Path(root).resolve()
     backup_root = root / "state" / "backups"
@@ -512,6 +704,98 @@ def record_finalization_failure(root):
     )
 
 
+def finalize_run(
+    root,
+    run_id,
+    guard_exit,
+    started_at,
+    ended_at,
+    transport=None,
+    pubkey_resolver=None,
+    chain_aggregator=None,
+):
+    root = Path(root).resolve()
+    run_id = _validate_run_id(run_id)
+    backup_dir = root / "state" / "backups" / f"mint-run-{run_id}"
+    result_dir = root / "state" / "mint-runs" / run_id
+    _validate_recovery_data(backup_dir, run_id)
+    metadata = json.loads((backup_dir / "metadata.json").read_bytes())
+    guard = _parse_guard_result(result_dir / "guard-result.txt")
+    log_relative = guard.get("log_path")
+    log_path = None
+    if log_relative:
+        candidate = (root / log_relative).resolve()
+        try:
+            candidate.relative_to(root)
+        except ValueError:
+            pass
+        else:
+            log_path = candidate
+    log_summary = (
+        aggregate_log(log_path)
+        if log_path is not None and log_path.is_file()
+        else {name: 0 for name in LOG_PATTERNS}
+    )
+    started_at = int(started_at)
+    ended_at = int(ended_at)
+    if started_at <= 0 or ended_at < started_at:
+        raise RunnerError("run window is invalid")
+    duration = float(guard.get("duration_seconds", "0"))
+    try:
+        with (backup_dir / "config.toml").open("rb") as handle:
+            config = tomllib.load(handle)
+        chain = _sanitize_chain_summary(
+            (chain_aggregator or aggregate_chain)(
+                config,
+                metadata["mint"],
+                started_at,
+                ended_at,
+                transport=transport,
+                pubkey_resolver=pubkey_resolver,
+            )
+        )
+        aggregation_status = "ok"
+    except Exception:
+        chain = _empty_chain_summary()
+        aggregation_status = "failed"
+    for name in OPTIONAL_FILES:
+        generated = root / name
+        if generated.exists():
+            _safe_copy(generated, result_dir / f"generated-{name}")
+    manifest = {
+        "run_id": run_id,
+        "mint": metadata["mint"],
+        "timeout_seconds": metadata["timeout_seconds"],
+        "guard_exit": int(guard_exit),
+        "stop_reason": (
+            guard["reason"]
+            if guard.get("reason") in STOP_REASONS
+            else "unknown"
+        ),
+        "duration_seconds": duration,
+        "started_at": started_at,
+        "ended_at": ended_at,
+        "aggregation_status": aggregation_status,
+        "log_events": log_summary,
+        "chain": chain,
+    }
+    _atomic_write(
+        result_dir / "manifest.json",
+        (json.dumps(manifest, sort_keys=True, indent=2) + "\n").encode(),
+    )
+    heading = f"{run_id} — single-mint guarded run"
+    bullets = [
+        f"Target mint recorded in private run manifest; timeout `{metadata['timeout_seconds']} s`.",
+        f"Stop reason `{manifest['stop_reason']}`; landed `{chain['landed']}`, successful `{chain['successful']}`, failed `{chain['failed']}`.",
+        f"Fees `{chain['fees_lamports']}`, rent `{chain['rent_lamports']}`, transfers `{chain['transfers_lamports']}` lamports.",
+        f"SOL delta `{chain['sol_delta_lamports']}` lamports; wSOL delta `{chain['wsol_delta_raw']}` raw units.",
+        "Original config, token list, and runtime artifacts restored; no automatic retry.",
+    ]
+    restore_run(root, run_id)
+    _record_state(root, heading, bullets)
+    return manifest
+
+
 def _record_failure_safely(root, command):
     try:
         if command == "prepare":
@@ -564,6 +848,11 @@ def main(argv=None):
     subparsers.add_parser("restore-active")
     result_parser = subparsers.add_parser("result-path")
     result_parser.add_argument("--run-id", required=True)
+    finalize_parser = subparsers.add_parser("finalize")
+    finalize_parser.add_argument("--run-id", required=True)
+    finalize_parser.add_argument("--guard-exit", required=True, type=int)
+    finalize_parser.add_argument("--started-at", required=True, type=int)
+    finalize_parser.add_argument("--ended-at", required=True, type=int)
     try:
         args = parser.parse_args(argv)
     except _CliArgumentError:
@@ -586,6 +875,17 @@ def main(argv=None):
         if args.command == "result-path":
             run_id = _validate_run_id(args.run_id)
             print(root / "state" / "mint-runs" / run_id / "guard-result.txt")
+            return 0
+        if args.command == "finalize":
+            manifest = finalize_run(
+                root,
+                args.run_id,
+                args.guard_exit,
+                args.started_at,
+                args.ended_at,
+            )
+            print(f"stop_reason={manifest['stop_reason']}")
+            print(f"manifest=state/mint-runs/{args.run_id}/manifest.json")
             return 0
     except _CliArgumentError:
         return _emit_command_failure(
