@@ -1,12 +1,17 @@
 import copy
+import io
 import json
+import os
+import signal
 import shutil
 import subprocess
 import tempfile
+import threading
 import unittest
-import signal
 from pathlib import Path
+from unittest.mock import Mock, patch
 
+from scripts import zavod_guard
 from scripts.zavod_guard import (
     EARLY_STOP_LAMPORTS,
     GuardError,
@@ -407,6 +412,8 @@ class SupervisorTests(unittest.TestCase):
             monotonic=iter([0, 1, 2]).__next__,
             sleep=lambda seconds: None,
             killpg=lambda pid, sig: signals.append((pid, sig)),
+            group_exists=Mock(side_effect=[True, False]),
+            signal_grace=((signal.SIGINT, 0),),
             timeout_seconds=300,
         )
         self.assertEqual(result["reason"], "loss_threshold")
@@ -422,6 +429,7 @@ class SupervisorTests(unittest.TestCase):
             monotonic=times.__next__,
             sleep=lambda seconds: None,
             killpg=lambda pid, sig: None,
+            group_exists=lambda pid: False,
             timeout_seconds=300,
         )
         self.assertEqual(result["reason"], "timeout")
@@ -439,6 +447,8 @@ class SupervisorTests(unittest.TestCase):
             monotonic=iter([0, 1]).__next__,
             sleep=lambda seconds: None,
             killpg=lambda pid, sig: signals.append((pid, sig)),
+            group_exists=Mock(side_effect=[True, False]),
+            signal_grace=((signal.SIGINT, 0),),
             timeout_seconds=300,
         )
         self.assertEqual(result["reason"], "rpc_error")
@@ -453,6 +463,7 @@ class SupervisorTests(unittest.TestCase):
             monotonic=iter([0, 1]).__next__,
             sleep=lambda seconds: None,
             killpg=lambda pid, sig: None,
+            group_exists=lambda pid: False,
             timeout_seconds=300,
         )
         self.assertEqual(result["reason"], "child_exit")
@@ -471,6 +482,8 @@ class SupervisorTests(unittest.TestCase):
             monotonic=iter([0, 1]).__next__,
             sleep=lambda seconds: None,
             killpg=lambda pid, sig: signals.append((pid, sig)),
+            group_exists=Mock(side_effect=[True, False]),
+            signal_grace=((signal.SIGINT, 0),),
             timeout_seconds=300,
         )
         self.assertEqual(result["reason"], "operator_signal")
@@ -490,6 +503,279 @@ class SupervisorTests(unittest.TestCase):
         redacted = redact_text(text, config)
         self.assertNotIn("secret", redacted)
         self.assertGreaterEqual(redacted.count("<redacted>"), 5)
+
+
+class StreamingRedactorTests(unittest.TestCase):
+    def test_secret_split_across_chunks_is_never_written(self):
+        sink = io.StringIO()
+        redactor = zavod_guard.StreamingRedactor(sink, ["secret-value"])
+        redactor.feed("before secret-")
+        redactor.feed("value after")
+        redactor.close()
+        self.assertEqual(sink.getvalue(), "before <redacted> after")
+
+    def test_output_pump_stop_unblocks_an_idle_pipe(self):
+        read_fd, write_fd = os.pipe()
+        source = os.fdopen(read_fd, "rb", buffering=0)
+        pump = zavod_guard.OutputPump(source, io.StringIO(), {})
+        pump.start()
+        try:
+            pump.stop()
+            pump.join(1)
+            self.assertFalse(pump.is_alive())
+        finally:
+            os.close(write_fd)
+            pump.join(1)
+            source.close()
+
+    def test_output_pump_preserves_multibyte_secret_across_byte_chunks(self):
+        secret = "clé-secret"
+        encoded = f"before {secret} after".encode()
+        split_at = encoded.index(b"\xc3") + 1
+        source = Mock()
+        source.read.side_effect = [
+            encoded[:split_at],
+            encoded[split_at:],
+            b"",
+        ]
+        sink = io.StringIO()
+        pump = zavod_guard.OutputPump(
+            source,
+            sink,
+            {"wallet": {"private_key": secret}},
+        )
+        pump.start()
+        pump.join(1)
+        self.assertFalse(pump.is_alive())
+        self.assertFalse(pump.output_error_event.is_set())
+        self.assertEqual(sink.getvalue(), "before <redacted> after")
+
+
+class HardenedCleanupTests(unittest.TestCase):
+    def test_keyboard_interrupt_from_poll_still_cleans_group(self):
+        child = Mock()
+        child.pid = 123
+        child.returncode = -2
+        child.poll.side_effect = [KeyboardInterrupt(), None, -2]
+        signals = []
+        result = zavod_guard.supervise(
+            child=child,
+            start_balance=100,
+            balance_reader=lambda: 100,
+            monotonic=Mock(side_effect=[0, 0]),
+            sleep=lambda _: None,
+            killpg=lambda pgid, sig: signals.append((pgid, sig)),
+            group_exists=Mock(side_effect=[True, False]),
+            signal_grace=((signal.SIGINT, 0),),
+            timeout_seconds=300,
+        )
+        self.assertEqual(result["reason"], "operator_signal")
+        self.assertIn((123, signal.SIGINT), signals)
+
+    def test_surviving_descendant_reports_cleanup_failed(self):
+        child = Mock(pid=123, returncode=None)
+        child.poll.return_value = None
+        result = zavod_guard._shutdown_child(
+            child,
+            killpg=lambda pgid, sig: None,
+            group_exists=lambda pgid: True,
+            monotonic=Mock(side_effect=[0, 1, 2, 3, 4, 5, 6]),
+            sleep=lambda _: None,
+            signal_grace=((signal.SIGINT, 0), (signal.SIGKILL, 0)),
+        )
+        self.assertFalse(result["group_absent"])
+
+    def test_output_error_stops_fail_closed(self):
+        event = threading.Event()
+        event.set()
+        child = Mock(pid=123, returncode=-2)
+        child.poll.return_value = None
+        result = zavod_guard.supervise(
+            child=child,
+            start_balance=100,
+            balance_reader=lambda: 100,
+            monotonic=Mock(side_effect=[0, 0]),
+            sleep=lambda _: None,
+            output_error_event=event,
+            killpg=lambda pgid, sig: None,
+            group_exists=Mock(side_effect=[True, False]),
+            signal_grace=((signal.SIGINT, 0),),
+        )
+        self.assertEqual(result["reason"], "output_error")
+
+    def test_repeated_interrupts_during_cleanup_fail_closed(self):
+        child = Mock(pid=123, returncode=None)
+        child.poll.return_value = None
+        result = zavod_guard._shutdown_child(
+            child,
+            killpg=lambda pgid, sig: None,
+            group_exists=lambda pgid: True,
+            monotonic=Mock(
+                side_effect=[KeyboardInterrupt()]
+                * zavod_guard.MAX_INTERRUPT_RETRIES
+            ),
+            sleep=lambda _: None,
+            signal_grace=((signal.SIGINT, 0),),
+        )
+        self.assertFalse(result["group_absent"])
+        self.assertTrue(result["interrupted"])
+
+    def test_interrupt_between_cleanup_operations_retries_cleanup(self):
+        cleanup = {
+            "exit_code": -2,
+            "group_absent": True,
+            "interrupted": False,
+        }
+        child = Mock(pid=123, returncode=-2)
+        child.poll.return_value = -2
+        with patch.object(
+            zavod_guard,
+            "_shutdown_child",
+            side_effect=[KeyboardInterrupt(), cleanup],
+        ) as shutdown:
+            result = zavod_guard.supervise(
+                child=child,
+                start_balance=100,
+                balance_reader=lambda: 100,
+                monotonic=lambda: 0,
+                sleep=lambda _: None,
+            )
+        self.assertEqual(shutdown.call_count, 2)
+        self.assertEqual(result["reason"], "operator_signal")
+
+
+class RunGuardedHardeningTests(unittest.TestCase):
+    def run_with_mocks(self, pump=None, cleanup=None):
+        config = valid_config()
+        child = Mock(pid=123, returncode=0, stdout=io.BytesIO())
+        cleanup = cleanup or {
+            "exit_code": 0,
+            "group_absent": True,
+            "interrupted": False,
+        }
+        patches = [
+            patch.object(zavod_guard, "load_config", return_value=config),
+            patch.object(
+                zavod_guard,
+                "preflight",
+                return_value={
+                    "wallet": "public-address",
+                    "balance_lamports": 100_000_000,
+                },
+            ),
+            patch.object(zavod_guard.subprocess, "Popen", return_value=child),
+            patch.object(
+                zavod_guard,
+                "supervise",
+                return_value={
+                    "reason": "child_exit",
+                    "start_balance": 100_000_000,
+                    "end_balance": 100_000_000,
+                    "observed_loss": 0,
+                    "child_exit_code": 0,
+                },
+            ),
+            patch.object(
+                zavod_guard,
+                "_verified_shutdown",
+                return_value=cleanup,
+            ),
+        ]
+        if pump is not None:
+            patches.append(
+                patch.object(zavod_guard, "OutputPump", return_value=pump)
+            )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patches[0], patches[1], patches[2], patches[3], patches[4]:
+                if pump is None:
+                    return zavod_guard.run_guarded(
+                        Path(temp_dir) / "config.toml"
+                    )
+                with patches[5]:
+                    return zavod_guard.run_guarded(
+                        Path(temp_dir) / "config.toml"
+                    )
+
+    def test_output_pump_drains_and_redacts_before_log_close(self):
+        config = valid_config()
+        child = Mock(pid=123, returncode=0)
+        child.stdout = io.BytesIO(b"before secret-wallet after")
+
+        def fake_popen(*args, **kwargs):
+            self.assertIs(kwargs["stdout"], subprocess.PIPE)
+            self.assertIs(kwargs["stderr"], subprocess.STDOUT)
+            return child
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.toml"
+            with (
+                patch.object(zavod_guard, "load_config", return_value=config),
+                patch.object(
+                    zavod_guard,
+                    "preflight",
+                    return_value={
+                        "wallet": "public-address",
+                        "balance_lamports": 100_000_000,
+                    },
+                ),
+                patch.object(
+                    zavod_guard.subprocess,
+                    "Popen",
+                    side_effect=fake_popen,
+                ),
+                patch.object(
+                    zavod_guard,
+                    "supervise",
+                    return_value={
+                        "reason": "child_exit",
+                        "start_balance": 100_000_000,
+                        "end_balance": 100_000_000,
+                        "observed_loss": 0,
+                        "child_exit_code": 0,
+                    },
+                ),
+                patch.object(
+                    zavod_guard,
+                    "_shutdown_child",
+                    return_value={
+                        "exit_code": 0,
+                        "group_absent": True,
+                        "interrupted": False,
+                    },
+                ),
+            ):
+                result = zavod_guard.run_guarded(config_path)
+
+            log_text = (Path(temp_dir) / result["log_path"]).read_text()
+            self.assertEqual(log_text, "before <redacted> after")
+
+    def test_output_failure_does_not_raise_during_finalization(self):
+        pump = Mock()
+        pump.output_error_event = threading.Event()
+        pump.output_error_event.set()
+        pump.is_alive.return_value = False
+        pump.redactor.close.side_effect = OSError("sink failed")
+        result = self.run_with_mocks(pump=pump)
+        self.assertEqual(result["reason"], "output_error")
+
+    def test_cleanup_interrupt_becomes_operator_signal(self):
+        result = self.run_with_mocks(
+            cleanup={
+                "exit_code": 0,
+                "group_absent": True,
+                "interrupted": True,
+            }
+        )
+        self.assertEqual(result["reason"], "operator_signal")
+
+    def test_interrupt_during_pump_join_is_retried(self):
+        pump = Mock()
+        pump.output_error_event = threading.Event()
+        pump.join.side_effect = [KeyboardInterrupt(), None]
+        pump.is_alive.return_value = False
+        result = self.run_with_mocks(pump=pump)
+        self.assertEqual(pump.join.call_count, 2)
+        self.assertEqual(result["reason"], "operator_signal")
 
 
 class RunGuardedWrapperTests(unittest.TestCase):

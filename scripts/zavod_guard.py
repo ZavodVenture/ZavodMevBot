@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import codecs
 import json
 import os
 import re
@@ -7,6 +8,7 @@ import shutil
 import signal
 import subprocess
 import tempfile
+import threading
 import time
 import tomllib
 import urllib.request
@@ -246,6 +248,111 @@ def redact_text(text, config):
     return text
 
 
+def _redaction_secrets(config):
+    values = [
+        _get(config, "wallet", "private_key"),
+        _get(config, "rpc", "url"),
+        _get(config, "circular", "api-key"),
+        _get(config, "falcon", "uuid"),
+        _get(config, "jito", "uuid"),
+    ]
+    values.extend(_get(config, "spam", "sending_rpc_urls", []))
+    return tuple(
+        sorted(
+            {value for value in values if isinstance(value, str) and len(value) >= 4},
+            key=len,
+            reverse=True,
+        )
+    )
+
+
+class StreamingRedactor:
+    def __init__(self, sink, secrets):
+        self.sink = sink
+        self.secrets = tuple(sorted(set(secrets), key=len, reverse=True))
+        self.buffer = ""
+        self.keep = max((len(secret) - 1 for secret in self.secrets), default=0)
+        self.closed = False
+
+    def _drain_one(self):
+        for secret in self.secrets:
+            if self.buffer.startswith(secret):
+                self.sink.write("<redacted>")
+                self.buffer = self.buffer[len(secret):]
+                return
+        self.sink.write(self.buffer[0])
+        self.buffer = self.buffer[1:]
+
+    def feed(self, text):
+        if self.closed:
+            raise ValueError("streaming redactor is closed")
+        self.buffer += text
+        while len(self.buffer) > self.keep:
+            self._drain_one()
+        self.sink.flush()
+
+    def close(self):
+        if self.closed:
+            return
+        while self.buffer:
+            self._drain_one()
+        self.sink.flush()
+        self.closed = True
+
+
+class OutputPump:
+    def __init__(self, source, sink, config):
+        self.source = source
+        self.redactor = StreamingRedactor(sink, _redaction_secrets(config))
+        self.output_error_event = threading.Event()
+        self.stop_event = threading.Event()
+        self.decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        try:
+            os.set_blocking(self.source.fileno(), False)
+        except (AttributeError, OSError, TypeError, ValueError):
+            pass
+        self.thread = threading.Thread(target=self._run, daemon=True)
+
+    def _run(self):
+        try:
+            while not self.stop_event.is_set():
+                try:
+                    chunk = self.source.read(4096)
+                except BlockingIOError:
+                    chunk = None
+                if chunk is None:
+                    self.stop_event.wait(0.05)
+                    continue
+                if not chunk:
+                    tail = self.decoder.decode(b"", final=True)
+                    if tail:
+                        self.redactor.feed(tail)
+                    break
+                if isinstance(chunk, bytes):
+                    chunk = self.decoder.decode(chunk, final=False)
+                if chunk:
+                    self.redactor.feed(chunk)
+        except Exception:
+            self.output_error_event.set()
+        finally:
+            try:
+                self.redactor.close()
+            except Exception:
+                self.output_error_event.set()
+
+    def start(self):
+        self.thread.start()
+
+    def stop(self):
+        self.stop_event.set()
+
+    def join(self, timeout):
+        self.thread.join(timeout)
+
+    def is_alive(self):
+        return self.thread.is_alive()
+
+
 def wallet_pubkey(secret):
     decoded = base58_decode(secret)
     if len(decoded) != 64:
@@ -309,17 +416,142 @@ def should_stop_for_loss(start_balance, current_balance):
     return start_balance - current_balance >= EARLY_STOP_LAMPORTS
 
 
-def _shutdown_child(child, killpg=os.killpg):
-    for sig, wait_seconds in ((signal.SIGINT, 5), (signal.SIGTERM, 3), (signal.SIGKILL, 3)):
+DEFAULT_SIGNAL_GRACE = (
+    (signal.SIGINT, 5),
+    (signal.SIGTERM, 3),
+    (signal.SIGKILL, 3),
+)
+MAX_INTERRUPT_RETRIES = 32
+
+
+def _retry_keyboard_interrupt(call):
+    interrupted = False
+    for _ in range(MAX_INTERRUPT_RETRIES):
         try:
-            killpg(child.pid, sig)
+            return call(), interrupted
+        except KeyboardInterrupt:
+            interrupted = True
+    raise GuardError("cleanup repeatedly interrupted")
+
+
+def _process_group_exists(pgid):
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _shutdown_child(
+    child,
+    killpg=os.killpg,
+    group_exists=None,
+    monotonic=time.monotonic,
+    sleep=time.sleep,
+    signal_grace=DEFAULT_SIGNAL_GRACE,
+):
+    verifier = group_exists or _process_group_exists
+    interrupted = False
+    try:
+        exit_code, was_interrupted = _retry_keyboard_interrupt(child.poll)
+        interrupted |= was_interrupted
+        exists, was_interrupted = _retry_keyboard_interrupt(
+            lambda: verifier(child.pid)
+        )
+        interrupted |= was_interrupted
+    except GuardError:
+        return {
+            "exit_code": None,
+            "group_absent": False,
+            "interrupted": True,
+        }
+    if not exists:
+        return {
+            "exit_code": exit_code,
+            "group_absent": True,
+            "interrupted": interrupted,
+        }
+    for sig, grace in signal_grace:
+        try:
+            _, was_interrupted = _retry_keyboard_interrupt(
+                lambda sig=sig: killpg(child.pid, sig)
+            )
+            interrupted |= was_interrupted
         except ProcessLookupError:
-            return child.poll()
-        try:
-            return child.wait(timeout=wait_seconds)
-        except subprocess.TimeoutExpired:
+            pass
+        except GuardError:
+            interrupted = True
             continue
-    return child.poll()
+        try:
+            started, was_interrupted = _retry_keyboard_interrupt(monotonic)
+            interrupted |= was_interrupted
+        except GuardError:
+            interrupted = True
+            continue
+        while True:
+            try:
+                exists, was_interrupted = _retry_keyboard_interrupt(
+                    lambda: verifier(child.pid)
+                )
+                interrupted |= was_interrupted
+                now, was_interrupted = _retry_keyboard_interrupt(monotonic)
+                interrupted |= was_interrupted
+            except GuardError:
+                interrupted = True
+                exists = True
+                break
+            if not exists or now - started >= grace:
+                break
+            try:
+                _, was_interrupted = _retry_keyboard_interrupt(
+                    lambda: sleep(0.05)
+                )
+                interrupted |= was_interrupted
+            except GuardError:
+                interrupted = True
+                break
+        try:
+            polled, was_interrupted = _retry_keyboard_interrupt(child.poll)
+            interrupted |= was_interrupted
+        except GuardError:
+            interrupted = True
+            polled = None
+        if polled is not None:
+            exit_code = polled
+        if not exists:
+            break
+    if exists:
+        try:
+            exists, was_interrupted = _retry_keyboard_interrupt(
+                lambda: verifier(child.pid)
+            )
+            interrupted |= was_interrupted
+        except GuardError:
+            exists = True
+            interrupted = True
+    return {
+        "exit_code": exit_code,
+        "group_absent": not exists,
+        "interrupted": interrupted,
+    }
+
+
+def _verified_shutdown(child, **kwargs):
+    try:
+        cleanup, interrupted = _retry_keyboard_interrupt(
+            lambda: _shutdown_child(child, **kwargs)
+        )
+    except GuardError:
+        return {
+            "exit_code": None,
+            "group_absent": False,
+            "interrupted": True,
+        }
+    if interrupted:
+        cleanup = {**cleanup, "interrupted": True}
+    return cleanup
 
 
 def supervise(
@@ -328,36 +560,55 @@ def supervise(
     balance_reader,
     monotonic,
     sleep,
+    output_error_event=None,
     killpg=os.killpg,
+    group_exists=None,
+    signal_grace=DEFAULT_SIGNAL_GRACE,
     timeout_seconds=DEFAULT_TIMEOUT_SECONDS,
+    cleanup_child=True,
 ):
-    started_at = monotonic()
     end_balance = start_balance
     reason = None
     exit_code = None
-    while reason is None:
-        polled = child.poll()
-        if polled is not None:
-            reason = "child_exit"
-            exit_code = polled
-            break
-        if monotonic() - started_at >= timeout_seconds:
-            reason = "timeout"
-            break
-        try:
-            end_balance = balance_reader()
-        except GuardError:
-            reason = "rpc_error"
-            break
-        except KeyboardInterrupt:
-            reason = "operator_signal"
-            break
-        if should_stop_for_loss(start_balance, end_balance):
-            reason = "loss_threshold"
-            break
-        sleep(1)
-    if reason != "child_exit":
-        exit_code = _shutdown_child(child, killpg)
+    try:
+        started_at = monotonic()
+        while reason is None:
+            if output_error_event is not None and output_error_event.is_set():
+                reason = "output_error"
+                break
+            polled = child.poll()
+            if polled is not None:
+                reason = "child_exit"
+                exit_code = polled
+                break
+            if monotonic() - started_at >= timeout_seconds:
+                reason = "timeout"
+                break
+            try:
+                end_balance = balance_reader()
+            except GuardError:
+                reason = "rpc_error"
+                break
+            if should_stop_for_loss(start_balance, end_balance):
+                reason = "loss_threshold"
+                break
+            sleep(1)
+    except KeyboardInterrupt:
+        reason = "operator_signal"
+    finally:
+        if cleanup_child:
+            cleanup = _verified_shutdown(
+                child,
+                killpg=killpg,
+                group_exists=group_exists,
+                signal_grace=signal_grace,
+            )
+            if cleanup["exit_code"] is not None:
+                exit_code = cleanup["exit_code"]
+            if not cleanup["group_absent"]:
+                reason = "cleanup_failed"
+            elif cleanup["interrupted"] and reason != "output_error":
+                reason = "operator_signal"
     return {
         "reason": reason,
         "start_balance": start_balance,
@@ -446,40 +697,112 @@ def run_guarded(config_path, timeout_seconds=DEFAULT_TIMEOUT_SECONDS, profile="d
     fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     started = time.monotonic()
     child = None
+    pump = None
+    result = None
+    finalization_interrupted = False
+    pump_alive = False
+    prior_sigterm = signal.getsignal(signal.SIGTERM)
+
+    def interrupt_handler(signum, frame):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, interrupt_handler)
+    log_handle = os.fdopen(fd, "w", buffering=1)
     try:
-        with os.fdopen(fd, "w", buffering=1) as log_handle:
-            child = subprocess.Popen(
-                [str(root / "zavod-mev-bot-rust-version-cli"), "run"],
-                cwd=root,
-                stdout=log_handle,
-                stderr=subprocess.STDOUT,
-                text=True,
-                start_new_session=True,
-            )
-            prior_sigterm = signal.getsignal(signal.SIGTERM)
-
-            def interrupt_handler(signum, frame):
-                raise KeyboardInterrupt
-
-            signal.signal(signal.SIGTERM, interrupt_handler)
-            try:
-                result = supervise(
-                    child=child,
-                    start_balance=start_balance,
-                    balance_reader=lambda: get_balance_lamports(rpc_url, public_key),
-                    monotonic=time.monotonic,
-                    sleep=time.sleep,
-                    timeout_seconds=timeout_seconds,
-                )
-            finally:
-                signal.signal(signal.SIGTERM, prior_sigterm)
+        child = subprocess.Popen(
+            [str(root / "zavod-mev-bot-rust-version-cli"), "run"],
+            cwd=root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        pump = OutputPump(child.stdout, log_handle, config)
+        pump.start()
+        result = supervise(
+            child=child,
+            start_balance=start_balance,
+            balance_reader=lambda: get_balance_lamports(rpc_url, public_key),
+            monotonic=time.monotonic,
+            sleep=time.sleep,
+            output_error_event=pump.output_error_event,
+            timeout_seconds=timeout_seconds,
+            cleanup_child=False,
+        )
+    except KeyboardInterrupt:
+        result = {
+            "reason": "operator_signal",
+            "start_balance": start_balance,
+            "end_balance": start_balance,
+            "observed_loss": 0,
+            "child_exit_code": None,
+        }
     finally:
+        cleanup = (
+            _verified_shutdown(child)
+            if child is not None
+            else {"exit_code": None, "group_absent": True, "interrupted": False}
+        )
+        if pump is not None:
+            try:
+                _, interrupted = _retry_keyboard_interrupt(
+                    lambda: pump.join(5)
+                )
+                finalization_interrupted |= interrupted
+            except GuardError:
+                finalization_interrupted = True
+                pump.output_error_event.set()
+            pump_alive = pump.is_alive()
+            if pump_alive:
+                pump.output_error_event.set()
+                try:
+                    _, interrupted = _retry_keyboard_interrupt(pump.stop)
+                    finalization_interrupted |= interrupted
+                    _, interrupted = _retry_keyboard_interrupt(
+                        lambda: pump.join(1)
+                    )
+                    finalization_interrupted |= interrupted
+                except GuardError:
+                    finalization_interrupted = True
+                pump_alive = pump.is_alive()
         try:
-            raw_log = log_path.read_text(errors="replace")
-            log_path.write_text(redact_text(raw_log, config))
+            if not pump_alive:
+                try:
+                    _, interrupted = _retry_keyboard_interrupt(
+                        log_handle.close
+                    )
+                    finalization_interrupted |= interrupted
+                except GuardError:
+                    finalization_interrupted = True
+                    if pump is not None:
+                        pump.output_error_event.set()
+                except Exception:
+                    if pump is not None:
+                        pump.output_error_event.set()
             log_path.chmod(0o600)
-        except OSError:
-            pass
+        finally:
+            try:
+                _, interrupted = _retry_keyboard_interrupt(
+                    lambda: signal.signal(signal.SIGTERM, prior_sigterm)
+                )
+                finalization_interrupted |= interrupted
+            except GuardError:
+                finalization_interrupted = True
+    if result is None:
+        result = {
+            "reason": "output_error",
+            "start_balance": start_balance,
+            "end_balance": start_balance,
+            "observed_loss": 0,
+            "child_exit_code": cleanup["exit_code"],
+        }
+    if cleanup["exit_code"] is not None:
+        result["child_exit_code"] = cleanup["exit_code"]
+    if not cleanup["group_absent"]:
+        result["reason"] = "cleanup_failed"
+    elif pump is not None and (pump.output_error_event.is_set() or pump.is_alive()):
+        result["reason"] = "output_error"
+    elif cleanup["interrupted"] or finalization_interrupted:
+        result["reason"] = "operator_signal"
     result["duration_seconds"] = round(time.monotonic() - started, 3)
     result["log_path"] = str(log_path.relative_to(root))
     result["loss_limit_lamports"] = LOSS_LIMIT_LAMPORTS
