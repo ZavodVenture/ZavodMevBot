@@ -2,9 +2,12 @@ import contextlib
 import copy
 import io
 import json
+import os
+import re
 import shutil
 import signal
 import stat
+import subprocess
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -132,6 +135,94 @@ class MintRunnerTestCase(unittest.TestCase):
                     self.prepare()
                 (self.root / "config.toml").write_bytes(self.original_config)
                 (self.root / "config.toml").chmod(0o600)
+
+    def test_prepare_uses_shared_environment_expansion_for_rpc_and_wallet(self):
+        rpc_variable = "ZAVOD_TEST_RPC_VALUE"
+        wallet_variable = "ZAVOD_TEST_WALLET_VALUE"
+        expanded_rpc = "mock-rpc-transport-value"
+        expanded_wallet = "mock-wallet-config-value"
+        (self.root / "config.toml").write_text(
+            "[auto]\n"
+            "enabled = true\n"
+            "[rpc]\n"
+            f'url = "${{{rpc_variable}}}"\n'
+            "[wallet]\n"
+            f'private_key = "${{{wallet_variable}}}"\n'
+        )
+        (self.root / "config.toml").chmod(0o600)
+        observed = {}
+
+        def transport(url, payload, timeout):
+            observed["rpc"] = url
+            return self.valid_transport(url, payload, timeout)
+
+        with patch.dict(
+            os.environ,
+            {
+                rpc_variable: expanded_rpc,
+                wallet_variable: expanded_wallet,
+            },
+            clear=False,
+        ):
+            prepared = self.prepare(transport=transport)
+
+        self.assertEqual(observed["rpc"], expanded_rpc)
+        rendered = json.dumps(prepared.safe_summary(), sort_keys=True)
+        self.assertNotIn(expanded_rpc, rendered)
+        self.assertNotIn(expanded_wallet, rendered)
+        mint_runner.restore_run(self.root, prepared.run_id)
+
+    def test_prepare_rejects_enabled_static_markets_before_rpc_or_snapshot(self):
+        (self.root / "config.toml").write_text(
+            "[auto]\n"
+            "enabled = true\n"
+            "[rpc]\n"
+            'url = "mock-rpc"\n'
+            "[[markets_file]]\n"
+            "enabled = true\n"
+            'path = "markets.toml"\n'
+        )
+        (self.root / "config.toml").chmod(0o600)
+        rpc_called = False
+
+        def transport(url, payload, timeout):
+            del url, payload, timeout
+            nonlocal rpc_called
+            rpc_called = True
+            return {}
+
+        with self.assertRaises(mint_runner.RunnerError):
+            self.prepare(transport=transport)
+
+        self.assertFalse(rpc_called)
+        self.assertFalse((self.root / "state" / ".mint-run-active").exists())
+
+    def test_guarded_preflight_uses_single_mint_auto_profile(self):
+        completed = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=(
+                "preflight=ok\n"
+                "cli_version=0.2.2\n"
+                "loss_limit_lamports=30000000\n"
+                "early_stop_lamports=25000000\n"
+            ),
+            stderr="",
+        )
+        with patch.object(
+            mint_runner.subprocess,
+            "run",
+            return_value=completed,
+        ) as runner:
+            mint_runner._run_preflight(self.root)
+
+        self.assertIn(
+            ["--profile", "single-mint-auto"],
+            [
+                runner.call_args.args[0][index:index + 2]
+                for index in range(len(runner.call_args.args[0]) - 1)
+            ],
+        )
 
     def test_active_process_and_wrong_cli_version_fail_closed(self):
         with self.assertRaises(mint_runner.RunnerError):
@@ -1478,7 +1569,7 @@ class FinalizationTests(MintRunnerTestCase):
         prepared = self.prepare()
         self.write_guard_result(prepared)
         generated_hot = b'{"generated": true}\n'
-        generated_routing = b"generated routing\n"
+        generated_routing = b'{"generated_route": true}\n'
         (self.root / "hot_tokens.json").write_bytes(generated_hot)
         (self.root / "routing.json").write_bytes(generated_routing)
         (self.root / "hot_tokens.json").chmod(0o600)
@@ -1500,12 +1591,20 @@ class FinalizationTests(MintRunnerTestCase):
         self.assertNotIn("https://secret.invalid", rendered)
         self.assertNotIn("signature", rendered.lower())
         self.assertEqual(
-            (prepared.result_dir / "generated-hot_tokens.json").read_bytes(),
-            generated_hot,
+            json.loads(
+                (
+                    prepared.result_dir / "generated-hot_tokens.json"
+                ).read_bytes()
+            ),
+            json.loads(generated_hot),
         )
         self.assertEqual(
-            (prepared.result_dir / "generated-routing.json").read_bytes(),
-            generated_routing,
+            json.loads(
+                (
+                    prepared.result_dir / "generated-routing.json"
+                ).read_bytes()
+            ),
+            json.loads(generated_routing),
         )
         self.assertEqual(
             stat.S_IMODE(
@@ -1857,6 +1956,125 @@ class FinalizationTests(MintRunnerTestCase):
         self.assertFalse(generated.exists())
         self.assertEqual((self.root / "tokens.toml").read_bytes(), self.original_tokens)
         self.assertFalse((self.root / "state" / ".mint-run-active").exists())
+
+    def test_finalize_rejects_non_json_generated_artifact_and_restores(self):
+        prepared = self.prepare()
+        self.write_guard_result(prepared)
+        generated = self.root / "hot_tokens.json"
+        generated.write_bytes(b"not-json-runtime-output")
+        generated.chmod(0o600)
+
+        with self.assertRaises(mint_runner.RunnerError):
+            mint_runner.finalize_run(
+                self.root,
+                prepared.run_id,
+                guard_exit=0,
+                started_at=100,
+                ended_at=400,
+                chain_aggregator=lambda *args, **kwargs: self.zero_chain(),
+            )
+
+        self.assertFalse(
+            (prepared.result_dir / "generated-hot_tokens.json").exists()
+        )
+        self.assertEqual(
+            (self.root / "tokens.toml").read_bytes(),
+            self.original_tokens,
+        )
+        self.assertFalse((self.root / "state" / ".mint-run-active").exists())
+
+    def test_finalize_sanitizes_every_persisted_artifact_and_result_file(self):
+        rpc_variable = "ZAVOD_TEST_FINAL_RPC"
+        wallet_variable = "ZAVOD_TEST_FINAL_WALLET"
+        expanded_rpc = "exact-rpc-config-value"
+        expanded_wallet = "exact-wallet-config-value"
+        (self.root / "config.toml").write_text(
+            "[auto]\n"
+            "enabled = true\n"
+            "[rpc]\n"
+            f'url = "${{{rpc_variable}}}"\n'
+            "[wallet]\n"
+            f'private_key = "${{{wallet_variable}}}"\n'
+        )
+        (self.root / "config.toml").chmod(0o600)
+        protected_uuid = "12345678-1234-4234-9234-123456789abc"
+        protected_signature = "4" * 88
+        protected_url = "https://example.invalid/path?credential=value"
+        artifact = {
+            "nested": {
+                "uuid": protected_uuid,
+                "signature": protected_signature,
+                "url": protected_url,
+                "wallet": expanded_wallet,
+                expanded_rpc: "protected-key",
+            }
+        }
+
+        with patch.dict(
+            os.environ,
+            {
+                rpc_variable: expanded_rpc,
+                wallet_variable: expanded_wallet,
+            },
+            clear=False,
+        ):
+            prepared = self.prepare()
+            log = self.write_guard_result(prepared)
+            for name in ("hot_tokens.json", "routing.json"):
+                (self.root / name).write_text(json.dumps(artifact))
+                (self.root / name).chmod(0o600)
+            observed_config = {}
+
+            def aggregate(config, *args, **kwargs):
+                del args, kwargs
+                observed_config.update(config)
+                return self.zero_chain()
+
+            mint_runner.finalize_run(
+                self.root,
+                prepared.run_id,
+                guard_exit=0,
+                started_at=100,
+                ended_at=400,
+                chain_aggregator=aggregate,
+            )
+
+        self.assertEqual(observed_config["rpc"]["url"], expanded_rpc)
+        self.assertEqual(
+            observed_config["wallet"]["private_key"],
+            expanded_wallet,
+        )
+        persisted = [log]
+        persisted.extend(
+            path
+            for path in prepared.result_dir.iterdir()
+            if path.is_file()
+        )
+        for path in persisted:
+            with self.subTest(path=path.name):
+                rendered = path.read_text(errors="replace")
+                self.assertNotRegex(
+                    rendered,
+                    re.compile(
+                        r"[0-9a-fA-F]{8}-"
+                        r"[0-9a-fA-F]{4}-"
+                        r"[0-9a-fA-F]{4}-"
+                        r"[0-9a-fA-F]{4}-"
+                        r"[0-9a-fA-F]{12}"
+                    ),
+                )
+                self.assertNotRegex(
+                    rendered,
+                    re.compile(
+                        r"[1-9A-HJ-NP-Za-km-z]{86,}"
+                    ),
+                )
+                for protected in (
+                    protected_url,
+                    expanded_rpc,
+                    expanded_wallet,
+                ):
+                    self.assertNotIn(protected, rendered)
 
     def test_finalize_rejects_symlink_destination_without_overwriting_target(self):
         prepared = self.prepare()

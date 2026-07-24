@@ -46,6 +46,7 @@ class MintRunShellTests(unittest.TestCase):
             """\
             #!/usr/bin/env python3
             import pathlib
+            import signal
             import sys
             import time
 
@@ -57,6 +58,18 @@ class MintRunShellTests(unittest.TestCase):
                 handle.write(command + " " + " ".join(args) + "\\n")
 
             if command == "prepare":
+                if (root / "slow-prepare").exists():
+                    def interrupted(signum, frame):
+                        del frame
+                        (root / "prepare.signal").write_text(
+                            signal.Signals(signum).name
+                        )
+                        raise SystemExit(128 + signum)
+
+                    signal.signal(signal.SIGINT, interrupted)
+                    signal.signal(signal.SIGTERM, interrupted)
+                    (root / "prepare.started").touch()
+                    time.sleep(0.5)
                 custom = root / "prepare-output.txt"
                 if custom.exists():
                     print(custom.read_text(), end="")
@@ -162,7 +175,10 @@ class MintRunShellTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
             self.guard_invocations(),
-            ["--live-confirmed --timeout 60"],
+            [
+                "--live-confirmed --timeout 60 "
+                "--profile single-mint-auto"
+            ],
         )
         finalize_args = (self.root / "finalize.called").read_text().split()
         started_at = int(finalize_args[finalize_args.index("--started-at") + 1])
@@ -233,7 +249,10 @@ class MintRunShellTests(unittest.TestCase):
         self.assertEqual(result.returncode, 23, result.stderr)
         self.assertEqual(
             self.guard_invocations(),
-            ["--live-confirmed --timeout 60"],
+            [
+                "--live-confirmed --timeout 60 "
+                "--profile single-mint-auto"
+            ],
         )
         self.assertTrue((self.root / "finalize.called").exists())
         self.assertTrue((self.root / "restore.called").exists())
@@ -255,7 +274,10 @@ class MintRunShellTests(unittest.TestCase):
         self.assertEqual(result.returncode, 23, result.stderr)
         self.assertEqual(
             self.guard_invocations(),
-            ["--live-confirmed --timeout 60"],
+            [
+                "--live-confirmed --timeout 60 "
+                "--profile single-mint-auto"
+            ],
         )
         self.assertTrue((self.root / "finalize.called").exists())
         self.assertTrue((self.root / "restore.called").exists())
@@ -390,7 +412,10 @@ class MintRunShellTests(unittest.TestCase):
         )
         self.assertEqual(
             self.guard_invocations(),
-            ["--live-confirmed --timeout 60"],
+            [
+                "--live-confirmed --timeout 60 "
+                "--profile single-mint-auto"
+            ],
         )
         self.assertTrue((self.root / "finalize.called").exists())
         self.assertTrue((self.root / "restore.called").exists())
@@ -513,6 +538,116 @@ class MintRunShellTests(unittest.TestCase):
                 )
                 self.assertTrue((self.root / "finalize.called").exists())
                 self.assertTrue((self.root / "restore.called").exists())
+
+    def test_signals_during_preparation_abort_before_prompt_and_restore_active(self):
+        for sent_signal, expected_name, expected_status in (
+            (signal.SIGINT, "SIGINT", 130),
+            (signal.SIGTERM, "SIGTERM", 143),
+        ):
+            with self.subTest(sent_signal=sent_signal):
+                for name in (
+                    "prepare.started",
+                    "prepare.signal",
+                    "restore-active.called",
+                ):
+                    (self.root / name).unlink(missing_ok=True)
+                (self.root / "slow-prepare").touch()
+                process = subprocess.Popen(
+                    [
+                        "bash",
+                        "scripts/mint-run.sh",
+                        TARGET_MINT,
+                        "--timeout",
+                        "60",
+                    ],
+                    cwd=self.root,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                for _ in range(200):
+                    if (self.root / "prepare.started").exists():
+                        break
+                    time.sleep(0.01)
+                else:
+                    process.kill()
+                    process.communicate()
+                    self.fail("fake preparation did not start")
+
+                os.kill(process.pid, sent_signal)
+                stdout, stderr = process.communicate(timeout=5)
+
+                self.assertEqual(process.returncode, expected_status, stderr)
+                self.assertTrue((self.root / "prepare.signal").exists())
+                self.assertEqual(
+                    (self.root / "prepare.signal").read_text(),
+                    expected_name,
+                )
+                self.assertNotIn("Type exactly:", stdout)
+                self.assertEqual(self.guard_invocations(), [])
+                self.assertTrue(
+                    (self.root / "restore-active.called").exists()
+                )
+                (self.root / "slow-prepare").unlink(missing_ok=True)
+
+    def test_mint_preparation_lock_blocks_direct_live_invocation(self):
+        actual_wrapper = (
+            Path(__file__).resolve().parents[1]
+            / "scripts"
+            / "run-guarded.sh"
+        )
+        shutil.copy2(
+            actual_wrapper,
+            self.root / "scripts" / "direct-run-guarded.sh",
+        )
+        self._write_executable(
+            "scripts/zavod_guard.py",
+            """\
+            #!/usr/bin/env python3
+            from pathlib import Path
+            Path("direct-guard.called").touch()
+            """,
+        )
+        (self.root / "slow-prepare").touch()
+        process = subprocess.Popen(
+            [
+                "bash",
+                "scripts/mint-run.sh",
+                TARGET_MINT,
+                "--timeout",
+                "60",
+            ],
+            cwd=self.root,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            for _ in range(200):
+                if (self.root / "prepare.started").exists():
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail("fake preparation did not start")
+
+            contender = subprocess.run(
+                [
+                    "bash",
+                    "scripts/direct-run-guarded.sh",
+                    "--live-confirmed",
+                ],
+                cwd=self.root,
+                text=True,
+                capture_output=True,
+                timeout=5,
+            )
+            self.assertNotEqual(contender.returncode, 0)
+            self.assertFalse((self.root / "direct-guard.called").exists())
+        finally:
+            os.kill(process.pid, signal.SIGTERM)
+            process.communicate(timeout=5)
 
 
 if __name__ == "__main__":

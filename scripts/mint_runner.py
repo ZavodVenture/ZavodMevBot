@@ -17,6 +17,11 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+try:
+    from scripts import zavod_guard
+except ModuleNotFoundError:
+    import zavod_guard
+
 
 ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 TOKEN_PROGRAM_ID = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
@@ -505,16 +510,15 @@ def _integrity_record(path):
 def _load_workspace_config(root):
     config_path = root / "config.toml"
     try:
-        if stat.S_IMODE(config_path.stat().st_mode) != 0o600:
-            raise RunnerError("config.toml must have mode 600")
-        with config_path.open("rb") as handle:
-            config = tomllib.load(handle)
+        config = zavod_guard.load_config_bytes(
+            _read_owned_file_no_follow(config_path, mode=0o600)
+        )
     except RunnerError:
         raise
-    except (OSError, tomllib.TOMLDecodeError) as exc:
+    except zavod_guard.GuardError as exc:
         raise RunnerError("config.toml is invalid or unreadable") from exc
-    if config.get("auto", {}).get("enabled") is not True:
-        raise RunnerError("auto mode must be enabled")
+    if zavod_guard.validate_single_mint_auto(config):
+        raise RunnerError("single-mint configuration is invalid")
     rpc_url = config.get("rpc", {}).get("url")
     if not isinstance(rpc_url, str) or not rpc_url:
         raise RunnerError("RPC configuration is missing")
@@ -523,7 +527,15 @@ def _load_workspace_config(root):
 
 def _run_preflight(root):
     result = subprocess.run(
-        ["python3", "scripts/zavod_guard.py", "preflight", "--config", "config.toml"],
+        [
+            "python3",
+            "scripts/zavod_guard.py",
+            "preflight",
+            "--config",
+            "config.toml",
+            "--profile",
+            "single-mint-auto",
+        ],
         cwd=root,
         text=True,
         capture_output=True,
@@ -981,8 +993,6 @@ def aggregate_chain(
     transport=None,
     pubkey_resolver=None,
 ):
-    from scripts import zavod_guard
-
     caller = transport or rpc_call
     rpc_url = config["rpc"]["url"]
     wallet = (
@@ -1246,7 +1256,67 @@ def _validate_log_path(root, value):
     return candidate
 
 
-def _capture_generated_artifact(directories, name):
+def _sanitize_json_value(value, policy, depth=0):
+    if depth > 64:
+        raise RunnerError("generated runtime artifact is invalid")
+    if value is None or isinstance(value, (bool, int)):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise RunnerError("generated runtime artifact is invalid")
+        return value
+    if isinstance(value, str):
+        return policy.redact_text(value)
+    if isinstance(value, list):
+        return [
+            _sanitize_json_value(item, policy, depth + 1)
+            for item in value
+        ]
+    if isinstance(value, dict):
+        sanitized = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise RunnerError("generated runtime artifact is invalid")
+            safe_key = policy.redact_text(key)
+            if safe_key in sanitized:
+                raise RunnerError("generated runtime artifact is invalid")
+            sanitized[safe_key] = _sanitize_json_value(
+                item,
+                policy,
+                depth + 1,
+            )
+        return sanitized
+    raise RunnerError("generated runtime artifact is invalid")
+
+
+def _sanitize_generated_artifact(data, policy):
+    try:
+        parsed = json.loads(
+            data.decode(),
+            parse_constant=lambda value: (_ for _ in ()).throw(
+                ValueError(value)
+            ),
+        )
+    except (UnicodeError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        raise RunnerError("generated runtime artifact is invalid") from exc
+    if not isinstance(parsed, (dict, list)):
+        raise RunnerError("generated runtime artifact is invalid")
+    sanitized = _sanitize_json_value(parsed, policy)
+    rendered = (
+        json.dumps(
+            sanitized,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
+        + "\n"
+    )
+    if policy.contains_protected(rendered):
+        raise RunnerError("generated runtime artifact is invalid")
+    return rendered.encode()
+
+
+def _capture_generated_artifact(directories, name, policy):
     data = _read_owned_file_at(
         directories.root_fd,
         name,
@@ -1258,7 +1328,7 @@ def _capture_generated_artifact(directories, name):
     _atomic_write_at(
         directories.result_fd,
         f"generated-{name}",
-        data,
+        _sanitize_generated_artifact(data, policy),
     )
 
 
@@ -1311,12 +1381,18 @@ def finalize_run(
             if not math.isfinite(duration) or duration < 0:
                 raise RunnerError("guard result is invalid")
             try:
-                config = tomllib.loads(
+                config = zavod_guard.load_config_bytes(
                     _read_owned_file_no_follow(
                         backup_dir / "config.toml",
                         mode=0o600,
-                    ).decode()
+                    )
                 )
+            except zavod_guard.GuardError as exc:
+                raise RunnerError("finalization failed") from exc
+            output_policy = zavod_guard.ProtectedOutputPolicy.from_config(
+                config
+            )
+            try:
                 chain = _sanitize_chain_summary(
                     (chain_aggregator or aggregate_chain)(
                         config,
@@ -1332,7 +1408,11 @@ def finalize_run(
                 chain = _empty_chain_summary()
                 aggregation_status = "failed"
             for name in OPTIONAL_FILES:
-                _capture_generated_artifact(directories, name)
+                _capture_generated_artifact(
+                    directories,
+                    name,
+                    output_policy,
+                )
             if isinstance(guard_exit, bool):
                 raise RunnerError("guard result is invalid")
             manifest = {
@@ -1398,13 +1478,18 @@ def _sigterm_as_keyboard_interrupt(signum, frame):
     raise KeyboardInterrupt()
 
 
-def _prepare_with_sigterm_handler(root, mint, timeout):
-    previous_handler = signal.getsignal(signal.SIGTERM)
-    signal.signal(signal.SIGTERM, _sigterm_as_keyboard_interrupt)
+def _prepare_with_signal_handlers(root, mint, timeout):
+    previous_handlers = {
+        signum: signal.getsignal(signum)
+        for signum in (signal.SIGINT, signal.SIGTERM)
+    }
+    for signum in previous_handlers:
+        signal.signal(signum, _sigterm_as_keyboard_interrupt)
     try:
         return prepare_run(root, mint, timeout)
     finally:
-        signal.signal(signal.SIGTERM, previous_handler)
+        for signum, previous_handler in previous_handlers.items():
+            signal.signal(signum, previous_handler)
 
 
 def _emit_command_failure(root, command, error, status):
@@ -1442,7 +1527,7 @@ def main(argv=None):
     root = Path(args.root).resolve()
     try:
         if args.command == "prepare":
-            prepared = _prepare_with_sigterm_handler(
+            prepared = _prepare_with_signal_handlers(
                 root, args.mint, args.timeout
             )
             _print_safe_summary(prepared)

@@ -62,12 +62,19 @@ class GuardError(RuntimeError):
     pass
 
 
+def load_config_bytes(data):
+    try:
+        return expand_environment(tomllib.loads(data.decode()))
+    except (UnicodeError, tomllib.TOMLDecodeError) as exc:
+        raise GuardError("config.toml is invalid or unreadable") from exc
+
+
 def load_config(path):
     try:
-        with Path(path).open("rb") as handle:
-            return expand_environment(tomllib.load(handle))
-    except (OSError, tomllib.TOMLDecodeError) as exc:
+        data = Path(path).read_bytes()
+    except OSError as exc:
         raise GuardError("config.toml is invalid or unreadable") from exc
+    return load_config_bytes(data)
 
 
 _ENV_VALUE = re.compile(r"^\$(?:\{)?([A-Za-z_][A-Za-z0-9_]*)(?:\})?$")
@@ -84,7 +91,7 @@ def expand_environment(value):
         if match:
             name = match.group(1)
             if name not in os.environ:
-                raise GuardError(f"environment variable {name} is required")
+                raise GuardError("required environment configuration is missing")
             return os.environ[name]
     return value
 
@@ -176,12 +183,36 @@ def validate_manual_single(config, root):
     return errors
 
 
+def validate_single_mint_auto(config):
+    errors = []
+    if _get(config, "auto", "enabled") is not True:
+        errors.append("auto.enabled must be true")
+    market_sources = config.get("markets_file", [])
+    if (
+        not isinstance(market_sources, list)
+        or any(
+            not isinstance(source, dict)
+            or source.get("enabled") is not False
+            for source in market_sources
+        )
+    ):
+        errors.append(
+            "single-mint auto requires all static market sources disabled"
+        )
+    return errors
+
+
 def validate_config(config, profile="default", root=None):
     errors = []
     expected_senders = dict(PROFILE_SENDERS.get(profile, EXPECTED_SENDERS))
     if profile == "ab-no-swqos":
         expected_senders["helius_swqos"] = False
-    elif profile not in ("default", "manual-single", *PROFILE_SENDERS):
+    elif profile not in (
+        "default",
+        "manual-single",
+        "single-mint-auto",
+        *PROFILE_SENDERS,
+    ):
         errors.append("unknown validation profile")
     for section, expected in expected_senders.items():
         if _get(config, section, "enabled") is not expected:
@@ -201,8 +232,11 @@ def validate_config(config, profile="default", root=None):
         if _get(config, "auto", "enabled") is not False:
             errors.append("auto.enabled must be false")
         errors.extend(validate_manual_single(config, root))
-    elif _get(config, "auto", "enabled") is not True:
-        errors.append("auto.enabled must be true")
+    else:
+        if profile == "single-mint-auto":
+            errors.extend(validate_single_mint_auto(config))
+        elif _get(config, "auto", "enabled") is not True:
+            errors.append("auto.enabled must be true")
     if _get(config, "flashloan", "enabled") is not True:
         errors.append("flashloan.enabled must be true")
     if _get(config, "dynamic_fees", "enabled") is not False:
@@ -233,69 +267,200 @@ def validate_config(config, profile="default", root=None):
     return errors
 
 
-def redact_text(text, config):
-    secrets = [
-        _get(config, "wallet", "private_key"),
-        _get(config, "rpc", "url"),
-        _get(config, "circular", "api-key"),
-        _get(config, "falcon", "uuid"),
-        _get(config, "jito", "uuid"),
-    ]
-    secrets.extend(_get(config, "spam", "sending_rpc_urls", []))
-    for secret in secrets:
-        if isinstance(secret, str) and len(secret) >= 4:
-            text = text.replace(secret, "<redacted>")
-    return text
-
-
 def _redaction_secrets(config):
-    values = [
-        _get(config, "wallet", "private_key"),
-        _get(config, "rpc", "url"),
-        _get(config, "circular", "api-key"),
-        _get(config, "falcon", "uuid"),
-        _get(config, "jito", "uuid"),
-    ]
-    values.extend(_get(config, "spam", "sending_rpc_urls", []))
+    values = []
+    sensitive_markers = (
+        "api_key",
+        "apikey",
+        "credential",
+        "password",
+        "private_key",
+        "secret",
+        "token",
+        "url",
+        "uuid",
+    )
+
+    def collect(value, sensitive=False):
+        if isinstance(value, dict):
+            for key, item in value.items():
+                normalized = str(key).lower().replace("-", "_")
+                collect(
+                    item,
+                    sensitive=sensitive
+                    or any(
+                        marker in normalized
+                        for marker in sensitive_markers
+                    ),
+                )
+        elif isinstance(value, list):
+            for item in value:
+                collect(item, sensitive=sensitive)
+        elif sensitive and isinstance(value, str) and value:
+            values.append(value)
+
+    collect(config)
     return tuple(
         sorted(
-            {value for value in values if isinstance(value, str) and len(value) >= 4},
+            set(values),
             key=len,
             reverse=True,
         )
     )
 
 
-class StreamingRedactor:
-    def __init__(self, sink, secrets):
-        self.sink = sink
-        self.secrets = tuple(sorted(set(secrets), key=len, reverse=True))
-        self.buffer = ""
-        self.keep = max((len(secret) - 1 for secret in self.secrets), default=0)
-        self.closed = False
+class ProtectedOutputPolicy:
+    UUID_PATTERN = re.compile(
+        r"(?i)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+        r"[0-9a-f]{4}-[0-9a-f]{12}"
+    )
+    SIGNATURE_PATTERN = re.compile(r"[1-9A-HJ-NP-Za-km-z]{86,}")
+    URL_SCHEME_PATTERN = re.compile(
+        r"[a-z][a-z0-9+.-]{0,31}://",
+        re.I,
+    )
+    URL_PATTERN = re.compile(
+        r"[a-z][a-z0-9+.-]{0,31}://[^\s<>\"'\[\]{}()]+",
+        re.I,
+    )
+    URL_DELIMITERS = frozenset("\"'<>[]{}()")
+    BASE58_CHARS = frozenset(ALPHABET)
+    GENERIC_STREAM_KEEP = 91
 
-    def _drain_one(self):
+    def __init__(self, secrets=()):
+        self.secrets = tuple(
+            sorted(
+                {
+                    value
+                    for value in secrets
+                    if isinstance(value, str) and value
+                },
+                key=len,
+                reverse=True,
+            )
+        )
+        self.stream_keep = max(
+            self.GENERIC_STREAM_KEEP,
+            max((len(secret) for secret in self.secrets), default=0),
+        )
+
+    @classmethod
+    def from_config(cls, config):
+        return cls(_redaction_secrets(config))
+
+    def redact_text(self, text):
         for secret in self.secrets:
+            text = text.replace(secret, "<redacted>")
+        text = self.URL_PATTERN.sub("<redacted>", text)
+        text = self.UUID_PATTERN.sub("<redacted>", text)
+        return self.SIGNATURE_PATTERN.sub("<redacted>", text)
+
+    def contains_protected(self, text):
+        return self.redact_text(text) != text
+
+
+def redact_text(text, config):
+    return ProtectedOutputPolicy.from_config(config).redact_text(text)
+
+
+class StreamingRedactor:
+    def __init__(self, sink, policy):
+        self.sink = sink
+        self.policy = (
+            policy
+            if isinstance(policy, ProtectedOutputPolicy)
+            else ProtectedOutputPolicy(policy)
+        )
+        self.buffer = ""
+        self.closed = False
+        self._discard_url = False
+        self._discard_signature = False
+
+    @staticmethod
+    def _is_url_delimiter(character):
+        return (
+            character.isspace()
+            or character in ProtectedOutputPolicy.URL_DELIMITERS
+        )
+
+    def _discard_protected_tail(self, kind):
+        if kind == "url":
+            predicate = lambda character: not self._is_url_delimiter(
+                character
+            )
+        else:
+            predicate = lambda character: (
+                character in ProtectedOutputPolicy.BASE58_CHARS
+            )
+        index = 0
+        while index < len(self.buffer) and predicate(self.buffer[index]):
+            index += 1
+        self.buffer = self.buffer[index:]
+        if self.buffer:
+            if kind == "url":
+                self._discard_url = False
+            else:
+                self._discard_signature = False
+
+    def _drain_one(self, final=False):
+        if not self.buffer:
+            return False
+        if self._discard_url:
+            self._discard_protected_tail("url")
+            return bool(self.buffer)
+        if self._discard_signature:
+            self._discard_protected_tail("signature")
+            return bool(self.buffer)
+
+        for secret in self.policy.secrets:
             if self.buffer.startswith(secret):
                 self.sink.write("<redacted>")
                 self.buffer = self.buffer[len(secret):]
-                return
+                return True
+
+        url_scheme_match = self.policy.URL_SCHEME_PATTERN.match(self.buffer)
+        if url_scheme_match is not None:
+            self.sink.write("<redacted>")
+            self.buffer = self.buffer[url_scheme_match.end():]
+            self._discard_url = True
+            return True
+
+        uuid_match = self.policy.UUID_PATTERN.match(self.buffer)
+        if uuid_match is not None:
+            self.sink.write("<redacted>")
+            self.buffer = self.buffer[uuid_match.end():]
+            return True
+
+        signature_match = self.policy.SIGNATURE_PATTERN.match(self.buffer)
+        if signature_match is not None:
+            self.sink.write("<redacted>")
+            self.buffer = self.buffer[signature_match.end():]
+            if (
+                not final
+                and not self.buffer
+            ):
+                self._discard_signature = True
+            return True
+
+        if not final and len(self.buffer) <= self.policy.stream_keep:
+            return False
         self.sink.write(self.buffer[0])
         self.buffer = self.buffer[1:]
+        return True
 
     def feed(self, text):
         if self.closed:
             raise ValueError("streaming redactor is closed")
         self.buffer += text
-        while len(self.buffer) > self.keep:
-            self._drain_one()
+        while self._drain_one():
+            pass
         self.sink.flush()
 
     def close(self):
         if self.closed:
             return
         while self.buffer:
-            self._drain_one()
+            self._drain_one(final=True)
         self.sink.flush()
         self.closed = True
 
@@ -303,7 +468,10 @@ class StreamingRedactor:
 class OutputPump:
     def __init__(self, source, sink, config):
         self.source = source
-        self.redactor = StreamingRedactor(sink, _redaction_secrets(config))
+        self.redactor = StreamingRedactor(
+            sink,
+            ProtectedOutputPolicy.from_config(config),
+        )
         self.output_error_event = threading.Event()
         self.stop_event = threading.Event()
         self.decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
@@ -572,6 +740,7 @@ def supervise(
     signal_grace=DEFAULT_SIGNAL_GRACE,
     timeout_seconds=DEFAULT_TIMEOUT_SECONDS,
     cleanup_child=True,
+    operator_signal_event=None,
 ):
     end_balance = start_balance
     reason = None
@@ -579,6 +748,12 @@ def supervise(
     try:
         started_at = monotonic()
         while reason is None:
+            if (
+                operator_signal_event is not None
+                and operator_signal_event.is_set()
+            ):
+                reason = "operator_signal"
+                break
             if output_error_event is not None and output_error_event.is_set():
                 reason = "output_error"
                 break
@@ -689,6 +864,12 @@ def preflight(
 
 
 def run_guarded(config_path, timeout_seconds=DEFAULT_TIMEOUT_SECONDS, profile="default"):
+    if (
+        isinstance(timeout_seconds, bool)
+        or not isinstance(timeout_seconds, int)
+        or not 30 <= timeout_seconds <= DEFAULT_TIMEOUT_SECONDS
+    ):
+        raise GuardError("timeout must be from 30 through 300 seconds")
     config_path = Path(config_path).resolve()
     root = config_path.parent
     config = load_config(config_path)
@@ -714,13 +895,17 @@ def run_guarded(config_path, timeout_seconds=DEFAULT_TIMEOUT_SECONDS, profile="d
         "group_absent": True,
         "interrupted": False,
     }
+    operator_signal_event = threading.Event()
+    prior_sigint = signal.getsignal(signal.SIGINT)
     prior_sigterm = signal.getsignal(signal.SIGTERM)
 
     def interrupt_handler(signum, frame):
-        raise KeyboardInterrupt
+        del signum, frame
+        operator_signal_event.set()
 
     try:
         log_handle = os.fdopen(fd, "w", buffering=1)
+        signal.signal(signal.SIGINT, interrupt_handler)
         signal.signal(signal.SIGTERM, interrupt_handler)
         child = subprocess.Popen(
             [str(root / "zavod-mev-bot-rust-version-cli"), "run"],
@@ -729,30 +914,43 @@ def run_guarded(config_path, timeout_seconds=DEFAULT_TIMEOUT_SECONDS, profile="d
             stderr=subprocess.STDOUT,
             start_new_session=True,
         )
-        pump = OutputPump(child.stdout, log_handle, config)
-        try:
-            pump.start()
-        except Exception:
-            pump.output_error_event.set()
+        if operator_signal_event.is_set():
             result = {
-                "reason": "output_error",
+                "reason": "operator_signal",
                 "start_balance": start_balance,
                 "end_balance": start_balance,
                 "observed_loss": 0,
                 "child_exit_code": None,
             }
         else:
-            pump_started = True
-            result = supervise(
-                child=child,
-                start_balance=start_balance,
-                balance_reader=lambda: get_balance_lamports(rpc_url, public_key),
-                monotonic=time.monotonic,
-                sleep=time.sleep,
-                output_error_event=pump.output_error_event,
-                timeout_seconds=timeout_seconds,
-                cleanup_child=False,
-            )
+            pump = OutputPump(child.stdout, log_handle, config)
+            try:
+                pump.start()
+            except Exception:
+                pump.output_error_event.set()
+                result = {
+                    "reason": "output_error",
+                    "start_balance": start_balance,
+                    "end_balance": start_balance,
+                    "observed_loss": 0,
+                    "child_exit_code": None,
+                }
+            else:
+                pump_started = True
+                result = supervise(
+                    child=child,
+                    start_balance=start_balance,
+                    balance_reader=lambda: get_balance_lamports(
+                        rpc_url,
+                        public_key,
+                    ),
+                    monotonic=time.monotonic,
+                    sleep=time.sleep,
+                    output_error_event=pump.output_error_event,
+                    timeout_seconds=timeout_seconds,
+                    cleanup_child=False,
+                    operator_signal_event=operator_signal_event,
+                )
     except KeyboardInterrupt:
         result = {
             "reason": "operator_signal",
@@ -810,6 +1008,10 @@ def run_guarded(config_path, timeout_seconds=DEFAULT_TIMEOUT_SECONDS, profile="d
         finally:
             try:
                 _, interrupted = _retry_keyboard_interrupt(
+                    lambda: signal.signal(signal.SIGINT, prior_sigint)
+                )
+                finalization_interrupted |= interrupted
+                _, interrupted = _retry_keyboard_interrupt(
                     lambda: signal.signal(signal.SIGTERM, prior_sigterm)
                 )
                 finalization_interrupted |= interrupted
@@ -832,7 +1034,11 @@ def run_guarded(config_path, timeout_seconds=DEFAULT_TIMEOUT_SECONDS, profile="d
         or (pump_started and pump.is_alive())
     ):
         result["reason"] = "output_error"
-    elif cleanup["interrupted"] or finalization_interrupted:
+    elif (
+        operator_signal_event.is_set()
+        or cleanup["interrupted"]
+        or finalization_interrupted
+    ):
         result["reason"] = "operator_signal"
     result["duration_seconds"] = round(time.monotonic() - started, 3)
     result["log_path"] = str(log_path.relative_to(root))

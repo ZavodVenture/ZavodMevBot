@@ -27,9 +27,57 @@ fi
 run_id=""
 finalized=0
 guard_pid=""
+prepare_pid=""
+prepare_output_path=""
 result_fd=""
 pending_signal=""
 pending_signal_status=0
+live_lock_fd=""
+live_lock_path="$root/state/.zavod-live.lock"
+
+lock_failure() {
+  echo 'Refusing live run: workspace live lock is unavailable.' >&2
+  exit 75
+}
+
+acquire_live_lock() {
+  [[ -d "$root/state" && ! -L "$root/state" ]] || lock_failure
+  local state_owner
+  state_owner="$(stat -Lc '%u' "$root/state" 2>/dev/null)" || lock_failure
+  [[ "$state_owner" == "$EUID" ]] || lock_failure
+
+  if [[ -e "$live_lock_path" || -L "$live_lock_path" ]]; then
+    [[ -f "$live_lock_path" && ! -L "$live_lock_path" ]] || lock_failure
+  else
+    (
+      set -o noclobber
+      : >"$live_lock_path"
+    ) 2>/dev/null || lock_failure
+    chmod 600 "$live_lock_path" 2>/dev/null || lock_failure
+  fi
+
+  if ! { exec {live_lock_fd}<>"$live_lock_path"; } 2>/dev/null; then
+    lock_failure
+  fi
+  local descriptor_identity path_identity
+  descriptor_identity="$(
+    stat -Lc '%d:%i:%u:%a' "/proc/$$/fd/$live_lock_fd" 2>/dev/null
+  )" || lock_failure
+  path_identity="$(
+    stat -Lc '%d:%i:%u:%a' "$live_lock_path" 2>/dev/null
+  )" || lock_failure
+  [[ "$descriptor_identity" == "$path_identity" ]] || lock_failure
+
+  local device inode owner mode
+  IFS=: read -r device inode owner mode <<<"$descriptor_identity"
+  [[
+    -n "$device" &&
+    -n "$inode" &&
+    "$owner" == "$EUID" &&
+    "$mode" == "600"
+  ]] || lock_failure
+  flock -n "$live_lock_fd" 2>/dev/null || lock_failure
+}
 
 close_result_fd() {
   if [[ -z "$result_fd" ]]; then
@@ -43,6 +91,14 @@ close_result_fd() {
 cleanup() {
   status=$?
   trap - EXIT
+  if [[ -n "$prepare_pid" ]] && kill -0 "$prepare_pid" 2>/dev/null; then
+    kill -TERM "$prepare_pid" 2>/dev/null || true
+    wait "$prepare_pid" 2>/dev/null || true
+  fi
+  if [[ -n "$prepare_output_path" ]]; then
+    rm -f -- "$prepare_output_path"
+    prepare_output_path=""
+  fi
   close_result_fd || true
   if [[ -n "$run_id" && "$finalized" -eq 0 ]]; then
     python3 scripts/mint_runner.py --root "$root" restore --run-id "$run_id" \
@@ -56,12 +112,13 @@ cleanup() {
 trap cleanup EXIT
 
 forward_pending_signal() {
-  if (
-    [[ -n "$pending_signal" && -n "$guard_pid" ]] &&
-    kill -0 "$guard_pid" 2>/dev/null
-  ); then
-    kill "-$pending_signal" "$guard_pid" 2>/dev/null || true
-  fi
+  [[ -n "$pending_signal" ]] || return 0
+  local child_pid
+  for child_pid in "$prepare_pid" "$guard_pid"; do
+    if [[ -n "$child_pid" ]] && kill -0 "$child_pid" 2>/dev/null; then
+      kill "-$pending_signal" "$child_pid" 2>/dev/null || true
+    fi
+  done
 }
 
 latch_int() {
@@ -79,11 +136,42 @@ latch_term() {
 trap latch_int INT
 trap latch_term TERM
 
-prepare_output="$(
-  python3 scripts/mint_runner.py --root "$root" prepare \
-    --mint "$mint" \
-    --timeout "$timeout_seconds"
+acquire_live_lock
+
+prepare_output_path="$(
+  mktemp "${TMPDIR:-/tmp}/zavod-mint-prepare.XXXXXX"
 )"
+if (( pending_signal_status != 0 )); then
+  exit "$pending_signal_status"
+fi
+set +e
+python3 scripts/mint_runner.py --root "$root" prepare \
+  --mint "$mint" \
+  --timeout "$timeout_seconds" \
+  >"$prepare_output_path" &
+prepare_pid=$!
+forward_pending_signal
+while true; do
+  wait "$prepare_pid"
+  prepare_wait_status=$?
+  if kill -0 "$prepare_pid" 2>/dev/null; then
+    forward_pending_signal
+    continue
+  fi
+  prepare_status=$prepare_wait_status
+  break
+done
+prepare_pid=""
+set -e
+if (( pending_signal_status != 0 )); then
+  exit "$pending_signal_status"
+fi
+if (( prepare_status != 0 )); then
+  exit "$prepare_status"
+fi
+prepare_output="$(<"$prepare_output_path")"
+rm -f -- "$prepare_output_path"
+prepare_output_path=""
 prepared_run_id="$(
   printf '%s\n' "$prepare_output" |
     awk -F= '$1 == "run_id" {print $2; exit}'
@@ -161,7 +249,11 @@ if (( pending_signal_status != 0 )); then
 fi
 
 set +e
-./scripts/run-guarded.sh --live-confirmed --timeout "$timeout_seconds" \
+ZAVOD_LIVE_LOCK_FD="$live_lock_fd" \
+  ./scripts/run-guarded.sh \
+  --live-confirmed \
+  --timeout "$timeout_seconds" \
+  --profile single-mint-auto \
   >&"$result_fd" &
 guard_pid=$!
 forward_pending_signal

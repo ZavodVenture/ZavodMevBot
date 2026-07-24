@@ -1,4 +1,5 @@
 import copy
+import fcntl
 import io
 import json
 import os
@@ -7,6 +8,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -261,6 +263,34 @@ class ConfigGuardTests(unittest.TestCase):
                 config = valid_config()
                 config["auto"]["enabled"] = False
                 self.assertIn("auto.enabled must be true", validate_config(config, profile=profile))
+
+    def test_single_mint_auto_rejects_every_enabled_static_market_source(self):
+        config = valid_config()
+        config["markets_file"] = [
+            {"enabled": False, "path": "disabled.toml"},
+            {"enabled": False, "path": "also-disabled.toml"},
+        ]
+        self.assertEqual(
+            validate_config(config, profile="single-mint-auto"),
+            [],
+        )
+
+        for sources in (
+            [{"enabled": True, "path": "markets.toml"}],
+            [{"path": "markets.toml"}],
+            ["markets.toml"],
+            {"enabled": False},
+        ):
+            with self.subTest(sources=sources):
+                config["markets_file"] = sources
+                errors = validate_config(
+                    config,
+                    profile="single-mint-auto",
+                )
+                self.assertIn(
+                    "single-mint auto requires all static market sources disabled",
+                    errors,
+                )
 
     def test_never_includes_secret_values_in_errors(self):
         sentinel = "NEVER_PRINT_THIS_SECRET"
@@ -549,6 +579,38 @@ class StreamingRedactorTests(unittest.TestCase):
         self.assertFalse(pump.is_alive())
         self.assertFalse(pump.output_error_event.is_set())
         self.assertEqual(sink.getvalue(), "before <redacted> after")
+
+    def test_protected_identifiers_are_redacted_across_chunk_boundaries(self):
+        protected_uuid = "12345678-1234-4234-9234-123456789abc"
+        protected_signature = "3" * 88
+        protected_url = "https://example.invalid/path?credential=value"
+        protected_exact = "environment-backed-secret"
+        text = "|".join(
+            (
+                protected_uuid,
+                protected_signature,
+                protected_url,
+                protected_exact,
+            )
+        )
+        sink = io.StringIO()
+        redactor = zavod_guard.StreamingRedactor(
+            sink,
+            zavod_guard.ProtectedOutputPolicy([protected_exact]),
+        )
+        for index in range(0, len(text), 7):
+            redactor.feed(text[index:index + 7])
+        redactor.close()
+
+        rendered = sink.getvalue()
+        for protected in (
+            protected_uuid,
+            protected_signature,
+            protected_url,
+            protected_exact,
+        ):
+            self.assertNotIn(protected, rendered)
+        self.assertGreaterEqual(rendered.count("<redacted>"), 3)
 
 
 class HardenedCleanupTests(unittest.TestCase):
@@ -846,17 +908,79 @@ class RunGuardedHardeningTests(unittest.TestCase):
         pump.join.assert_not_called()
         self.assertIs(restored_sigterm, prior_sigterm)
 
+    def test_signal_during_popen_startup_latches_then_cleans_returned_group(self):
+        config = valid_config()
+        child = Mock(pid=123, returncode=-signal.SIGTERM, stdout=io.BytesIO())
+        cleanup = {
+            "exit_code": -signal.SIGTERM,
+            "group_absent": True,
+            "interrupted": False,
+        }
+
+        def popen_with_startup_signal(*args, **kwargs):
+            del args, kwargs
+            signal.getsignal(signal.SIGTERM)(signal.SIGTERM, None)
+            return child
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.toml"
+            with (
+                patch.object(zavod_guard, "load_config", return_value=config),
+                patch.object(
+                    zavod_guard,
+                    "preflight",
+                    return_value={
+                        "wallet": "public-address",
+                        "balance_lamports": 100_000_000,
+                    },
+                ),
+                patch.object(
+                    zavod_guard.subprocess,
+                    "Popen",
+                    side_effect=popen_with_startup_signal,
+                ),
+                patch.object(
+                    zavod_guard,
+                    "_verified_shutdown",
+                    return_value=cleanup,
+                ) as shutdown,
+                patch.object(zavod_guard, "OutputPump") as output_pump,
+            ):
+                result = zavod_guard.run_guarded(config_path)
+
+        self.assertEqual(result["reason"], "operator_signal")
+        shutdown.assert_called_once_with(child)
+        output_pump.assert_not_called()
+
+    def test_run_guarded_defensively_rejects_timeout_outside_bounds(self):
+        for value in (29, 301):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(
+                    GuardError,
+                    "timeout must be from 30 through 300 seconds",
+                ):
+                    zavod_guard.run_guarded("unused-config.toml", value)
+
 
 class RunGuardedWrapperTests(unittest.TestCase):
     def setUp(self):
         self.root = Path(tempfile.mkdtemp())
         (self.root / "scripts").mkdir()
+        (self.root / "state").mkdir()
         source = Path(__file__).resolve().parents[1] / "scripts" / "run-guarded.sh"
         shutil.copy2(source, self.root / "scripts" / "run-guarded.sh")
         fake = self.root / "scripts" / "zavod_guard.py"
         fake.write_text(
             "#!/usr/bin/env python3\n"
-            "import json, sys\n"
+            "import json, pathlib, sys, time\n"
+            "root = pathlib.Path.cwd()\n"
+            "with (root / 'guard-launches').open('a') as handle:\n"
+            "    handle.write('launch\\n')\n"
+            "launch_count = len((root / 'guard-launches').read_text().splitlines())\n"
+            "if (root / 'hold-first-guard').exists() and launch_count == 1:\n"
+            "    (root / 'first-guard-started').touch()\n"
+            "    while not (root / 'release-first-guard').exists():\n"
+            "        time.sleep(0.01)\n"
             "print(json.dumps(sys.argv[1:]))\n"
         )
         fake.chmod(0o755)
@@ -864,12 +988,15 @@ class RunGuardedWrapperTests(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.root)
 
-    def invoke(self, *args):
+    def invoke(self, *args, env=None, pass_fds=()):
         return subprocess.run(
             ["bash", "scripts/run-guarded.sh", *args],
             cwd=self.root,
             text=True,
             capture_output=True,
+            env=env,
+            pass_fds=pass_fds,
+            timeout=5,
         )
 
     def test_defaults_to_300_seconds(self):
@@ -882,6 +1009,17 @@ class RunGuardedWrapperTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertIn('"--timeout-seconds", "60"', result.stdout)
 
+    def test_accepts_single_mint_profile(self):
+        result = self.invoke(
+            "--live-confirmed",
+            "--timeout",
+            "60",
+            "--profile",
+            "single-mint-auto",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('"--profile", "single-mint-auto"', result.stdout)
+
     def test_rejects_timeout_outside_bounds(self):
         for value in ("29", "301", "invalid"):
             with self.subTest(value=value):
@@ -893,6 +1031,76 @@ class RunGuardedWrapperTests(unittest.TestCase):
         self.assertEqual(
             self.invoke("--live-confirmed", "--timeout", "60", "extra").returncode,
             64,
+        )
+
+    def test_direct_live_invocations_contend_without_second_launch(self):
+        (self.root / "hold-first-guard").touch()
+        first = subprocess.Popen(
+            ["bash", "scripts/run-guarded.sh", "--live-confirmed"],
+            cwd=self.root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            for _ in range(200):
+                if (self.root / "first-guard-started").exists():
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail("first fake guard did not start")
+
+            second = self.invoke("--live-confirmed")
+            self.assertNotEqual(second.returncode, 0)
+            self.assertEqual(
+                (self.root / "guard-launches").read_text().splitlines(),
+                ["launch"],
+            )
+        finally:
+            (self.root / "release-first-guard").touch()
+            first.communicate(timeout=5)
+
+    def test_inherited_lock_descriptor_must_match_owned_workspace_lock(self):
+        unrelated = self.root / "unrelated-lock"
+        descriptor = os.open(unrelated, os.O_RDWR | os.O_CREAT, 0o600)
+        environment = os.environ.copy()
+        environment["ZAVOD_LIVE_LOCK_FD"] = str(descriptor)
+        try:
+            result = self.invoke(
+                "--live-confirmed",
+                env=environment,
+                pass_fds=(descriptor,),
+            )
+        finally:
+            os.close(descriptor)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((self.root / "guard-launches").exists())
+
+    def test_valid_inherited_workspace_lock_launches_without_deadlock(self):
+        lock_path = self.root / "state" / ".zavod-live.lock"
+        lock_path.touch(mode=0o600)
+        lock_path.chmod(0o600)
+        descriptor = os.open(lock_path, os.O_RDWR)
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        environment = os.environ.copy()
+        environment["ZAVOD_LIVE_LOCK_FD"] = str(descriptor)
+        try:
+            result = self.invoke(
+                "--live-confirmed",
+                "--profile",
+                "single-mint-auto",
+                env=environment,
+                pass_fds=(descriptor,),
+            )
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            (self.root / "guard-launches").read_text().splitlines(),
+            ["launch"],
         )
 
 
