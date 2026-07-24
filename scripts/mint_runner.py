@@ -5,6 +5,7 @@ import json
 import math
 import os
 import re
+import secrets
 import shutil
 import signal
 import stat
@@ -100,6 +101,27 @@ class PreparedRun:
             "loss_limit_lamports": self.loss_limit_lamports,
             "early_stop_lamports": self.early_stop_lamports,
         }
+
+
+@dataclass
+class _FinalizationDirectories:
+    root_path: Path
+    root_fd: int
+    state_fd: int
+    mint_runs_fd: int
+    result_fd: int
+
+    def close(self):
+        for descriptor in (
+            self.result_fd,
+            self.mint_runs_fd,
+            self.state_fd,
+            self.root_fd,
+        ):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
 
 
 def validate_timeout(value):
@@ -258,6 +280,218 @@ def _read_owned_file_no_follow(path, mode=None):
         raise RunnerError("private run paths are invalid") from exc
     finally:
         os.close(descriptor)
+
+
+def _validate_directory_fd(descriptor, mode=None):
+    try:
+        info = os.fstat(descriptor)
+    except OSError as exc:
+        raise RunnerError("private run paths are invalid") from exc
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != os.getuid()
+        or (mode is not None and stat.S_IMODE(info.st_mode) != mode)
+    ):
+        raise RunnerError("private run paths are invalid")
+    return info
+
+
+def _open_owned_directory_at(parent_fd, name, mode=None):
+    if not isinstance(name, str) or not name or Path(name).name != name:
+        raise RunnerError("private run paths are invalid")
+    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(name, flags, dir_fd=parent_fd)
+    except OSError as exc:
+        raise RunnerError("private run paths are invalid") from exc
+    try:
+        _validate_directory_fd(descriptor, mode=mode)
+    except Exception:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def _open_finalization_directories(root, run_id):
+    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+    descriptors = []
+    try:
+        root_fd = os.open(root, flags)
+        descriptors.append(root_fd)
+        _validate_directory_fd(root_fd)
+        state_fd = _open_owned_directory_at(root_fd, "state")
+        descriptors.append(state_fd)
+        mint_runs_fd = _open_owned_directory_at(state_fd, "mint-runs")
+        descriptors.append(mint_runs_fd)
+        result_fd = _open_owned_directory_at(
+            mint_runs_fd,
+            run_id,
+            mode=0o700,
+        )
+        descriptors.append(result_fd)
+        return _FinalizationDirectories(
+            root_path=Path(root),
+            root_fd=root_fd,
+            state_fd=state_fd,
+            mint_runs_fd=mint_runs_fd,
+            result_fd=result_fd,
+        )
+    except OSError as exc:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+        raise RunnerError("private run paths are invalid") from exc
+    except Exception:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+        raise
+
+
+def _read_owned_file_at(directory_fd, name, mode=None, missing_ok=False):
+    if not isinstance(name, str) or not name or Path(name).name != name:
+        raise RunnerError("private run paths are invalid")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(name, flags, dir_fd=directory_fd)
+    except FileNotFoundError:
+        if missing_ok:
+            return None
+        raise RunnerError("private run paths are invalid") from None
+    except OSError as exc:
+        raise RunnerError("private run paths are invalid") from exc
+    try:
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.getuid()
+            or (mode is not None and stat.S_IMODE(info.st_mode) != mode)
+        ):
+            raise RunnerError("private run paths are invalid")
+        chunks = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return b"".join(chunks)
+    except OSError as exc:
+        raise RunnerError("private run paths are invalid") from exc
+    finally:
+        os.close(descriptor)
+
+
+def _existing_owned_file_at(directory_fd, name, mode=0o600):
+    try:
+        info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise RunnerError("private run paths are invalid") from exc
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid != os.getuid()
+        or stat.S_IMODE(info.st_mode) != mode
+    ):
+        raise RunnerError("private run paths are invalid")
+    return True
+
+
+def _atomic_write_at(directory_fd, name, data, mode=0o600):
+    _validate_directory_fd(directory_fd, mode=0o700)
+    _existing_owned_file_at(directory_fd, name, mode=mode)
+    temporary = f".{name}.{secrets.token_hex(12)}"
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptor = None
+    try:
+        descriptor = os.open(
+            temporary,
+            flags,
+            mode,
+            dir_fd=directory_fd,
+        )
+        os.fchmod(descriptor, mode)
+        view = memoryview(data)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError("short write")
+            view = view[written:]
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = None
+        os.replace(
+            temporary,
+            name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        _read_owned_file_at(directory_fd, name, mode=mode)
+    except Exception:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        try:
+            os.unlink(temporary, dir_fd=directory_fd)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+        raise
+
+
+def _directory_identity(descriptor):
+    info = _validate_directory_fd(descriptor)
+    return info.st_dev, info.st_ino
+
+
+def _require_same_directory_at(parent_fd, name, expected_fd, mode=None):
+    current_fd = _open_owned_directory_at(parent_fd, name, mode=mode)
+    try:
+        if _directory_identity(current_fd) != _directory_identity(expected_fd):
+            raise RunnerError("private run paths are invalid")
+    finally:
+        os.close(current_fd)
+
+
+def _validate_held_state(directories):
+    try:
+        root_info = directories.root_path.lstat()
+    except OSError as exc:
+        raise RunnerError("private run paths are invalid") from exc
+    held_root = _validate_directory_fd(directories.root_fd)
+    if (
+        not stat.S_ISDIR(root_info.st_mode)
+        or root_info.st_uid != os.getuid()
+        or (root_info.st_dev, root_info.st_ino)
+        != (held_root.st_dev, held_root.st_ino)
+    ):
+        raise RunnerError("private run paths are invalid")
+    _require_same_directory_at(
+        directories.root_fd,
+        "state",
+        directories.state_fd,
+    )
+
+
+def _validate_held_result(directories, run_id):
+    _validate_held_state(directories)
+    _require_same_directory_at(
+        directories.state_fd,
+        "mint-runs",
+        directories.mint_runs_fd,
+    )
+    _require_same_directory_at(
+        directories.mint_runs_fd,
+        run_id,
+        directories.result_fd,
+        mode=0o700,
+    )
 
 
 def _integrity_record(path):
@@ -549,6 +783,12 @@ def aggregate_log(log_path):
 
 
 def _parse_guard_result(path):
+    return _parse_guard_result_bytes(
+        _read_owned_file_no_follow(path, mode=0o600)
+    )
+
+
+def _parse_guard_result_bytes(data):
     allowed = {
         "reason",
         "start_balance",
@@ -561,7 +801,7 @@ def _parse_guard_result(path):
         "log_path",
     }
     result = {}
-    text = _read_owned_file_no_follow(path, mode=0o600).decode(errors="replace")
+    text = data.decode(errors="replace")
     for line in text.splitlines():
         key, separator, value = line.partition("=")
         if separator and key in allowed:
@@ -701,6 +941,7 @@ def _signature_entries(caller, rpc_url, wallet, started_at, ended_at):
             if (
                 not isinstance(signature, str)
                 or not signature
+                or confirmation != "finalized"
                 or (
                     block_time is not None
                     and (
@@ -708,24 +949,19 @@ def _signature_entries(caller, rpc_url, wallet, started_at, ended_at):
                         or block_time < 0
                     )
                 )
-                or (
-                    confirmation is not None
-                    and not isinstance(confirmation, str)
-                )
             ):
                 raise RunnerError("chain aggregation failed")
-            is_finalized = confirmation in (None, "finalized")
-            if is_finalized and block_time is not None:
+            if block_time is not None:
                 oldest_usable = (
                     block_time
                     if oldest_usable is None
                     else min(oldest_usable, block_time)
                 )
-                if (
-                    started_at <= block_time <= ended_at
-                    and signature not in seen_signatures
-                ):
-                    entries.append(signature)
+            if (
+                (block_time is None or started_at <= block_time <= ended_at)
+                and signature not in seen_signatures
+            ):
+                entries.append(signature)
             seen_signatures.add(signature)
         cursor = page[-1]["signature"]
         if cursor in seen_cursors:
@@ -787,7 +1023,14 @@ def aggregate_chain(
             )
             meta = transaction.get("meta")
             transaction_body = transaction.get("transaction")
+            transaction_time = transaction.get("blockTime")
+            if type(transaction_time) is not int or transaction_time < 0:
+                raise RunnerError("chain aggregation failed")
+            if not started_at <= transaction_time <= ended_at:
+                continue
             if not isinstance(meta, dict) or not isinstance(transaction_body, dict):
+                raise RunnerError("chain aggregation failed")
+            if "err" not in meta:
                 raise RunnerError("chain aggregation failed")
             message = transaction_body.get("message")
             if not isinstance(message, dict):
@@ -944,16 +1187,22 @@ def record_finalization_failure(root):
     )
 
 
-def _validate_result_directory(result_dir):
-    _lstat_owned_path(result_dir, "directory", mode=0o700)
-
-
-def _validate_finalization_context(root, run_id, backup_dir, result_dir):
-    _validate_result_directory(result_dir)
-    marker = root / "state" / ".mint-run-active"
-    _lstat_owned_path(marker, "file", mode=0o600)
+def _validate_finalization_context(
+    root,
+    run_id,
+    backup_dir,
+    directories,
+):
+    _validate_held_result(directories, run_id)
     expected_marker = f"{run_id}\n".encode()
-    if _read_owned_file_no_follow(marker, mode=0o600) != expected_marker:
+    if (
+        _read_owned_file_at(
+            directories.state_fd,
+            ".mint-run-active",
+            mode=0o600,
+        )
+        != expected_marker
+    ):
         raise RunnerError("private run paths are invalid")
     if _path_exists_no_follow(backup_dir / "restored"):
         raise RunnerError("private run paths are invalid")
@@ -967,16 +1216,8 @@ def _validate_finalization_context(root, run_id, backup_dir, result_dir):
         )
     except (TypeError, ValueError, json.JSONDecodeError) as exc:
         raise RunnerError("private recovery data is invalid") from exc
+    _validate_held_result(directories, run_id)
     return metadata
-
-
-def _validate_guard_result_path(result_dir):
-    _validate_result_directory(result_dir)
-    path = result_dir / "guard-result.txt"
-    if path.parent != result_dir:
-        raise RunnerError("private run paths are invalid")
-    _lstat_owned_path(path, "file", mode=0o600)
-    return path
 
 
 def _validate_log_path(root, value):
@@ -1005,31 +1246,20 @@ def _validate_log_path(root, value):
     return candidate
 
 
-def _validate_result_destination(result_dir, name):
-    _validate_result_directory(result_dir)
-    destination = result_dir / name
-    if destination.parent != result_dir:
-        raise RunnerError("private run paths are invalid")
-    if _path_exists_no_follow(destination):
-        _lstat_owned_path(destination, "file", mode=0o600)
-    return destination
-
-
-def _capture_generated_artifact(root, result_dir, name):
-    source = root / name
-    if source.parent != root:
-        raise RunnerError("private run paths are invalid")
-    if not _path_exists_no_follow(source):
-        return
-    _lstat_owned_path(source, "file")
-    data = _read_owned_file_no_follow(source)
-    destination = _validate_result_destination(
-        result_dir,
-        f"generated-{name}",
+def _capture_generated_artifact(directories, name):
+    data = _read_owned_file_at(
+        directories.root_fd,
+        name,
+        mode=0o600,
+        missing_ok=True,
     )
-    _validate_result_directory(result_dir)
-    _atomic_write(destination, data)
-    _lstat_owned_path(destination, "file", mode=0o600)
+    if data is None:
+        return
+    _atomic_write_at(
+        directories.result_fd,
+        f"generated-{name}",
+        data,
+    )
 
 
 def finalize_run(
@@ -1045,102 +1275,106 @@ def finalize_run(
     root = Path(root).resolve()
     run_id = _validate_run_id(run_id)
     backup_dir = root / "state" / "backups" / f"mint-run-{run_id}"
-    result_dir = root / "state" / "mint-runs" / run_id
-    metadata = _validate_finalization_context(
-        root,
-        run_id,
-        backup_dir,
-        result_dir,
-    )
-    manifest = None
+    directories = _open_finalization_directories(root, run_id)
     try:
-        guard_result_path = _validate_guard_result_path(result_dir)
-        guard = _parse_guard_result(guard_result_path)
-        log_path = _validate_log_path(root, guard.get("log_path"))
-        log_summary = (
-            aggregate_log(log_path)
-            if log_path is not None
-            else {name: 0 for name in LOG_PATTERNS}
+        metadata = _validate_finalization_context(
+            root,
+            run_id,
+            backup_dir,
+            directories,
         )
-        if isinstance(started_at, bool) or isinstance(ended_at, bool):
-            raise RunnerError("run window is invalid")
-        started_at = int(started_at)
-        ended_at = int(ended_at)
-        if started_at <= 0 or ended_at < started_at:
-            raise RunnerError("run window is invalid")
+        manifest = None
         try:
-            duration = float(guard.get("duration_seconds", "0"))
-        except (TypeError, ValueError) as exc:
-            raise RunnerError("guard result is invalid") from exc
-        if not math.isfinite(duration) or duration < 0:
-            raise RunnerError("guard result is invalid")
-        try:
-            config = tomllib.loads(
-                _read_owned_file_no_follow(
-                    backup_dir / "config.toml",
+            guard = _parse_guard_result_bytes(
+                _read_owned_file_at(
+                    directories.result_fd,
+                    "guard-result.txt",
                     mode=0o600,
-                ).decode()
-            )
-            chain = _sanitize_chain_summary(
-                (chain_aggregator or aggregate_chain)(
-                    config,
-                    metadata["mint"],
-                    started_at,
-                    ended_at,
-                    transport=transport,
-                    pubkey_resolver=pubkey_resolver,
                 )
             )
-            aggregation_status = "ok"
-        except Exception:
-            chain = _empty_chain_summary()
-            aggregation_status = "failed"
-        for name in OPTIONAL_FILES:
-            _capture_generated_artifact(root, result_dir, name)
-        if isinstance(guard_exit, bool):
-            raise RunnerError("guard result is invalid")
-        manifest = {
-            "run_id": run_id,
-            "mint": metadata["mint"],
-            "timeout_seconds": metadata["timeout_seconds"],
-            "guard_exit": int(guard_exit),
-            "stop_reason": (
-                guard["reason"]
-                if guard.get("reason") in STOP_REASONS
-                else "unknown"
-            ),
-            "duration_seconds": duration,
-            "started_at": started_at,
-            "ended_at": ended_at,
-            "aggregation_status": aggregation_status,
-            "log_events": log_summary,
-            "chain": chain,
-        }
-        manifest_path = _validate_result_destination(
-            result_dir,
-            "manifest.json",
-        )
-        _validate_result_directory(result_dir)
-        _atomic_write(
-            manifest_path,
-            (json.dumps(manifest, sort_keys=True, indent=2) + "\n").encode(),
-        )
-        _lstat_owned_path(manifest_path, "file", mode=0o600)
+            log_path = _validate_log_path(root, guard.get("log_path"))
+            log_summary = (
+                aggregate_log(log_path)
+                if log_path is not None
+                else {name: 0 for name in LOG_PATTERNS}
+            )
+            if isinstance(started_at, bool) or isinstance(ended_at, bool):
+                raise RunnerError("run window is invalid")
+            started_at = int(started_at)
+            ended_at = int(ended_at)
+            if started_at <= 0 or ended_at < started_at:
+                raise RunnerError("run window is invalid")
+            try:
+                duration = float(guard.get("duration_seconds", "0"))
+            except (TypeError, ValueError) as exc:
+                raise RunnerError("guard result is invalid") from exc
+            if not math.isfinite(duration) or duration < 0:
+                raise RunnerError("guard result is invalid")
+            try:
+                config = tomllib.loads(
+                    _read_owned_file_no_follow(
+                        backup_dir / "config.toml",
+                        mode=0o600,
+                    ).decode()
+                )
+                chain = _sanitize_chain_summary(
+                    (chain_aggregator or aggregate_chain)(
+                        config,
+                        metadata["mint"],
+                        started_at,
+                        ended_at,
+                        transport=transport,
+                        pubkey_resolver=pubkey_resolver,
+                    )
+                )
+                aggregation_status = "ok"
+            except Exception:
+                chain = _empty_chain_summary()
+                aggregation_status = "failed"
+            for name in OPTIONAL_FILES:
+                _capture_generated_artifact(directories, name)
+            if isinstance(guard_exit, bool):
+                raise RunnerError("guard result is invalid")
+            manifest = {
+                "run_id": run_id,
+                "mint": metadata["mint"],
+                "timeout_seconds": metadata["timeout_seconds"],
+                "guard_exit": int(guard_exit),
+                "stop_reason": (
+                    guard["reason"]
+                    if guard.get("reason") in STOP_REASONS
+                    else "unknown"
+                ),
+                "duration_seconds": duration,
+                "started_at": started_at,
+                "ended_at": ended_at,
+                "aggregation_status": aggregation_status,
+                "log_events": log_summary,
+                "chain": chain,
+            }
+            _atomic_write_at(
+                directories.result_fd,
+                "manifest.json",
+                (json.dumps(manifest, sort_keys=True, indent=2) + "\n").encode(),
+            )
+            _validate_held_result(directories, run_id)
+        finally:
+            _validate_held_state(directories)
+            restore_run(root, run_id)
+        if manifest is None:
+            raise RunnerError("finalization failed")
+        heading = f"{run_id} — single-mint guarded run"
+        bullets = [
+            f"Target mint recorded in private run manifest; timeout `{metadata['timeout_seconds']} s`.",
+            f"Stop reason `{manifest['stop_reason']}`; landed `{chain['landed']}`, successful `{chain['successful']}`, failed `{chain['failed']}`.",
+            f"Fees `{chain['fees_lamports']}`, rent `{chain['rent_lamports']}`, transfers `{chain['transfers_lamports']}` lamports.",
+            f"SOL delta `{chain['sol_delta_lamports']}` lamports; wSOL delta `{chain['wsol_delta_raw']}` raw units.",
+            "Original config, token list, and runtime artifacts restored; no automatic retry.",
+        ]
+        _record_state(root, heading, bullets)
+        return manifest
     finally:
-        restore_run(root, run_id)
-    if manifest is None:
-        raise RunnerError("finalization failed")
-    heading = f"{run_id} — single-mint guarded run"
-    bullets = [
-        f"Target mint recorded in private run manifest; timeout `{metadata['timeout_seconds']} s`.",
-        f"Stop reason `{manifest['stop_reason']}`; landed `{chain['landed']}`, successful `{chain['successful']}`, failed `{chain['failed']}`.",
-        f"Fees `{chain['fees_lamports']}`, rent `{chain['rent_lamports']}`, transfers `{chain['transfers_lamports']}` lamports.",
-        f"SOL delta `{chain['sol_delta_lamports']}` lamports; wSOL delta `{chain['wsol_delta_raw']}` raw units.",
-        "Original config, token list, and runtime artifacts restored; no automatic retry.",
-    ]
-    restore_run(root, run_id)
-    _record_state(root, heading, bullets)
-    return manifest
+        directories.close()
 
 
 def _record_failure_safely(root, command):
