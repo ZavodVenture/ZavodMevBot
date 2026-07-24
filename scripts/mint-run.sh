@@ -33,6 +33,8 @@ result_fd=""
 pending_signal=""
 pending_signal_status=0
 live_lock_fd=""
+lock_acquired=0
+prepare_started=0
 live_lock_path="$root/state/.zavod-live.lock"
 
 lock_failure() {
@@ -77,6 +79,7 @@ acquire_live_lock() {
     "$mode" == "600"
   ]] || lock_failure
   flock -n "$live_lock_fd" 2>/dev/null || lock_failure
+  lock_acquired=1
 }
 
 close_result_fd() {
@@ -100,16 +103,24 @@ cleanup() {
     prepare_output_path=""
   fi
   close_result_fd || true
-  if [[ -n "$run_id" && "$finalized" -eq 0 ]]; then
+  if [[
+    "$lock_acquired" -eq 1 &&
+    "$prepare_started" -eq 1 &&
+    "$finalized" -eq 0 &&
+    -n "$run_id"
+  ]]; then
     python3 scripts/mint_runner.py --root "$root" restore --run-id "$run_id" \
       >/dev/null 2>&1 || true
-  elif [[ "$finalized" -eq 0 ]]; then
+  elif [[
+    "$lock_acquired" -eq 1 &&
+    "$prepare_started" -eq 1 &&
+    "$finalized" -eq 0
+  ]]; then
     python3 scripts/mint_runner.py --root "$root" restore-active \
       >/dev/null 2>&1 || true
   fi
   exit "$status"
 }
-trap cleanup EXIT
 
 forward_pending_signal() {
   [[ -n "$pending_signal" ]] || return 0
@@ -133,10 +144,10 @@ latch_term() {
   forward_pending_signal
 }
 
+acquire_live_lock
+trap cleanup EXIT
 trap latch_int INT
 trap latch_term TERM
-
-acquire_live_lock
 
 prepare_output_path="$(
   mktemp "${TMPDIR:-/tmp}/zavod-mint-prepare.XXXXXX"
@@ -145,6 +156,7 @@ if (( pending_signal_status != 0 )); then
   exit "$pending_signal_status"
 fi
 set +e
+prepare_started=1
 python3 scripts/mint_runner.py --root "$root" prepare \
   --mint "$mint" \
   --timeout "$timeout_seconds" \
@@ -194,6 +206,9 @@ printf '%s\n' "$prepare_output" |
   exit 1
 }
 run_id="$prepared_run_id"
+if (( pending_signal_status != 0 )); then
+  exit "$pending_signal_status"
+fi
 
 confirmation="RUN $mint FOR $timeout_seconds"
 printf 'Type exactly: %s\n> ' "$confirmation"
@@ -244,6 +259,11 @@ if (
   fi
   exit 1
 fi
+if (( pending_signal_status != 0 )); then
+  exit "$pending_signal_status"
+fi
+
+python3 scripts/mint_runner.py --root "$root" validate-live --run-id "$run_id"
 if (( pending_signal_status != 0 )); then
   exit "$pending_signal_status"
 fi

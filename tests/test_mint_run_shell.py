@@ -19,6 +19,9 @@ class MintRunShellTests(unittest.TestCase):
         (self.root / "state" / "mint-runs" / "20260724T190000Z").mkdir(
             parents=True
         )
+        tokens_path = self.root / "tokens.toml"
+        tokens_path.write_text('tokens = ["original"]\n')
+        tokens_path.chmod(0o600)
         source = Path(__file__).resolve().parents[1] / "scripts" / "mint-run.sh"
         shutil.copy2(source, self.root / "scripts" / "mint-run.sh")
         self._write_helper()
@@ -57,6 +60,18 @@ class MintRunShellTests(unittest.TestCase):
             with (root / "helper.calls").open("a") as handle:
                 handle.write(command + " " + " ".join(args) + "\\n")
 
+            def write_private(path, content):
+                path.write_text(content)
+                path.chmod(0o600)
+
+            def restore_workspace():
+                original = root / "tokens.original"
+                if original.exists():
+                    tokens = root / "tokens.toml"
+                    tokens.write_bytes(original.read_bytes())
+                    tokens.chmod(0o600)
+                (root / "state/.mint-run-active").unlink(missing_ok=True)
+
             if command == "prepare":
                 if (root / "slow-prepare").exists():
                     def interrupted(signum, frame):
@@ -70,11 +85,21 @@ class MintRunShellTests(unittest.TestCase):
                     signal.signal(signal.SIGTERM, interrupted)
                     (root / "prepare.started").touch()
                     time.sleep(0.5)
+                mint = args[args.index("--mint") + 1]
+                original = root / "tokens.original"
+                if not original.exists():
+                    original.write_bytes((root / "tokens.toml").read_bytes())
+                write_private(
+                    root / "state/.mint-run-active",
+                    "20260724T190000Z\\n",
+                )
+                write_private(root / "tokens.toml", f'tokens = ["{mint}"]\\n')
+                (root / "prepared-mint").write_text(mint)
+                (root / "owner-prepared").touch()
                 custom = root / "prepare-output.txt"
                 if custom.exists():
                     print(custom.read_text(), end="")
                 else:
-                    mint = args[args.index("--mint") + 1]
                     timeout = args[args.index("--timeout") + 1]
                     print("run_id=20260724T190000Z")
                     print("mint=" + mint)
@@ -87,6 +112,15 @@ class MintRunShellTests(unittest.TestCase):
             elif command == "result-path":
                 if (root / "fail-result-path").exists():
                     raise SystemExit(4)
+                if (root / "tamper-before-validate").exists():
+                    write_private(
+                        root / "state/.mint-run-active",
+                        "tampered-run-id\\n",
+                    )
+                    write_private(
+                        root / "tokens.toml",
+                        'tokens = ["tampered"]\\n',
+                    )
                 custom = root / "result-path-output.txt"
                 if custom.exists():
                     print(custom.read_text(), end="")
@@ -98,6 +132,15 @@ class MintRunShellTests(unittest.TestCase):
                         root
                         / "state/mint-runs/20260724T190000Z/guard-result.txt"
                     )
+            elif command == "validate-live":
+                run_id = args[args.index("--run-id") + 1]
+                mint = (root / "prepared-mint").read_text()
+                marker = (root / "state/.mint-run-active").read_bytes()
+                tokens = (root / "tokens.toml").read_bytes()
+                if marker != f"{run_id}\\n".encode():
+                    raise SystemExit(7)
+                if tokens != f'tokens = ["{mint}"]\\n'.encode():
+                    raise SystemExit(7)
             elif command == "finalize":
                 (root / "finalize.called").write_text(" ".join(sys.argv))
                 if (root / "fail-finalize").exists():
@@ -105,13 +148,16 @@ class MintRunShellTests(unittest.TestCase):
                 ended_at = args[args.index("--ended-at") + 1]
                 if ended_at == "0":
                     raise SystemExit(1)
+                restore_workspace()
                 (root / "restore.called").write_text("finalize restored\\n")
             elif command == "restore":
                 (root / "restore.called").write_text(" ".join(sys.argv))
+                restore_workspace()
                 if (root / "fail-restore").exists():
                     raise SystemExit(9)
             elif command == "restore-active":
                 (root / "restore-active.called").write_text(" ".join(sys.argv))
+                restore_workspace()
                 if (root / "fail-restore").exists():
                     raise SystemExit(9)
             """
@@ -386,6 +432,72 @@ class MintRunShellTests(unittest.TestCase):
         self.assertFalse((self.root / "finalize.called").exists())
         self.assertTrue((self.root / "restore.called").exists())
 
+    def test_signal_during_prepare_output_parsing_aborts_before_prompt(self):
+        self._write_executable(
+            "fake-bin/awk",
+            """\
+            #!/usr/bin/env bash
+            if [[ ! -f parsing.signal-sent ]]; then
+              touch parsing.signal-sent
+              shell_pid="$(/usr/bin/awk '{print $4}' "/proc/$PPID/stat")"
+              kill -TERM "$shell_pid"
+            fi
+            exec /usr/bin/awk "$@"
+            """,
+        )
+        environment = os.environ.copy()
+        environment["PATH"] = (
+            f"{self.root / 'fake-bin'}:{environment.get('PATH', '')}"
+        )
+        process = subprocess.Popen(
+            [
+                "bash",
+                "scripts/mint-run.sh",
+                TARGET_MINT,
+                "--timeout",
+                "60",
+            ],
+            cwd=self.root,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=environment,
+        )
+
+        for _ in range(200):
+            if (self.root / "parsing.signal-sent").exists():
+                break
+            time.sleep(0.01)
+        else:
+            process.kill()
+            process.communicate()
+            self.fail("prepare-output parser did not run")
+
+        stdout, stderr = process.communicate(timeout=5)
+
+        self.assertEqual(process.returncode, 143, stderr)
+        self.assertNotIn("Type exactly:", stdout)
+        self.assertEqual(self.guard_invocations(), [])
+        self.assertTrue((self.root / "restore.called").exists())
+
+    def test_prelaunch_validation_rejects_tampering_and_restores(self):
+        original_tokens = (self.root / "tokens.toml").read_bytes()
+        (self.root / "tamper-before-validate").touch()
+
+        phrase = f"RUN {TARGET_MINT} FOR 60\n"
+        result = self.invoke(phrase, TARGET_MINT, "--timeout", "60")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.guard_invocations(), [])
+        self.assertIn("validate-live", self.helper_commands())
+        self.assertTrue((self.root / "restore.called").exists())
+        self.assertEqual(
+            (self.root / "tokens.toml").read_bytes(),
+            original_tokens,
+        )
+        self.assertFalse((self.root / "state/.mint-run-active").exists())
+
     def test_signal_at_earliest_guard_start_is_latched_and_forwarded(self):
         self._write_guard(
             """\
@@ -429,7 +541,14 @@ class MintRunShellTests(unittest.TestCase):
         self.assertEqual(result.returncode, 9, result.stderr)
         self.assertTrue((self.root / "finalize.called").exists())
         self.assertEqual(
-            self.helper_commands(), ["prepare", "result-path", "finalize", "restore"]
+            self.helper_commands(),
+            [
+                "prepare",
+                "result-path",
+                "validate-live",
+                "finalize",
+                "restore",
+            ],
         )
         self.assertTrue((self.root / "restore.called").exists())
 
@@ -471,7 +590,14 @@ class MintRunShellTests(unittest.TestCase):
             finalize_args[finalize_args.index("--ended-at") + 1], "0"
         )
         self.assertEqual(
-            self.helper_commands(), ["prepare", "result-path", "finalize", "restore"]
+            self.helper_commands(),
+            [
+                "prepare",
+                "result-path",
+                "validate-live",
+                "finalize",
+                "restore",
+            ],
         )
         self.assertTrue((self.root / "restore.called").exists())
 
@@ -645,6 +771,46 @@ class MintRunShellTests(unittest.TestCase):
             )
             self.assertNotEqual(contender.returncode, 0)
             self.assertFalse((self.root / "direct-guard.called").exists())
+        finally:
+            os.kill(process.pid, signal.SIGTERM)
+            process.communicate(timeout=5)
+
+    def test_mint_contender_cannot_restore_owner_prepared_state(self):
+        process = subprocess.Popen(
+            [
+                "bash",
+                "scripts/mint-run.sh",
+                TARGET_MINT,
+                "--timeout",
+                "60",
+            ],
+            cwd=self.root,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            for _ in range(200):
+                if (self.root / "owner-prepared").exists():
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail("owner preparation did not complete")
+
+            marker_path = self.root / "state/.mint-run-active"
+            tokens_path = self.root / "tokens.toml"
+            marker_before = marker_path.read_bytes()
+            tokens_before = tokens_path.read_bytes()
+
+            contender = self.invoke("", TARGET_MINT, "--timeout", "60")
+
+            self.assertNotEqual(contender.returncode, 0)
+            self.assertEqual(self.helper_commands(), ["prepare"])
+            self.assertFalse((self.root / "restore.called").exists())
+            self.assertFalse((self.root / "restore-active.called").exists())
+            self.assertEqual(marker_path.read_bytes(), marker_before)
+            self.assertEqual(tokens_path.read_bytes(), tokens_before)
         finally:
             os.kill(process.pid, signal.SIGTERM)
             process.communicate(timeout=5)

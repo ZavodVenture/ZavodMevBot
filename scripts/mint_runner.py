@@ -187,11 +187,17 @@ def validate_mint_account(rpc_url, mint, transport=None):
         body = (transport or rpc_call)(rpc_url, payload, 10)
         value = body["result"]["value"]
         parsed_type = value["data"]["parsed"]["type"] if value else None
+        initialized = (
+            value["data"]["parsed"]["info"]["isInitialized"]
+            if value
+            else None
+        )
         if (
             value is None
             or value.get("executable") is not False
             or value.get("owner") not in (TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID)
             or parsed_type != "mint"
+            or initialized is not True
         ):
             raise ValueError("not a token mint")
     except Exception as exc:
@@ -752,14 +758,41 @@ def _validate_recovery_data(backup_dir, run_id):
                 raise ValueError("recovery file integrity check failed")
     except (OSError, UnicodeError, ValueError, TypeError, json.JSONDecodeError) as exc:
         raise RunnerError("private recovery data is invalid") from exc
-    return optional_files
+    return metadata
+
+
+def validate_live_state(root, run_id):
+    root = Path(root).resolve()
+    run_id = _validate_run_id(run_id)
+    backup_dir = root / "state" / "backups" / f"mint-run-{run_id}"
+    metadata = _validate_recovery_data(backup_dir, run_id)
+    if _path_exists_no_follow(backup_dir / "restored"):
+        raise RunnerError("live run state validation failed")
+    expected_marker = f"{run_id}\n".encode()
+    expected_tokens = f'tokens = ["{metadata["mint"]}"]\n'.encode()
+    try:
+        marker = _read_owned_file_no_follow(
+            root / "state" / ".mint-run-active",
+            mode=0o600,
+        )
+        tokens = _read_owned_file_no_follow(
+            root / "tokens.toml",
+            mode=0o600,
+        )
+    except RunnerError:
+        raise
+    except (OSError, ValueError, TypeError) as exc:
+        raise RunnerError("live run state validation failed") from exc
+    if marker != expected_marker or tokens != expected_tokens:
+        raise RunnerError("live run state validation failed")
 
 
 def restore_run(root, run_id):
     root = Path(root).resolve()
     run_id = _validate_run_id(run_id)
     backup_dir = root / "state" / "backups" / f"mint-run-{run_id}"
-    optional_files = _validate_recovery_data(backup_dir, run_id)
+    metadata = _validate_recovery_data(backup_dir, run_id)
+    optional_files = metadata["optional_files"]
     for name in REQUIRED_FILES:
         _atomic_copy(backup_dir / name, root / name)
     for name in OPTIONAL_FILES:
@@ -1512,6 +1545,8 @@ def main(argv=None):
     restore_parser = subparsers.add_parser("restore")
     restore_parser.add_argument("--run-id", required=True)
     subparsers.add_parser("restore-active")
+    validate_parser = subparsers.add_parser("validate-live")
+    validate_parser.add_argument("--run-id", required=True)
     result_parser = subparsers.add_parser("result-path")
     result_parser.add_argument("--run-id", required=True)
     finalize_parser = subparsers.add_parser("finalize")
@@ -1537,6 +1572,9 @@ def main(argv=None):
             return 0
         if args.command == "restore-active":
             restore_active(root)
+            return 0
+        if args.command == "validate-live":
+            validate_live_state(root, args.run_id)
             return 0
         if args.command == "result-path":
             run_id = _validate_run_id(args.run_id)

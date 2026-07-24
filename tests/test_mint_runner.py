@@ -50,7 +50,12 @@ class MintRunnerTestCase(unittest.TestCase):
                 "value": {
                     "executable": False,
                     "owner": mint_runner.TOKEN_PROGRAM_ID,
-                    "data": {"parsed": {"type": "mint", "info": {}}},
+                    "data": {
+                        "parsed": {
+                            "type": "mint",
+                            "info": {"isInitialized": True},
+                        }
+                    },
                 }
             }
         }
@@ -120,6 +125,36 @@ class MintRunnerTestCase(unittest.TestCase):
         mint_runner.validate_mint_account(
             "https://secret.invalid", TARGET_MINT, transport
         )
+
+    def test_uninitialized_token_and_token_2022_mints_are_rejected(self):
+        for owner in (
+            mint_runner.TOKEN_PROGRAM_ID,
+            mint_runner.TOKEN_2022_PROGRAM_ID,
+        ):
+            with self.subTest(owner=owner):
+                def transport(url, payload, timeout, owner=owner):
+                    del url, payload, timeout
+                    return {
+                        "result": {
+                            "value": {
+                                "executable": False,
+                                "owner": owner,
+                                "data": {
+                                    "parsed": {
+                                        "type": "mint",
+                                        "info": {"isInitialized": False},
+                                    }
+                                },
+                            }
+                        }
+                    }
+
+                with self.assertRaises(mint_runner.RunnerError):
+                    mint_runner.validate_mint_account(
+                        "https://secret.invalid",
+                        TARGET_MINT,
+                        transport,
+                    )
 
     def test_invalid_unsafe_and_disabled_configs_fail_closed(self):
         cases = (
@@ -252,6 +287,64 @@ class MintRunnerTestCase(unittest.TestCase):
                 stat.S_IMODE((prepared.backup_dir / name).stat().st_mode),
                 0o600,
             )
+
+    def test_validate_live_state_requires_exact_marker_and_single_mint(self):
+        prepared = self.prepare()
+        marker = self.root / "state" / ".mint-run-active"
+        tokens = self.root / "tokens.toml"
+        expected_marker = marker.read_bytes()
+        expected_tokens = tokens.read_bytes()
+
+        mint_runner.validate_live_state(self.root, prepared.run_id)
+
+        marker.write_bytes(b"wrong-run-id\n")
+        marker.chmod(0o600)
+        with self.assertRaises(mint_runner.RunnerError):
+            mint_runner.validate_live_state(self.root, prepared.run_id)
+        marker.write_bytes(expected_marker)
+        marker.chmod(0o600)
+
+        tokens.write_text(f'tokens = ["{TARGET_MINT}", "extra"]\n')
+        tokens.chmod(0o600)
+        with self.assertRaises(mint_runner.RunnerError):
+            mint_runner.validate_live_state(self.root, prepared.run_id)
+        tokens.write_bytes(expected_tokens)
+        tokens.chmod(0o600)
+
+        mint_runner.restore_run(self.root, prepared.run_id)
+
+    def test_validate_live_cli_is_silent_on_success_and_generic_on_failure(self):
+        prepared = self.prepare()
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        argv = [
+            "--root",
+            str(self.root),
+            "validate-live",
+            "--run-id",
+            prepared.run_id,
+        ]
+
+        with (
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            self.assertEqual(mint_runner.main(argv), 0)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(stderr.getvalue(), "")
+
+        protected = "https://secret.invalid/must-not-survive"
+        (self.root / "tokens.toml").write_text(protected)
+        (self.root / "tokens.toml").chmod(0o600)
+        with (
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            self.assertEqual(mint_runner.main(argv), 1)
+        self.assertNotIn(protected, stderr.getvalue())
+        self.assertIn("error=operation failed", stderr.getvalue())
+
+        mint_runner.restore_run(self.root, prepared.run_id)
 
     def test_restore_is_idempotent_and_byte_exact(self):
         prepared = self.prepare()
@@ -1998,12 +2091,19 @@ class FinalizationTests(MintRunnerTestCase):
         )
         (self.root / "config.toml").chmod(0o600)
         protected_uuid = "12345678-1234-4234-9234-123456789abc"
-        protected_signature = "4" * 88
+        protected_signature = mint_runner.zavod_guard.base58_encode(
+            b"\x01" * 64
+        )
+        short_signature = mint_runner.zavod_guard.base58_encode(
+            b"\0" * 16 + b"\x01" * 48
+        )
+        self.assertLess(len(short_signature), 86)
         protected_url = "https://example.invalid/path?credential=value"
         artifact = {
             "nested": {
                 "uuid": protected_uuid,
                 "signature": protected_signature,
+                "short_signature": short_signature,
                 "url": protected_url,
                 "wallet": expanded_wallet,
                 expanded_rpc: "protected-key",
@@ -2070,6 +2170,8 @@ class FinalizationTests(MintRunnerTestCase):
                     ),
                 )
                 for protected in (
+                    protected_signature,
+                    short_signature,
                     protected_url,
                     expanded_rpc,
                     expanded_wallet,

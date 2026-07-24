@@ -314,7 +314,9 @@ class ProtectedOutputPolicy:
         r"(?i)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
         r"[0-9a-f]{4}-[0-9a-f]{12}"
     )
-    SIGNATURE_PATTERN = re.compile(r"[1-9A-HJ-NP-Za-km-z]{86,}")
+    SIGNATURE_PATTERN = re.compile(
+        rf"(?<![{ALPHABET}])[{ALPHABET}]{{64,88}}(?![{ALPHABET}])"
+    )
     URL_SCHEME_PATTERN = re.compile(
         r"[a-z][a-z0-9+.-]{0,31}://",
         re.I,
@@ -348,12 +350,28 @@ class ProtectedOutputPolicy:
     def from_config(cls, config):
         return cls(_redaction_secrets(config))
 
+    @staticmethod
+    def is_signature_token(value):
+        if not 64 <= len(value) <= 88:
+            return False
+        try:
+            return len(base58_decode(value)) == 64
+        except GuardError:
+            return False
+
     def redact_text(self, text):
         for secret in self.secrets:
             text = text.replace(secret, "<redacted>")
         text = self.URL_PATTERN.sub("<redacted>", text)
         text = self.UUID_PATTERN.sub("<redacted>", text)
-        return self.SIGNATURE_PATTERN.sub("<redacted>", text)
+        return self.SIGNATURE_PATTERN.sub(
+            lambda match: (
+                "<redacted>"
+                if self.is_signature_token(match.group(0))
+                else match.group(0)
+            ),
+            text,
+        )
 
     def contains_protected(self, text):
         return self.redact_text(text) != text
@@ -374,7 +392,7 @@ class StreamingRedactor:
         self.buffer = ""
         self.closed = False
         self._discard_url = False
-        self._discard_signature = False
+        self._inside_base58_token = False
 
     @staticmethod
     def _is_url_delimiter(character):
@@ -389,9 +407,7 @@ class StreamingRedactor:
                 character
             )
         else:
-            predicate = lambda character: (
-                character in ProtectedOutputPolicy.BASE58_CHARS
-            )
+            raise ValueError("unsupported protected tail")
         index = 0
         while index < len(self.buffer) and predicate(self.buffer[index]):
             index += 1
@@ -399,8 +415,6 @@ class StreamingRedactor:
         if self.buffer:
             if kind == "url":
                 self._discard_url = False
-            else:
-                self._discard_signature = False
 
     def _drain_one(self, final=False):
         if not self.buffer:
@@ -408,9 +422,11 @@ class StreamingRedactor:
         if self._discard_url:
             self._discard_protected_tail("url")
             return bool(self.buffer)
-        if self._discard_signature:
-            self._discard_protected_tail("signature")
-            return bool(self.buffer)
+        if (
+            self._inside_base58_token
+            and self.buffer[0] not in self.policy.BASE58_CHARS
+        ):
+            self._inside_base58_token = False
 
         for secret in self.policy.secrets:
             if self.buffer.startswith(secret):
@@ -431,19 +447,26 @@ class StreamingRedactor:
             self.buffer = self.buffer[uuid_match.end():]
             return True
 
-        signature_match = self.policy.SIGNATURE_PATTERN.match(self.buffer)
-        if signature_match is not None:
-            self.sink.write("<redacted>")
-            self.buffer = self.buffer[signature_match.end():]
-            if (
-                not final
-                and not self.buffer
+        signature_end = 0
+        if not self._inside_base58_token:
+            while (
+                signature_end < len(self.buffer)
+                and self.buffer[signature_end] in self.policy.BASE58_CHARS
             ):
-                self._discard_signature = True
-            return True
+                signature_end += 1
+            if signature_end:
+                token_complete = final or signature_end < len(self.buffer)
+                if token_complete:
+                    token = self.buffer[:signature_end]
+                    if self.policy.is_signature_token(token):
+                        self.sink.write("<redacted>")
+                        self.buffer = self.buffer[signature_end:]
+                        return True
 
         if not final and len(self.buffer) <= self.policy.stream_keep:
             return False
+        if self.buffer[0] in self.policy.BASE58_CHARS:
+            self._inside_base58_token = True
         self.sink.write(self.buffer[0])
         self.buffer = self.buffer[1:]
         return True

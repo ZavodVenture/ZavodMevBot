@@ -536,6 +536,22 @@ class SupervisorTests(unittest.TestCase):
 
 
 class StreamingRedactorTests(unittest.TestCase):
+    def test_signature_policy_covers_leading_zero_encodings(self):
+        policy = zavod_guard.ProtectedOutputPolicy()
+        signatures = {
+            base58_encode(b"\0" * zeros + b"\xff" * (64 - zeros))
+            for zeros in range(65)
+        }
+
+        self.assertEqual(min(map(len, signatures)), 64)
+        self.assertEqual(max(map(len, signatures)), 88)
+        for signature in signatures:
+            with self.subTest(length=len(signature)):
+                self.assertEqual(
+                    policy.redact_text(f"<{signature}>"),
+                    "<<redacted>>",
+                )
+
     def test_secret_split_across_chunks_is_never_written(self):
         sink = io.StringIO()
         redactor = zavod_guard.StreamingRedactor(sink, ["secret-value"])
@@ -582,13 +598,18 @@ class StreamingRedactorTests(unittest.TestCase):
 
     def test_protected_identifiers_are_redacted_across_chunk_boundaries(self):
         protected_uuid = "12345678-1234-4234-9234-123456789abc"
-        protected_signature = "3" * 88
+        protected_signature = base58_encode(b"\x01" * 64)
+        short_signature = base58_encode(b"\0" * 16 + b"\x01" * 48)
+        public_key = base58_encode(b"\x02" * 32)
+        self.assertLess(len(short_signature), 86)
         protected_url = "https://example.invalid/path?credential=value"
         protected_exact = "environment-backed-secret"
         text = "|".join(
             (
                 protected_uuid,
                 protected_signature,
+                short_signature,
+                public_key,
                 protected_url,
                 protected_exact,
             )
@@ -606,11 +627,13 @@ class StreamingRedactorTests(unittest.TestCase):
         for protected in (
             protected_uuid,
             protected_signature,
+            short_signature,
             protected_url,
             protected_exact,
         ):
             self.assertNotIn(protected, rendered)
-        self.assertGreaterEqual(rendered.count("<redacted>"), 3)
+        self.assertIn(public_key, rendered)
+        self.assertGreaterEqual(rendered.count("<redacted>"), 4)
 
 
 class HardenedCleanupTests(unittest.TestCase):
