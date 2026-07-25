@@ -1368,13 +1368,15 @@ def _capture_generated_artifact(directories, name, policy):
     )
     if data is None:
         return "missing"
+    destination = f"generated-{name}"
+    _existing_owned_file_at(directories.result_fd, destination)
     try:
         sanitized = _sanitize_generated_artifact(data, policy)
     except GeneratedArtifactContentError:
         return "rejected_content"
     _atomic_write_at(
         directories.result_fd,
-        f"generated-{name}",
+        destination,
         sanitized,
     )
     return "captured"
