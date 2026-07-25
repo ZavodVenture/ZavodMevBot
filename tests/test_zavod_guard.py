@@ -851,6 +851,22 @@ class RunGuardedHardeningTests(unittest.TestCase):
                         Path(temp_dir) / "config.toml"
                     )
 
+    def assert_diagnostic_identity_rejected(self, config_path, root, pattern):
+        with (
+            patch.object(
+                zavod_guard,
+                "load_config",
+                side_effect=GuardError("identity validation fell through"),
+            ),
+            self.assertRaisesRegex(GuardError, pattern),
+        ):
+            zavod_guard.run_guarded(
+                config_path,
+                profile="selector-diagnostic",
+                test_mode=True,
+                workspace_root=root,
+            )
+
     def test_output_pump_drains_and_redacts_before_log_close(self):
         config = valid_config()
         child = Mock(pid=123, returncode=0)
@@ -1131,6 +1147,112 @@ class RunGuardedHardeningTests(unittest.TestCase):
             self.assertEqual(
                 launch.call_args.args[0],
                 [str(binary), "run"],
+            )
+
+    def test_main_binds_diagnostic_to_guard_repository_root(self):
+        config = valid_config()
+        child = Mock(pid=123, returncode=0, stdout=io.BytesIO())
+        summary = {"wallet": "public-address", "balance_lamports": 100_000_000}
+        supervised = {
+            "reason": "child_exit",
+            "start_balance": 100_000_000,
+            "end_balance": 100_000_000,
+            "observed_loss": 0,
+            "child_exit_code": 0,
+        }
+        cleanup = {"exit_code": 0, "group_absent": True, "interrupted": False}
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fixture_root = Path(temp_dir)
+            trusted_root = fixture_root / "trusted-workspace"
+            (trusted_root / "scripts").mkdir(parents=True)
+            guard_path = trusted_root / "scripts" / "zavod_guard.py"
+            guard_path.touch()
+
+            outside_root = fixture_root / "attacker-workspace"
+            outside_root.mkdir()
+            (outside_root / "zavod-mev-bot-rust-version-cli").touch()
+            config_path = outside_root / "selector-diagnostic.toml"
+            config_path.touch(mode=0o600)
+            config_path.chmod(0o600)
+
+            with (
+                patch.object(zavod_guard, "__file__", str(guard_path)),
+                patch.object(zavod_guard, "load_config", return_value=config),
+                patch.object(zavod_guard, "preflight", return_value=summary),
+                patch.object(
+                    zavod_guard.subprocess,
+                    "Popen",
+                    return_value=child,
+                ) as launch,
+                patch.object(zavod_guard, "supervise", return_value=supervised),
+                patch.object(zavod_guard, "_verified_shutdown", return_value=cleanup),
+                patch("sys.stdout", new=io.StringIO()),
+                patch("sys.stderr", new=io.StringIO()),
+            ):
+                exit_code = zavod_guard.main(
+                    [
+                        "run",
+                        "--config",
+                        str(config_path),
+                        "--profile",
+                        "selector-diagnostic",
+                        "--test-mode",
+                        "--live-confirmed",
+                    ]
+                )
+
+            self.assertEqual(exit_code, 1)
+            launch.assert_not_called()
+
+    def test_selector_diagnostic_rejects_config_owned_by_another_euid(self):
+        real_stat = Path.stat
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config_path = root / "selector-diagnostic.toml"
+            config_path.touch(mode=0o600)
+            config_path.chmod(0o600)
+
+            def wrong_owner_stat(path, *, follow_symlinks=True):
+                metadata = real_stat(path, follow_symlinks=follow_symlinks)
+                if Path(path) != config_path:
+                    return metadata
+                fields = list(metadata)
+                fields[4] = os.geteuid() + 1
+                return os.stat_result(fields)
+
+            with patch.object(Path, "stat", new=wrong_owner_stat):
+                self.assert_diagnostic_identity_rejected(
+                    config_path,
+                    root,
+                    "owned by the current user",
+                )
+
+    def test_selector_diagnostic_rejects_config_mode_with_special_bits(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config_path = root / "selector-diagnostic.toml"
+            config_path.touch(mode=0o600)
+            config_path.chmod(0o4600)
+            self.assert_diagnostic_identity_rejected(
+                config_path,
+                root,
+                "permissions must be mode 600",
+            )
+
+    def test_selector_diagnostic_rejects_config_symlink(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target_path = root / "selector-diagnostic-target.toml"
+            target_path.touch(mode=0o600)
+            target_path.chmod(0o600)
+            symlink_path = root / "selector-diagnostic-link.toml"
+            symlink_path.symlink_to(target_path)
+            self.assert_diagnostic_identity_rejected(
+                symlink_path,
+                root,
+                "regular non-symlink file",
             )
 
     def test_test_mode_dispatch_violation_stops_child(self):

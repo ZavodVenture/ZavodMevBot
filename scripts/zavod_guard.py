@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import tempfile
 import threading
@@ -946,23 +947,33 @@ def run_guarded(
         raise GuardError(
             "selector-diagnostic profile and test mode must be provided together"
         )
-    config_path = Path(config_path).resolve()
-    root = Path(workspace_root or config_path.parent).resolve()
     if profile == "selector-diagnostic":
+        config_path = Path(config_path).absolute()
+        root = Path(workspace_root or config_path.parent).resolve()
+        try:
+            identity = config_path.stat(follow_symlinks=False)
+        except OSError as exc:
+            raise GuardError("config.toml is invalid or unreadable") from exc
+        if not stat.S_ISREG(identity.st_mode):
+            raise GuardError(
+                "selector-diagnostic config must be a regular non-symlink file"
+            )
+        if identity.st_uid != os.geteuid():
+            raise GuardError(
+                "selector-diagnostic config must be owned by the current user"
+            )
+        if stat.S_IMODE(identity.st_mode) != 0o600:
+            raise GuardError("selector-diagnostic config permissions must be mode 600")
+        config_path = config_path.resolve()
         try:
             config_path.relative_to(root)
         except ValueError as exc:
             raise GuardError(
                 "selector-diagnostic config must be inside the workspace"
             ) from exc
-        try:
-            mode = config_path.stat().st_mode & 0o777
-        except OSError as exc:
-            raise GuardError("config.toml is invalid or unreadable") from exc
-        if not config_path.is_file():
-            raise GuardError("selector-diagnostic config must be a regular file")
-        if mode != 0o600:
-            raise GuardError("selector-diagnostic config permissions must be mode 600")
+    else:
+        config_path = Path(config_path).resolve()
+        root = Path(workspace_root or config_path.parent).resolve()
     config = load_config(config_path)
     summary = preflight(config_path, root=root, config=config, profile=profile)
     public_key = summary["wallet"]
@@ -1203,6 +1214,11 @@ def main(argv=None):
                     args.timeout_seconds,
                     args.profile,
                     test_mode=args.test_mode,
+                    workspace_root=(
+                        Path(__file__).resolve().parents[1]
+                        if args.test_mode
+                        else None
+                    ),
                 )
             )
             return 0
