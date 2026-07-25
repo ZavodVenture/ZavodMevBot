@@ -292,6 +292,43 @@ class ConfigGuardTests(unittest.TestCase):
                     errors,
                 )
 
+    def test_selector_diagnostic_requires_cardinality_controls(self):
+        config = valid_config()
+        config["markets_file"] = [
+            {"enabled": False, "path": "disabled-markets.toml"},
+        ]
+        config["auto"]["force_two_mints"] = False
+        config["auto"]["filters"] = {"limit": 1}
+        config["bot"] = {"merge_mints": False}
+
+        self.assertEqual(
+            validate_config(config, profile="selector-diagnostic"),
+            [],
+        )
+
+        for section, key, value, expected_error in (
+            ("auto", "enabled", False, "auto.enabled must be true"),
+            (
+                "markets_file",
+                None,
+                [{"enabled": True, "path": "enabled-markets.toml"}],
+                "single-mint auto requires all static market sources disabled",
+            ),
+            ("auto", "force_two_mints", True, "auto.force_two_mints must be false"),
+            ("auto", "filters", {"limit": 2}, "auto.filters.limit must be 1"),
+            ("bot", "merge_mints", True, "bot.merge_mints must be false"),
+        ):
+            with self.subTest(expected_error=expected_error):
+                changed = copy.deepcopy(config)
+                if key is None:
+                    changed[section] = value
+                else:
+                    changed[section][key] = value
+                self.assertIn(
+                    expected_error,
+                    validate_config(changed, profile="selector-diagnostic"),
+                )
+
     def test_never_includes_secret_values_in_errors(self):
         sentinel = "NEVER_PRINT_THIS_SECRET"
         config = valid_config()
@@ -983,6 +1020,151 @@ class RunGuardedHardeningTests(unittest.TestCase):
                     "timeout must be from 30 through 300 seconds",
                 ):
                     zavod_guard.run_guarded("unused-config.toml", value)
+
+    def test_selector_diagnostic_uses_exact_test_mode_argv(self):
+        config = valid_config()
+        config["markets_file"] = [{"enabled": False, "path": "disabled.toml"}]
+        config["auto"]["force_two_mints"] = False
+        config["auto"]["filters"] = {"limit": 1}
+        config["bot"] = {"merge_mints": False}
+        child = Mock(pid=123, returncode=0, stdout=io.BytesIO())
+        summary = {"wallet": "public-address", "balance_lamports": 100_000_000}
+        supervised = {
+            "reason": "child_exit",
+            "start_balance": 100_000_000,
+            "end_balance": 100_000_000,
+            "observed_loss": 0,
+            "child_exit_code": 0,
+        }
+        cleanup = {"exit_code": 0, "group_absent": True, "interrupted": False}
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            binary = root / "zavod-mev-bot-rust-version-cli"
+            binary.touch()
+            config_path = root / "selector-diagnostic.toml"
+            config_path.touch(mode=0o600)
+            config_path.chmod(0o600)
+
+            with self.assertRaisesRegex(GuardError, "must be provided together"):
+                zavod_guard.run_guarded(
+                    config_path,
+                    profile="selector-diagnostic",
+                    workspace_root=root,
+                )
+            with self.assertRaisesRegex(GuardError, "must be provided together"):
+                zavod_guard.run_guarded(
+                    config_path,
+                    test_mode=True,
+                    workspace_root=root,
+                )
+
+            config_path.chmod(0o640)
+            with self.assertRaisesRegex(GuardError, "permissions must be mode 600"):
+                zavod_guard.run_guarded(
+                    config_path,
+                    profile="selector-diagnostic",
+                    test_mode=True,
+                    workspace_root=root,
+                )
+            config_path.chmod(0o600)
+
+            outside_path = root.parent / "outside-selector-diagnostic.toml"
+            outside_path.touch(mode=0o600)
+            outside_path.chmod(0o600)
+            try:
+                with self.assertRaisesRegex(GuardError, "inside the workspace"):
+                    zavod_guard.run_guarded(
+                        outside_path,
+                        profile="selector-diagnostic",
+                        test_mode=True,
+                        workspace_root=root,
+                    )
+            finally:
+                outside_path.unlink()
+
+            def popen(argv, **kwargs):
+                self.assertEqual(
+                    argv,
+                    [
+                        str(binary),
+                        "run",
+                        "--config",
+                        str(config_path.resolve()),
+                        "--test-mode",
+                    ],
+                )
+                return child
+
+            with (
+                patch.object(zavod_guard, "load_config", return_value=config),
+                patch.object(zavod_guard, "preflight", return_value=summary),
+                patch.object(zavod_guard.subprocess, "Popen", side_effect=popen),
+                patch.object(zavod_guard, "supervise", return_value=supervised),
+                patch.object(zavod_guard, "_verified_shutdown", return_value=cleanup),
+            ):
+                zavod_guard.run_guarded(
+                    config_path,
+                    profile="selector-diagnostic",
+                    test_mode=True,
+                    workspace_root=root,
+                )
+
+            shutil.rmtree(root / "logs")
+
+            def live_popen(argv, **kwargs):
+                self.assertEqual(argv, [str(binary), "run"])
+                return child
+
+            with (
+                patch.object(zavod_guard, "load_config", return_value=config),
+                patch.object(zavod_guard, "preflight", return_value=summary),
+                patch.object(
+                    zavod_guard.subprocess,
+                    "Popen",
+                    side_effect=live_popen,
+                ) as launch,
+                patch.object(zavod_guard, "supervise", return_value=supervised),
+                patch.object(zavod_guard, "_verified_shutdown", return_value=cleanup),
+            ):
+                zavod_guard.run_guarded(config_path, workspace_root=root)
+            self.assertEqual(
+                launch.call_args.args[0],
+                [str(binary), "run"],
+            )
+
+    def test_test_mode_dispatch_violation_stops_child(self):
+        marker = "dispatching transaction marker-payload"
+        sink = io.StringIO()
+        pump = zavod_guard.OutputPump(
+            io.BytesIO(marker.encode()),
+            sink,
+            valid_config(),
+            test_mode=True,
+        )
+        pump.start()
+        pump.join(1)
+        self.assertFalse(pump.is_alive())
+        self.assertTrue(pump.test_mode_dispatch_event.is_set())
+
+        child = Mock(pid=123, returncode=None)
+        child.poll.return_value = None
+        killpg = Mock()
+        result = zavod_guard.supervise(
+            child=child,
+            start_balance=100_000_000,
+            balance_reader=lambda: 100_000_000,
+            monotonic=lambda: 0,
+            sleep=lambda _: None,
+            test_mode_dispatch_event=pump.test_mode_dispatch_event,
+            killpg=killpg,
+            group_exists=Mock(side_effect=[True, False]),
+            signal_grace=((signal.SIGINT, 0),),
+        )
+
+        self.assertEqual(result["reason"], "test_mode_dispatch_violation")
+        killpg.assert_called_once_with(123, signal.SIGINT)
+        self.assertNotIn(marker, str(result))
 
 
 class RunGuardedWrapperTests(unittest.TestCase):

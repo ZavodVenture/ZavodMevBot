@@ -202,6 +202,22 @@ def validate_single_mint_auto(config):
     return errors
 
 
+def validate_selector_diagnostic(config):
+    errors = validate_single_mint_auto(config)
+    if _get(config, "auto", "force_two_mints") is not False:
+        errors.append("auto.force_two_mints must be false")
+    filters = _get(config, "auto", "filters")
+    if (
+        not isinstance(filters, dict)
+        or isinstance(filters.get("limit"), bool)
+        or filters.get("limit") != 1
+    ):
+        errors.append("auto.filters.limit must be 1")
+    if _get(config, "bot", "merge_mints") is not False:
+        errors.append("bot.merge_mints must be false")
+    return errors
+
+
 def validate_config(config, profile="default", root=None):
     errors = []
     expected_senders = dict(PROFILE_SENDERS.get(profile, EXPECTED_SENDERS))
@@ -211,6 +227,7 @@ def validate_config(config, profile="default", root=None):
         "default",
         "manual-single",
         "single-mint-auto",
+        "selector-diagnostic",
         *PROFILE_SENDERS,
     ):
         errors.append("unknown validation profile")
@@ -233,7 +250,9 @@ def validate_config(config, profile="default", root=None):
             errors.append("auto.enabled must be false")
         errors.extend(validate_manual_single(config, root))
     else:
-        if profile == "single-mint-auto":
+        if profile == "selector-diagnostic":
+            errors.extend(validate_selector_diagnostic(config))
+        elif profile == "single-mint-auto":
             errors.extend(validate_single_mint_auto(config))
         elif _get(config, "auto", "enabled") is not True:
             errors.append("auto.enabled must be true")
@@ -489,13 +508,16 @@ class StreamingRedactor:
 
 
 class OutputPump:
-    def __init__(self, source, sink, config):
+    def __init__(self, source, sink, config, test_mode=False):
         self.source = source
         self.redactor = StreamingRedactor(
             sink,
             ProtectedOutputPolicy.from_config(config),
         )
         self.output_error_event = threading.Event()
+        self.test_mode_dispatch_event = threading.Event()
+        self.test_mode = test_mode
+        self._dispatch_buffer = ""
         self.stop_event = threading.Event()
         self.decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         try:
@@ -522,6 +544,17 @@ class OutputPump:
                 if isinstance(chunk, bytes):
                     chunk = self.decoder.decode(chunk, final=False)
                 if chunk:
+                    if self.test_mode:
+                        self._dispatch_buffer = (
+                            self._dispatch_buffer + chunk
+                        )[-256:]
+                        if re.search(
+                            r"\b(?:sending|dispatch(?:ing|ed)?)\s+"
+                            r"(?:a\s+)?(?:transaction|bundle)\b",
+                            self._dispatch_buffer,
+                            re.IGNORECASE,
+                        ):
+                            self.test_mode_dispatch_event.set()
                     self.redactor.feed(chunk)
         except Exception:
             self.output_error_event.set()
@@ -758,6 +791,7 @@ def supervise(
     monotonic,
     sleep,
     output_error_event=None,
+    test_mode_dispatch_event=None,
     killpg=os.killpg,
     group_exists=None,
     signal_grace=DEFAULT_SIGNAL_GRACE,
@@ -776,6 +810,12 @@ def supervise(
                 and operator_signal_event.is_set()
             ):
                 reason = "operator_signal"
+                break
+            if (
+                test_mode_dispatch_event is not None
+                and test_mode_dispatch_event.is_set()
+            ):
+                reason = "test_mode_dispatch_violation"
                 break
             if output_error_event is not None and output_error_event.is_set():
                 reason = "output_error"
@@ -811,7 +851,10 @@ def supervise(
                 exit_code = cleanup["exit_code"]
             if not cleanup["group_absent"]:
                 reason = "cleanup_failed"
-            elif cleanup["interrupted"] and reason != "output_error":
+            elif cleanup["interrupted"] and reason not in (
+                "output_error",
+                "test_mode_dispatch_violation",
+            ):
                 reason = "operator_signal"
     return {
         "reason": reason,
@@ -886,15 +929,40 @@ def preflight(
     }
 
 
-def run_guarded(config_path, timeout_seconds=DEFAULT_TIMEOUT_SECONDS, profile="default"):
+def run_guarded(
+    config_path,
+    timeout_seconds=DEFAULT_TIMEOUT_SECONDS,
+    profile="default",
+    test_mode=False,
+    workspace_root=None,
+):
     if (
         isinstance(timeout_seconds, bool)
         or not isinstance(timeout_seconds, int)
         or not 30 <= timeout_seconds <= DEFAULT_TIMEOUT_SECONDS
     ):
         raise GuardError("timeout must be from 30 through 300 seconds")
+    if (profile == "selector-diagnostic") != test_mode:
+        raise GuardError(
+            "selector-diagnostic profile and test mode must be provided together"
+        )
     config_path = Path(config_path).resolve()
-    root = config_path.parent
+    root = Path(workspace_root or config_path.parent).resolve()
+    if profile == "selector-diagnostic":
+        try:
+            config_path.relative_to(root)
+        except ValueError as exc:
+            raise GuardError(
+                "selector-diagnostic config must be inside the workspace"
+            ) from exc
+        try:
+            mode = config_path.stat().st_mode & 0o777
+        except OSError as exc:
+            raise GuardError("config.toml is invalid or unreadable") from exc
+        if not config_path.is_file():
+            raise GuardError("selector-diagnostic config must be a regular file")
+        if mode != 0o600:
+            raise GuardError("selector-diagnostic config permissions must be mode 600")
     config = load_config(config_path)
     summary = preflight(config_path, root=root, config=config, profile=profile)
     public_key = summary["wallet"]
@@ -930,8 +998,11 @@ def run_guarded(config_path, timeout_seconds=DEFAULT_TIMEOUT_SECONDS, profile="d
         log_handle = os.fdopen(fd, "w", buffering=1)
         signal.signal(signal.SIGINT, interrupt_handler)
         signal.signal(signal.SIGTERM, interrupt_handler)
+        command = [str(root / "zavod-mev-bot-rust-version-cli"), "run"]
+        if test_mode:
+            command.extend(["--config", str(config_path), "--test-mode"])
         child = subprocess.Popen(
-            [str(root / "zavod-mev-bot-rust-version-cli"), "run"],
+            command,
             cwd=root,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -946,7 +1017,7 @@ def run_guarded(config_path, timeout_seconds=DEFAULT_TIMEOUT_SECONDS, profile="d
                 "child_exit_code": None,
             }
         else:
-            pump = OutputPump(child.stdout, log_handle, config)
+            pump = OutputPump(child.stdout, log_handle, config, test_mode=test_mode)
             try:
                 pump.start()
             except Exception:
@@ -970,6 +1041,7 @@ def run_guarded(config_path, timeout_seconds=DEFAULT_TIMEOUT_SECONDS, profile="d
                     monotonic=time.monotonic,
                     sleep=time.sleep,
                     output_error_event=pump.output_error_event,
+                    test_mode_dispatch_event=pump.test_mode_dispatch_event,
                     timeout_seconds=timeout_seconds,
                     cleanup_child=False,
                     operator_signal_event=operator_signal_event,
@@ -1052,6 +1124,12 @@ def run_guarded(config_path, timeout_seconds=DEFAULT_TIMEOUT_SECONDS, profile="d
         result["child_exit_code"] = cleanup["exit_code"]
     if not cleanup["group_absent"]:
         result["reason"] = "cleanup_failed"
+    elif (
+        test_mode
+        and pump is not None
+        and pump.test_mode_dispatch_event.is_set()
+    ):
+        result["reason"] = "test_mode_dispatch_violation"
     elif pump is not None and (
         pump.output_error_event.is_set()
         or (pump_started and pump.is_alive())
@@ -1109,6 +1187,7 @@ def main(argv=None):
     run_parser.add_argument("--config", default="config.toml")
     run_parser.add_argument("--timeout-seconds", type=int, default=DEFAULT_TIMEOUT_SECONDS)
     run_parser.add_argument("--profile", default="default")
+    run_parser.add_argument("--test-mode", action="store_true")
     run_parser.add_argument("--live-confirmed", action="store_true")
     args = parser.parse_args(argv)
     try:
@@ -1118,7 +1197,14 @@ def main(argv=None):
         if args.command == "run":
             if not args.live_confirmed:
                 raise GuardError("live confirmation is required")
-            _print_run_result(run_guarded(args.config, args.timeout_seconds, args.profile))
+            _print_run_result(
+                run_guarded(
+                    args.config,
+                    args.timeout_seconds,
+                    args.profile,
+                    test_mode=args.test_mode,
+                )
+            )
             return 0
     except GuardError as exc:
         print(f"status=failed\nerror={exc}", file=os.sys.stderr)
