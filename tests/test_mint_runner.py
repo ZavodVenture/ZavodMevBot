@@ -1141,6 +1141,77 @@ class MintRunnerTestCase(unittest.TestCase):
             },
         )
 
+    def test_selector_histogram_builds_with_linear_comparisons(self):
+        observation_count = 256
+        log = self.root / "selector.log"
+        log.write_text(
+            "".join(
+                f"Fetched {count} mint list.\n"
+                for count in range(observation_count)
+            )
+        )
+        log.chmod(0o600)
+
+        class ComparisonCountingInt(int):
+            comparisons = 0
+            __hash__ = int.__hash__
+
+            def __eq__(self, other):
+                type(self).comparisons += 1
+                return int.__eq__(self, other)
+
+            def __lt__(self, other):
+                type(self).comparisons += 1
+                return int.__lt__(self, other)
+
+        with patch.object(
+            mint_runner,
+            "int",
+            ComparisonCountingInt,
+            create=True,
+        ):
+            summary = mint_runner._selector_diagnostic_summary(
+                log,
+                TARGET_MINT,
+                {},
+                "timeout",
+            )
+        construction_comparisons = ComparisonCountingInt.comparisons
+
+        self.assertEqual(summary["refresh_count"], observation_count)
+        self.assertEqual(len(summary["selected_count_histogram"]), 256)
+        self.assertEqual(summary["selected_count_histogram"]["0"], 1)
+        self.assertEqual(summary["selected_count_histogram"]["255"], 1)
+        self.assertEqual(summary["selected_count_min"], 0)
+        self.assertEqual(summary["selected_count_max"], 255)
+        self.assertLess(
+            construction_comparisons,
+            observation_count * 4,
+        )
+
+    def test_selector_refresh_count_accepts_18_digits_and_rejects_19(self):
+        log = self.root / "selector.log"
+        log.write_text(
+            "Fetched 999999999999999999 mint list.\n"
+            "Fetched 1000000000000000000 mint list.\n"
+        )
+        log.chmod(0o600)
+
+        summary = mint_runner._selector_diagnostic_summary(
+            log,
+            TARGET_MINT,
+            {},
+            "timeout",
+        )
+
+        self.assertEqual(summary["refresh_count"], 1)
+        self.assertEqual(
+            summary["selected_count_histogram"],
+            {"999999999999999999": 1},
+        )
+        self.assertEqual(summary["selected_count_min"], 999999999999999999)
+        self.assertEqual(summary["selected_count_max"], 999999999999999999)
+
     def test_selector_summary_separates_discovery_from_selection(self):
         protected_url = "https://source.invalid/private-route"
         protected_signature = "unrelated-signature-fixture"
@@ -3355,6 +3426,33 @@ class FinalizationTests(MintRunnerTestCase):
         self.assertNotIn(UNRELATED_MINT, rendered)
         self.assertNotIn("https://fixture.invalid/fixture-uuid", rendered)
         self.assertNotIn("signature", rendered.lower())
+
+    def test_non_diagnostic_manifest_sanitizes_dispatch_violation_reason(self):
+        prepared = self.prepare()
+        self.write_guard_result(
+            prepared,
+            content=(
+                "reason=test_mode_dispatch_violation\n"
+                "duration_seconds=1\n"
+                "log_path=logs/run.log\n"
+            ),
+        )
+
+        result = mint_runner.finalize_run(
+            self.root,
+            prepared.run_id,
+            guard_exit=1,
+            started_at=100,
+            ended_at=101,
+            chain_aggregator=lambda *args, **kwargs: self.zero_chain(),
+        )
+
+        self.assertEqual(result["stop_reason"], "unknown")
+        self.assertNotIn("selector_diagnostic", result)
+        self.assertNotIn(
+            "test_mode_dispatch_violation",
+            (prepared.result_dir / "manifest.json").read_text(),
+        )
 
     def test_finalize_cli_passes_exact_window_and_outputs_only_safe_paths(self):
         manifest = {

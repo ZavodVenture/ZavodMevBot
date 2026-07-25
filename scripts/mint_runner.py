@@ -79,7 +79,6 @@ STOP_REASONS = frozenset(
         "operator_signal",
         "output_error",
         "rpc_error",
-        "test_mode_dispatch_violation",
         "timeout",
     }
 )
@@ -1302,14 +1301,26 @@ def _selector_diagnostic_summary(
             errors="replace"
         )
         lines = text.splitlines()
-    selected_counts = []
+    refresh_count = 0
+    zero_refresh_count = 0
+    histogram_counts = {}
+    selected_count_min = None
+    selected_count_max = None
     for line in lines:
         match = SELECTOR_REFRESH_PATTERN.fullmatch(line)
         if match is not None:
-            selected_counts.append(int(match.group(1)))
+            count = int(match.group(1))
+            refresh_count += 1
+            if count == 0:
+                zero_refresh_count += 1
+            histogram_counts[count] = histogram_counts.get(count, 0) + 1
+            if selected_count_min is None or count < selected_count_min:
+                selected_count_min = count
+            if selected_count_max is None or count > selected_count_max:
+                selected_count_max = count
     histogram = {
-        str(count): selected_counts.count(count)
-        for count in sorted(set(selected_counts))
+        str(count): occurrences
+        for count, occurrences in histogram_counts.items()
     }
 
     artifact_values = artifacts if isinstance(artifacts, dict) else {}
@@ -1329,14 +1340,18 @@ def _selector_diagnostic_summary(
         or SELECTOR_DISPATCH_VIOLATION_MARKER in lines
     )
     return {
-        "refresh_count": len(selected_counts),
-        "zero_refresh_count": selected_counts.count(0),
+        "refresh_count": refresh_count,
+        "zero_refresh_count": zero_refresh_count,
         "selected_count_histogram": histogram,
         "selected_count_min": (
-            min(selected_counts) if selected_counts else SELECTOR_UNAVAILABLE
+            selected_count_min
+            if selected_count_min is not None
+            else SELECTOR_UNAVAILABLE
         ),
         "selected_count_max": (
-            max(selected_counts) if selected_counts else SELECTOR_UNAVAILABLE
+            selected_count_max
+            if selected_count_max is not None
+            else SELECTOR_UNAVAILABLE
         ),
         "target_artifact_present": (
             hot_entry is not None or routing_entry is not None
@@ -2035,9 +2050,17 @@ def finalize_run(
                 )
             if isinstance(guard_exit, bool):
                 raise RunnerError("guard result is invalid")
+            diagnostic = _diagnostic_metadata(metadata)
             stop_reason = (
                 guard["reason"]
-                if guard.get("reason") in STOP_REASONS
+                if (
+                    guard.get("reason") in STOP_REASONS
+                    or (
+                        diagnostic is not None
+                        and guard.get("reason")
+                        == "test_mode_dispatch_violation"
+                    )
+                )
                 else "unknown"
             )
             manifest = {
@@ -2054,7 +2077,7 @@ def finalize_run(
                 "log_events": log_summary,
                 "chain": chain,
             }
-            if _diagnostic_metadata(metadata) is not None:
+            if diagnostic is not None:
                 manifest["selector_diagnostic"] = (
                     _selector_diagnostic_summary(
                         log_path,
