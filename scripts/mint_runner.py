@@ -2170,6 +2170,22 @@ def _capture_generated_artifact(directories, name, policy):
     return "captured"
 
 
+def _read_generated_artifact_value(directories, name, policy):
+    data = _read_owned_file_at(
+        directories.root_fd,
+        name,
+        mode=0o600,
+        missing_ok=True,
+    )
+    if data is None:
+        return "missing", None
+    try:
+        sanitized = _sanitize_generated_artifact(data, policy)
+        return "captured", json.loads(sanitized)
+    except (GeneratedArtifactContentError, TypeError, ValueError):
+        return "rejected_content", None
+
+
 def finalize_run(
     root,
     run_id,
@@ -2260,12 +2276,23 @@ def finalize_run(
                 }
                 aggregation_status = "not_applicable"
             artifact_status = {}
+            diagnostic_artifacts = {}
             for name in OPTIONAL_FILES:
-                artifact_status[name] = _capture_generated_artifact(
-                    directories,
-                    name,
-                    output_policy,
-                )
+                if diagnostic is None:
+                    artifact_status[name] = _capture_generated_artifact(
+                        directories,
+                        name,
+                        output_policy,
+                    )
+                else:
+                    status, value = _read_generated_artifact_value(
+                        directories,
+                        name,
+                        output_policy,
+                    )
+                    artifact_status[name] = status
+                    if value is not None:
+                        diagnostic_artifacts[name] = value
             if isinstance(guard_exit, bool):
                 raise RunnerError("guard result is invalid")
             stop_reason = (
@@ -2299,10 +2326,7 @@ def finalize_run(
                     _selector_diagnostic_summary(
                         log_path,
                         metadata["mint"],
-                        _captured_artifact_values(
-                            directories,
-                            artifact_status,
-                        ),
+                        diagnostic_artifacts,
                         guard.get("reason"),
                     )
                 )

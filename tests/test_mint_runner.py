@@ -2704,9 +2704,18 @@ class FinalizationTests(MintRunnerTestCase):
             "SELECTOR_DIAGNOSTIC candidate_construction=observed\n"
         )
         log.chmod(0o600)
-        (self.root / "hot_tokens.json").write_bytes(
-            SANITIZED_OBSERVED_HOT_TOKEN_JSON
+        generated_hot = json.loads(SANITIZED_OBSERVED_HOT_TOKEN_JSON)
+        generated_hot["arb_mint_info"].append(
+            sanitized_hot_token_entry(
+                UNRELATED_MINT,
+                2,
+                4,
+                5,
+                "unrelated",
+            )
         )
+        generated_hot["count"] = 2
+        (self.root / "hot_tokens.json").write_text(json.dumps(generated_hot))
         (self.root / "hot_tokens.json").chmod(0o600)
         chain_calls = []
 
@@ -2724,6 +2733,14 @@ class FinalizationTests(MintRunnerTestCase):
         )
 
         self.assertEqual(chain_calls, [])
+        self.assertFalse(
+            (prepared.result_dir / "generated-hot_tokens.json").exists()
+        )
+        self.assertFalse(
+            (prepared.result_dir / "generated-routing.json").exists()
+        )
+        self.assertEqual(result["artifact_status"]["hot_tokens.json"], "captured")
+        self.assertNotIn("arb_mint_info", json.dumps(result, sort_keys=True))
         self.assertEqual(result["aggregation_status"], "not_applicable")
         self.assertEqual(
             result["chain"],
