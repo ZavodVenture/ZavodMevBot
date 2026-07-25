@@ -775,6 +775,59 @@ class FinalizationTests(MintRunnerTestCase):
         guard_result.chmod(0o600)
         return log
 
+    def test_generated_artifact_content_failures_use_dedicated_error(self):
+        policy = mint_runner.zavod_guard.ProtectedOutputPolicy()
+        nested = {}
+        cursor = nested
+        for _index in range(66):
+            cursor["nested"] = {}
+            cursor = cursor["nested"]
+        collision = {
+            "https://route-a.invalid/private": {"weight": 1},
+            "https://route-b.invalid/private": {"weight": 2},
+        }
+        cases = {
+            "invalid_utf8": (b"\xff", policy),
+            "invalid_json": (b"not-json", policy),
+            "scalar": (b'"scalar"', policy),
+            "non_finite": (b'{"value":NaN}', policy),
+            "too_deep": (json.dumps(nested).encode(), policy),
+            "protected_key_collision": (
+                json.dumps(collision).encode(),
+                policy,
+            ),
+        }
+
+        class ResidualPolicy:
+            @staticmethod
+            def redact_text(value):
+                return value
+
+            @staticmethod
+            def contains_protected(value):
+                return True
+
+        cases["residual_protected_content"] = (
+            b'{"safe":"value"}',
+            ResidualPolicy(),
+        )
+
+        self.assertTrue(
+            issubclass(
+                mint_runner.GeneratedArtifactContentError,
+                mint_runner.RunnerError,
+            )
+        )
+        for label, (data, selected_policy) in cases.items():
+            with self.subTest(label=label):
+                with self.assertRaises(
+                    mint_runner.GeneratedArtifactContentError
+                ):
+                    mint_runner._sanitize_generated_artifact(
+                        data,
+                        selected_policy,
+                    )
+
     @staticmethod
     def target_transaction(
         mint=TARGET_MINT,

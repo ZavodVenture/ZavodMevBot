@@ -74,6 +74,10 @@ class RunnerError(RuntimeError):
     pass
 
 
+class GeneratedArtifactContentError(RunnerError):
+    pass
+
+
 class _CliArgumentError(RunnerError):
     pass
 
@@ -1291,12 +1295,12 @@ def _validate_log_path(root, value):
 
 def _sanitize_json_value(value, policy, depth=0):
     if depth > 64:
-        raise RunnerError("generated runtime artifact is invalid")
+        raise GeneratedArtifactContentError("generated runtime artifact is invalid")
     if value is None or isinstance(value, (bool, int)):
         return value
     if isinstance(value, float):
         if not math.isfinite(value):
-            raise RunnerError("generated runtime artifact is invalid")
+            raise GeneratedArtifactContentError("generated runtime artifact is invalid")
         return value
     if isinstance(value, str):
         return policy.redact_text(value)
@@ -1312,14 +1316,16 @@ def _sanitize_json_value(value, policy, depth=0):
                 raise RunnerError("generated runtime artifact is invalid")
             safe_key = policy.redact_text(key)
             if safe_key in sanitized:
-                raise RunnerError("generated runtime artifact is invalid")
+                raise GeneratedArtifactContentError(
+                    "generated runtime artifact is invalid"
+                )
             sanitized[safe_key] = _sanitize_json_value(
                 item,
                 policy,
                 depth + 1,
             )
         return sanitized
-    raise RunnerError("generated runtime artifact is invalid")
+    raise GeneratedArtifactContentError("generated runtime artifact is invalid")
 
 
 def _sanitize_generated_artifact(data, policy):
@@ -1331,9 +1337,11 @@ def _sanitize_generated_artifact(data, policy):
             ),
         )
     except (UnicodeError, ValueError, TypeError, json.JSONDecodeError) as exc:
-        raise RunnerError("generated runtime artifact is invalid") from exc
+        raise GeneratedArtifactContentError(
+            "generated runtime artifact is invalid"
+        ) from exc
     if not isinstance(parsed, (dict, list)):
-        raise RunnerError("generated runtime artifact is invalid")
+        raise GeneratedArtifactContentError("generated runtime artifact is invalid")
     sanitized = _sanitize_json_value(parsed, policy)
     rendered = (
         json.dumps(
@@ -1345,7 +1353,7 @@ def _sanitize_generated_artifact(data, policy):
         + "\n"
     )
     if policy.contains_protected(rendered):
-        raise RunnerError("generated runtime artifact is invalid")
+        raise GeneratedArtifactContentError("generated runtime artifact is invalid")
     return rendered.encode()
 
 
