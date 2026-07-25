@@ -1367,12 +1367,17 @@ def _capture_generated_artifact(directories, name, policy):
         missing_ok=True,
     )
     if data is None:
-        return
+        return "missing"
+    try:
+        sanitized = _sanitize_generated_artifact(data, policy)
+    except GeneratedArtifactContentError:
+        return "rejected_content"
     _atomic_write_at(
         directories.result_fd,
         f"generated-{name}",
-        _sanitize_generated_artifact(data, policy),
+        sanitized,
     )
+    return "captured"
 
 
 def finalize_run(
@@ -1450,8 +1455,9 @@ def finalize_run(
             except Exception:
                 chain = _empty_chain_summary()
                 aggregation_status = "failed"
+            artifact_status = {}
             for name in OPTIONAL_FILES:
-                _capture_generated_artifact(
+                artifact_status[name] = _capture_generated_artifact(
                     directories,
                     name,
                     output_policy,
@@ -1472,6 +1478,7 @@ def finalize_run(
                 "started_at": started_at,
                 "ended_at": ended_at,
                 "aggregation_status": aggregation_status,
+                "artifact_status": artifact_status,
                 "log_events": log_summary,
                 "chain": chain,
             }

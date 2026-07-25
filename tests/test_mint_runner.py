@@ -1736,6 +1736,13 @@ class FinalizationTests(MintRunnerTestCase):
             chain_aggregator=lambda *args, **kwargs: self.zero_chain(),
         )
 
+        self.assertEqual(
+            result["artifact_status"],
+            {
+                "hot_tokens.json": "captured",
+                "routing.json": "captured",
+            },
+        )
         manifest = prepared.result_dir / "manifest.json"
         self.assertTrue(manifest.exists())
         self.assertEqual(stat.S_IMODE(manifest.stat().st_mode), 0o600)
@@ -1777,6 +1784,40 @@ class FinalizationTests(MintRunnerTestCase):
         )
         self.assertEqual(len(state_backups), 1)
         self.assertEqual(stat.S_IMODE(state_backups[0].stat().st_mode), 0o600)
+
+    def test_finalize_records_missing_optional_artifacts(self):
+        prepared = self.prepare()
+        self.write_guard_result(prepared)
+
+        result = mint_runner.finalize_run(
+            self.root,
+            prepared.run_id,
+            guard_exit=0,
+            started_at=100,
+            ended_at=400,
+            chain_aggregator=lambda *args, **kwargs: self.zero_chain(),
+        )
+
+        expected = {
+            "hot_tokens.json": "missing",
+            "routing.json": "missing",
+        }
+        self.assertEqual(result["artifact_status"], expected)
+        manifest = json.loads(
+            (prepared.result_dir / "manifest.json").read_text()
+        )
+        self.assertEqual(manifest["artifact_status"], expected)
+        self.assertEqual(
+            set(manifest["artifact_status"].values()),
+            {"missing"},
+        )
+        self.assertEqual(
+            (self.root / "tokens.toml").read_bytes(),
+            self.original_tokens,
+        )
+        self.assertFalse(
+            (self.root / "state" / ".mint-run-active").exists()
+        )
 
     def test_finalize_rejects_stale_marker_without_restoring(self):
         prepared = self.prepare()
@@ -2042,6 +2083,33 @@ class FinalizationTests(MintRunnerTestCase):
         self.assertEqual((self.root / "tokens.toml").read_bytes(), self.original_tokens)
         self.assertFalse((self.root / "state" / ".mint-run-active").exists())
 
+    def test_capture_generated_artifact_does_not_downgrade_path_errors(self):
+        directories = mint_runner._FinalizationDirectories(
+            root_path=self.root,
+            root_fd=-1,
+            state_fd=-1,
+            mint_runs_fd=-1,
+            result_fd=-1,
+        )
+        policy = mint_runner.zavod_guard.ProtectedOutputPolicy()
+        path_error = mint_runner.RunnerError(
+            "private run paths are invalid"
+        )
+
+        with patch.object(
+            mint_runner,
+            "_read_owned_file_at",
+            side_effect=path_error,
+        ):
+            with self.assertRaises(mint_runner.RunnerError) as raised:
+                mint_runner._capture_generated_artifact(
+                    directories,
+                    "routing.json",
+                    policy,
+                )
+
+        self.assertIs(raised.exception, path_error)
+
     def test_finalize_rejects_artifact_symlink_and_restores(self):
         prepared = self.prepare()
         self.write_guard_result(prepared)
@@ -2109,23 +2177,38 @@ class FinalizationTests(MintRunnerTestCase):
         self.assertEqual((self.root / "tokens.toml").read_bytes(), self.original_tokens)
         self.assertFalse((self.root / "state" / ".mint-run-active").exists())
 
-    def test_finalize_rejects_non_json_generated_artifact_and_restores(self):
+    def test_finalize_records_non_json_artifact_as_rejected_content(self):
         prepared = self.prepare()
         self.write_guard_result(prepared)
         generated = self.root / "hot_tokens.json"
-        generated.write_bytes(b"not-json-runtime-output")
+        rejected = b"not-json-runtime-output"
+        generated.write_bytes(rejected)
         generated.chmod(0o600)
 
-        with self.assertRaises(mint_runner.RunnerError):
-            mint_runner.finalize_run(
-                self.root,
-                prepared.run_id,
-                guard_exit=0,
-                started_at=100,
-                ended_at=400,
-                chain_aggregator=lambda *args, **kwargs: self.zero_chain(),
-            )
+        result = mint_runner.finalize_run(
+            self.root,
+            prepared.run_id,
+            guard_exit=0,
+            started_at=100,
+            ended_at=400,
+            chain_aggregator=lambda *args, **kwargs: self.zero_chain(),
+        )
 
+        expected = {
+            "hot_tokens.json": "rejected_content",
+            "routing.json": "missing",
+        }
+        self.assertEqual(result["artifact_status"], expected)
+        manifest_path = prepared.result_dir / "manifest.json"
+        self.assertTrue(manifest_path.exists())
+        self.assertEqual(
+            json.loads(manifest_path.read_text())["artifact_status"],
+            expected,
+        )
+        self.assertNotIn(
+            rejected.decode(),
+            manifest_path.read_text(),
+        )
         self.assertFalse(
             (prepared.result_dir / "generated-hot_tokens.json").exists()
         )
@@ -2134,6 +2217,66 @@ class FinalizationTests(MintRunnerTestCase):
             self.original_tokens,
         )
         self.assertFalse((self.root / "state" / ".mint-run-active").exists())
+
+    def test_finalize_preserves_manifest_after_routing_key_collision(self):
+        prepared = self.prepare()
+        self.write_guard_result(prepared)
+        generated_hot = b'{"generated":true}\n'
+        protected_routes = (
+            "https://route-a.invalid/private",
+            "https://route-b.invalid/private",
+        )
+        routing = {
+            protected_routes[0]: {"weight": 1},
+            protected_routes[1]: {"weight": 2},
+        }
+        (self.root / "hot_tokens.json").write_bytes(generated_hot)
+        (self.root / "routing.json").write_text(json.dumps(routing))
+        (self.root / "hot_tokens.json").chmod(0o600)
+        (self.root / "routing.json").chmod(0o600)
+
+        result = mint_runner.finalize_run(
+            self.root,
+            prepared.run_id,
+            guard_exit=0,
+            started_at=100,
+            ended_at=400,
+            chain_aggregator=lambda *args, **kwargs: self.zero_chain(),
+        )
+
+        expected = {
+            "hot_tokens.json": "captured",
+            "routing.json": "rejected_content",
+        }
+        self.assertEqual(result["artifact_status"], expected)
+        manifest_path = prepared.result_dir / "manifest.json"
+        rendered = manifest_path.read_text()
+        self.assertEqual(
+            json.loads(rendered)["artifact_status"],
+            expected,
+        )
+        self.assertTrue(
+            (
+                prepared.result_dir / "generated-hot_tokens.json"
+            ).exists()
+        )
+        self.assertFalse(
+            (prepared.result_dir / "generated-routing.json").exists()
+        )
+        for protected in protected_routes:
+            self.assertNotIn(protected, rendered)
+            for name in ("CURRENT.md", "EXPERIMENTS.md"):
+                self.assertNotIn(
+                    protected,
+                    (self.root / "state" / name).read_text(),
+                )
+        self.assertEqual(
+            (self.root / "tokens.toml").read_bytes(),
+            self.original_tokens,
+        )
+        self.assertFalse(
+            (self.root / "state" / ".mint-run-active").exists()
+        )
 
     def test_finalize_sanitizes_every_persisted_artifact_and_result_file(self):
         rpc_variable = "ZAVOD_TEST_FINAL_RPC"
@@ -2504,6 +2647,73 @@ class FinalizationTests(MintRunnerTestCase):
             rendered,
             "stop_reason=timeout\n"
             "manifest=state/mint-runs/20260724T183000Z/manifest.json\n",
+        )
+
+    def test_finalize_cli_succeeds_without_leaking_rejected_routing(self):
+        prepared = self.prepare()
+        self.write_guard_result(prepared)
+        protected_routes = (
+            "https://route-a.invalid/private",
+            "https://route-b.invalid/private",
+        )
+        routing = {
+            protected_routes[0]: {"weight": 1},
+            protected_routes[1]: {"weight": 2},
+        }
+        (self.root / "hot_tokens.json").write_text(
+            '{"generated":true}\n'
+        )
+        (self.root / "routing.json").write_text(json.dumps(routing))
+        (self.root / "hot_tokens.json").chmod(0o600)
+        (self.root / "routing.json").chmod(0o600)
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        with (
+            patch.object(
+                mint_runner,
+                "aggregate_chain",
+                return_value=self.zero_chain(),
+            ),
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            status = mint_runner.main(
+                [
+                    "--root",
+                    str(self.root),
+                    "finalize",
+                    "--run-id",
+                    prepared.run_id,
+                    "--guard-exit",
+                    "0",
+                    "--started-at",
+                    "100",
+                    "--ended-at",
+                    "400",
+                ]
+            )
+
+        self.assertEqual(status, 0)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(
+            stdout.getvalue(),
+            "stop_reason=timeout\n"
+            f"manifest=state/mint-runs/{prepared.run_id}/manifest.json\n",
+        )
+        persisted = stdout.getvalue() + stderr.getvalue()
+        persisted += (
+            prepared.result_dir / "manifest.json"
+        ).read_text()
+        for name in ("CURRENT.md", "EXPERIMENTS.md"):
+            persisted += (self.root / "state" / name).read_text()
+        for protected in protected_routes:
+            self.assertNotIn(protected, persisted)
+        self.assertEqual(
+            json.loads(
+                (prepared.result_dir / "manifest.json").read_text()
+            )["artifact_status"]["routing.json"],
+            "rejected_content",
         )
 
     def test_finalize_cli_failure_is_generic_and_leaves_restore_to_failsafe(self):
