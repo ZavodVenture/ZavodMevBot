@@ -883,6 +883,162 @@ def _cli_version(binary):
     return match.group(1)
 
 
+def _selector_diagnostic_error(message="private path is invalid"):
+    return GuardError(f"selector-diagnostic {message}")
+
+
+def _validate_owned_descriptor(descriptor, kind, mode=None):
+    try:
+        identity = os.fstat(descriptor)
+    except OSError as exc:
+        raise _selector_diagnostic_error() from exc
+    expected_type = stat.S_ISDIR if kind == "directory" else stat.S_ISREG
+    if not expected_type(identity.st_mode):
+        raise _selector_diagnostic_error()
+    if identity.st_uid != os.geteuid():
+        raise _selector_diagnostic_error("path must be owned by the current user")
+    if mode is not None and stat.S_IMODE(identity.st_mode) != mode:
+        raise _selector_diagnostic_error(
+            f"path permissions must be mode {mode:o}"
+        )
+    return identity
+
+
+def _open_owned_relative(parent_descriptor, name, kind, mode=None):
+    if (
+        not isinstance(name, str)
+        or not name
+        or Path(name).name != name
+    ):
+        raise _selector_diagnostic_error()
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    if kind == "directory":
+        flags |= getattr(os, "O_DIRECTORY", 0)
+    try:
+        descriptor = os.open(name, flags, dir_fd=parent_descriptor)
+    except OSError as exc:
+        raise _selector_diagnostic_error() from exc
+    try:
+        _validate_owned_descriptor(descriptor, kind, mode=mode)
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def _read_descriptor_bytes(descriptor):
+    try:
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        chunks = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        return b"".join(chunks)
+    except OSError as exc:
+        raise _selector_diagnostic_error("config is unreadable") from exc
+
+
+def _open_selector_diagnostic_config(workspace_root, requested_path):
+    if workspace_root is None:
+        raise _selector_diagnostic_error("workspace root is required")
+    root = Path(workspace_root).absolute()
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    directories = []
+    config_descriptor = None
+    try:
+        try:
+            root_descriptor = os.open(root, directory_flags)
+        except OSError as exc:
+            raise _selector_diagnostic_error() from exc
+        directories.append(root_descriptor)
+        _validate_owned_descriptor(root_descriptor, "directory")
+
+        state_descriptor = _open_owned_relative(
+            root_descriptor,
+            "state",
+            "directory",
+            mode=0o700,
+        )
+        directories.append(state_descriptor)
+
+        marker_descriptor = _open_owned_relative(
+            state_descriptor,
+            ".mint-run-active",
+            "file",
+            mode=0o600,
+        )
+        try:
+            marker = _read_descriptor_bytes(marker_descriptor)
+        finally:
+            os.close(marker_descriptor)
+        try:
+            marker_text = marker.decode("ascii")
+        except UnicodeError as exc:
+            raise _selector_diagnostic_error(
+                "active marker is invalid"
+            ) from exc
+        match = re.fullmatch(r"([0-9]{8}T[0-9]{6}Z)\n", marker_text)
+        if match is None:
+            raise _selector_diagnostic_error("active marker is invalid")
+        run_id = match.group(1)
+
+        mint_runs_descriptor = _open_owned_relative(
+            state_descriptor,
+            "mint-runs",
+            "directory",
+            mode=0o700,
+        )
+        directories.append(mint_runs_descriptor)
+        run_descriptor = _open_owned_relative(
+            mint_runs_descriptor,
+            run_id,
+            "directory",
+            mode=0o700,
+        )
+        directories.append(run_descriptor)
+
+        expected_relative = (
+            Path("state")
+            / "mint-runs"
+            / run_id
+            / "selector-diagnostic.toml"
+        )
+        expected_absolute = root / expected_relative
+        requested = Path(requested_path)
+        expected = expected_absolute if requested.is_absolute() else expected_relative
+        if requested != expected:
+            if requested.is_absolute():
+                try:
+                    requested.relative_to(root)
+                except ValueError as exc:
+                    raise _selector_diagnostic_error(
+                        "config must be inside the workspace"
+                    ) from exc
+            raise _selector_diagnostic_error("config path is invalid")
+
+        config_descriptor = _open_owned_relative(
+            run_descriptor,
+            "selector-diagnostic.toml",
+            "file",
+            mode=0o600,
+        )
+        held_descriptor = config_descriptor
+        config_descriptor = None
+        return root, held_descriptor
+    finally:
+        if config_descriptor is not None:
+            os.close(config_descriptor)
+        for descriptor in reversed(directories):
+            os.close(descriptor)
+
+
 def preflight(
     config_path,
     root=None,
@@ -947,59 +1103,59 @@ def run_guarded(
         raise GuardError(
             "selector-diagnostic profile and test mode must be provided together"
         )
-    if profile == "selector-diagnostic":
-        config_path = Path(config_path).absolute()
-        root = Path(workspace_root or config_path.parent).resolve()
-        try:
-            identity = config_path.stat(follow_symlinks=False)
-        except OSError as exc:
-            raise GuardError("config.toml is invalid or unreadable") from exc
-        if not stat.S_ISREG(identity.st_mode):
-            raise GuardError(
-                "selector-diagnostic config must be a regular non-symlink file"
+    diagnostic_config_descriptor = None
+    try:
+        if profile == "selector-diagnostic":
+            root, diagnostic_config_descriptor = (
+                _open_selector_diagnostic_config(
+                    workspace_root,
+                    config_path,
+                )
             )
-        if identity.st_uid != os.geteuid():
-            raise GuardError(
-                "selector-diagnostic config must be owned by the current user"
+            config_path = Path(
+                f"/proc/self/fd/{diagnostic_config_descriptor}"
             )
-        if stat.S_IMODE(identity.st_mode) != 0o600:
-            raise GuardError("selector-diagnostic config permissions must be mode 600")
-        config_path = config_path.resolve()
-        try:
-            config_path.relative_to(root)
-        except ValueError as exc:
-            raise GuardError(
-                "selector-diagnostic config must be inside the workspace"
-            ) from exc
-    else:
-        config_path = Path(config_path).resolve()
-        root = Path(workspace_root or config_path.parent).resolve()
-    config = load_config(config_path)
-    summary = preflight(config_path, root=root, config=config, profile=profile)
-    public_key = summary["wallet"]
-    rpc_url = _get(config, "rpc", "url")
-    start_balance = summary["balance_lamports"]
-    logs_dir = root / "logs"
-    logs_dir.mkdir(mode=0o700, exist_ok=True)
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    log_path = logs_dir / f"{stamp}-zavod-cli.log"
-    fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    started = time.monotonic()
-    child = None
-    pump = None
-    result = None
-    finalization_interrupted = False
-    pump_alive = False
-    pump_started = False
-    log_handle = None
-    cleanup = {
-        "exit_code": None,
-        "group_absent": True,
-        "interrupted": False,
-    }
-    operator_signal_event = threading.Event()
-    prior_sigint = signal.getsignal(signal.SIGINT)
-    prior_sigterm = signal.getsignal(signal.SIGTERM)
+            config = load_config_bytes(
+                _read_descriptor_bytes(diagnostic_config_descriptor)
+            )
+        else:
+            config_path = Path(config_path).resolve()
+            root = Path(workspace_root or config_path.parent).resolve()
+            config = load_config(config_path)
+        summary = preflight(
+            config_path,
+            root=root,
+            config=config,
+            profile=profile,
+        )
+        public_key = summary["wallet"]
+        rpc_url = _get(config, "rpc", "url")
+        start_balance = summary["balance_lamports"]
+        logs_dir = root / "logs"
+        logs_dir.mkdir(mode=0o700, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        log_path = logs_dir / f"{stamp}-zavod-cli.log"
+        fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        started = time.monotonic()
+        child = None
+        pump = None
+        result = None
+        finalization_interrupted = False
+        pump_alive = False
+        pump_started = False
+        log_handle = None
+        cleanup = {
+            "exit_code": None,
+            "group_absent": True,
+            "interrupted": False,
+        }
+        operator_signal_event = threading.Event()
+        prior_sigint = signal.getsignal(signal.SIGINT)
+        prior_sigterm = signal.getsignal(signal.SIGTERM)
+    except BaseException:
+        if diagnostic_config_descriptor is not None:
+            os.close(diagnostic_config_descriptor)
+        raise
 
     def interrupt_handler(signum, frame):
         del signum, frame
@@ -1012,13 +1168,15 @@ def run_guarded(
         command = [str(root / "zavod-mev-bot-rust-version-cli"), "run"]
         if test_mode:
             command.extend(["--config", str(config_path), "--test-mode"])
-        child = subprocess.Popen(
-            command,
-            cwd=root,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
+        popen_arguments = {
+            "cwd": root,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.STDOUT,
+            "start_new_session": True,
+        }
+        if diagnostic_config_descriptor is not None:
+            popen_arguments["pass_fds"] = (diagnostic_config_descriptor,)
+        child = subprocess.Popen(command, **popen_arguments)
         if operator_signal_event.is_set():
             result = {
                 "reason": "operator_signal",
@@ -1066,6 +1224,9 @@ def run_guarded(
             "child_exit_code": None,
         }
     finally:
+        if diagnostic_config_descriptor is not None:
+            os.close(diagnostic_config_descriptor)
+            diagnostic_config_descriptor = None
         cleanup = (
             _verified_shutdown(child)
             if child is not None

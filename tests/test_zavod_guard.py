@@ -800,6 +800,9 @@ class HardenedCleanupTests(unittest.TestCase):
 
 
 class RunGuardedHardeningTests(unittest.TestCase):
+    DIAGNOSTIC_RUN_ID = "20260724T190000Z"
+    ORIGINAL_DIAGNOSTIC_BYTES = b"original diagnostic descriptor fixture\n"
+
     def run_with_mocks(self, pump=None, cleanup=None):
         config = valid_config()
         child = Mock(pid=123, returncode=0, stdout=io.BytesIO())
@@ -851,13 +854,65 @@ class RunGuardedHardeningTests(unittest.TestCase):
                         Path(temp_dir) / "config.toml"
                     )
 
-    def assert_diagnostic_identity_rejected(self, config_path, root, pattern):
+    def prepare_diagnostic_workspace(self, root, config_bytes=None):
+        root = Path(root)
+        binary = root / "zavod-mev-bot-rust-version-cli"
+        binary.touch()
+        state = root / "state"
+        mint_runs = state / "mint-runs"
+        run_dir = mint_runs / self.DIAGNOSTIC_RUN_ID
+        state.mkdir(mode=0o700)
+        mint_runs.mkdir(mode=0o700)
+        run_dir.mkdir(mode=0o700)
+        for directory in (state, mint_runs, run_dir):
+            directory.chmod(0o700)
+        marker = state / ".mint-run-active"
+        marker.write_text(f"{self.DIAGNOSTIC_RUN_ID}\n")
+        marker.chmod(0o600)
+        config_path = run_dir / "selector-diagnostic.toml"
+        config_path.write_bytes(
+            config_bytes
+            if config_bytes is not None
+            else self.ORIGINAL_DIAGNOSTIC_BYTES
+        )
+        config_path.chmod(0o600)
+        return {
+            "binary": binary,
+            "state": state,
+            "mint_runs": mint_runs,
+            "run_dir": run_dir,
+            "marker": marker,
+            "config": config_path,
+        }
+
+    def assert_diagnostic_identity_rejected(
+        self,
+        config_path,
+        root,
+        pattern="selector-diagnostic",
+    ):
+        config = valid_config()
+        child = Mock(pid=123, returncode=0, stdout=io.BytesIO())
+        summary = {"wallet": "public-address", "balance_lamports": 100_000_000}
+        supervised = {
+            "reason": "child_exit",
+            "start_balance": 100_000_000,
+            "end_balance": 100_000_000,
+            "observed_loss": 0,
+            "child_exit_code": 0,
+        }
+        cleanup = {"exit_code": 0, "group_absent": True, "interrupted": False}
         with (
+            patch.object(zavod_guard, "load_config", return_value=config),
+            patch.object(zavod_guard, "load_config_bytes", return_value=config),
+            patch.object(zavod_guard, "preflight", return_value=summary),
             patch.object(
-                zavod_guard,
-                "load_config",
-                side_effect=GuardError("identity validation fell through"),
-            ),
+                zavod_guard.subprocess,
+                "Popen",
+                return_value=child,
+            ) as launch,
+            patch.object(zavod_guard, "supervise", return_value=supervised),
+            patch.object(zavod_guard, "_verified_shutdown", return_value=cleanup),
             self.assertRaisesRegex(GuardError, pattern),
         ):
             zavod_guard.run_guarded(
@@ -866,6 +921,7 @@ class RunGuardedHardeningTests(unittest.TestCase):
                 test_mode=True,
                 workspace_root=root,
             )
+        launch.assert_not_called()
 
     def test_output_pump_drains_and_redacts_before_log_close(self):
         config = valid_config()
@@ -1056,11 +1112,9 @@ class RunGuardedHardeningTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            binary = root / "zavod-mev-bot-rust-version-cli"
-            binary.touch()
-            config_path = root / "selector-diagnostic.toml"
-            config_path.touch(mode=0o600)
-            config_path.chmod(0o600)
+            paths = self.prepare_diagnostic_workspace(root)
+            binary = paths["binary"]
+            config_path = paths["config"]
 
             with self.assertRaisesRegex(GuardError, "must be provided together"):
                 zavod_guard.run_guarded(
@@ -1100,20 +1154,34 @@ class RunGuardedHardeningTests(unittest.TestCase):
                 outside_path.unlink()
 
             def popen(argv, **kwargs):
+                passed = kwargs.get("pass_fds")
+                self.assertIsNotNone(passed)
+                self.assertEqual(len(passed), 1)
+                descriptor = passed[0]
                 self.assertEqual(
                     argv,
                     [
                         str(binary),
                         "run",
                         "--config",
-                        str(config_path.resolve()),
+                        f"/proc/self/fd/{descriptor}",
                         "--test-mode",
                     ],
+                )
+                self.assertTrue(Path(argv[3]).is_absolute())
+                self.assertEqual(
+                    Path(argv[3]).read_bytes(),
+                    self.ORIGINAL_DIAGNOSTIC_BYTES,
                 )
                 return child
 
             with (
                 patch.object(zavod_guard, "load_config", return_value=config),
+                patch.object(
+                    zavod_guard,
+                    "load_config_bytes",
+                    return_value=config,
+                ),
                 patch.object(zavod_guard, "preflight", return_value=summary),
                 patch.object(zavod_guard.subprocess, "Popen", side_effect=popen),
                 patch.object(zavod_guard, "supervise", return_value=supervised),
@@ -1134,6 +1202,11 @@ class RunGuardedHardeningTests(unittest.TestCase):
 
             with (
                 patch.object(zavod_guard, "load_config", return_value=config),
+                patch.object(
+                    zavod_guard,
+                    "load_config_bytes",
+                    return_value=config,
+                ),
                 patch.object(zavod_guard, "preflight", return_value=summary),
                 patch.object(
                     zavod_guard.subprocess,
@@ -1148,6 +1221,139 @@ class RunGuardedHardeningTests(unittest.TestCase):
                 launch.call_args.args[0],
                 [str(binary), "run"],
             )
+
+    def test_selector_diagnostic_holds_config_across_run_directory_swap(self):
+        config = valid_config()
+        child = Mock(pid=123, returncode=0, stdout=io.BytesIO())
+        summary = {"wallet": "public-address", "balance_lamports": 100_000_000}
+        supervised = {
+            "reason": "child_exit",
+            "start_balance": 100_000_000,
+            "end_balance": 100_000_000,
+            "observed_loss": 0,
+            "child_exit_code": 0,
+        }
+        cleanup = {"exit_code": 0, "group_absent": True, "interrupted": False}
+        replacement_bytes = b"replacement attacker-controlled fixture\n"
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = self.prepare_diagnostic_workspace(root)
+            original_run_dir = paths["run_dir"].with_name("held-original-run")
+
+            def swap_after_config_load(*args, **kwargs):
+                del args, kwargs
+                paths["run_dir"].rename(original_run_dir)
+                paths["run_dir"].mkdir(mode=0o700)
+                paths["run_dir"].chmod(0o700)
+                replacement = paths["run_dir"] / "selector-diagnostic.toml"
+                replacement.write_bytes(replacement_bytes)
+                replacement.chmod(0o600)
+                return summary
+
+            def popen(argv, **kwargs):
+                passed = kwargs.get("pass_fds")
+                self.assertIsNotNone(passed)
+                self.assertEqual(len(passed), 1)
+                self.assertEqual(
+                    argv[3],
+                    f"/proc/self/fd/{passed[0]}",
+                )
+                self.assertEqual(
+                    Path(argv[3]).read_bytes(),
+                    self.ORIGINAL_DIAGNOSTIC_BYTES,
+                )
+                self.assertNotEqual(Path(argv[3]).read_bytes(), replacement_bytes)
+                return child
+
+            with (
+                patch.object(zavod_guard, "load_config", return_value=config),
+                patch.object(
+                    zavod_guard,
+                    "load_config_bytes",
+                    return_value=config,
+                ),
+                patch.object(
+                    zavod_guard,
+                    "preflight",
+                    side_effect=swap_after_config_load,
+                ),
+                patch.object(
+                    zavod_guard.subprocess,
+                    "Popen",
+                    side_effect=popen,
+                ),
+                patch.object(zavod_guard, "supervise", return_value=supervised),
+                patch.object(zavod_guard, "_verified_shutdown", return_value=cleanup),
+            ):
+                zavod_guard.run_guarded(
+                    paths["config"],
+                    profile="selector-diagnostic",
+                    test_mode=True,
+                    workspace_root=root,
+                )
+
+    def test_selector_diagnostic_descriptor_walk_rejects_symlinked_components(self):
+        components = ("state", "mint_runs", "run_dir", "config")
+        for component_name in components:
+            with self.subTest(component=component_name):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    root = Path(temp_dir)
+                    paths = self.prepare_diagnostic_workspace(root)
+                    component = paths[component_name]
+                    target = component.with_name(f"{component.name}-target")
+                    component.rename(target)
+                    component.symlink_to(
+                        target.name,
+                        target_is_directory=component_name != "config",
+                    )
+
+                    self.assert_diagnostic_identity_rejected(
+                        paths["config"],
+                        root,
+                    )
+
+    def test_selector_diagnostic_descriptor_walk_requires_private_modes(self):
+        components = {
+            "state": 0o755,
+            "mint_runs": 0o755,
+            "run_dir": 0o755,
+            "marker": 0o640,
+            "config": 0o640,
+        }
+        for component_name, mode in components.items():
+            with self.subTest(component=component_name):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    root = Path(temp_dir)
+                    paths = self.prepare_diagnostic_workspace(root)
+                    paths[component_name].chmod(mode)
+
+                    self.assert_diagnostic_identity_rejected(
+                        paths["config"],
+                        root,
+                    )
+
+    def test_selector_diagnostic_requires_exact_descriptor_bound_marker(self):
+        marker_variants = ("wrong-run", "symlink")
+        for variant in marker_variants:
+            with self.subTest(variant=variant):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    root = Path(temp_dir)
+                    paths = self.prepare_diagnostic_workspace(root)
+                    if variant == "wrong-run":
+                        paths["marker"].write_text("20260724T190001Z\n")
+                        paths["marker"].chmod(0o600)
+                    else:
+                        marker_target = paths["marker"].with_name(
+                            ".mint-run-active-target"
+                        )
+                        paths["marker"].rename(marker_target)
+                        paths["marker"].symlink_to(marker_target.name)
+
+                    self.assert_diagnostic_identity_rejected(
+                        paths["config"],
+                        root,
+                    )
 
     def test_main_binds_diagnostic_to_guard_repository_root(self):
         config = valid_config()
@@ -1206,53 +1412,58 @@ class RunGuardedHardeningTests(unittest.TestCase):
             launch.assert_not_called()
 
     def test_selector_diagnostic_rejects_config_owned_by_another_euid(self):
-        real_stat = Path.stat
+        real_fstat = os.fstat
 
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            config_path = root / "selector-diagnostic.toml"
-            config_path.touch(mode=0o600)
-            config_path.chmod(0o600)
+            paths = self.prepare_diagnostic_workspace(root)
+            config_identity = paths["config"].stat()
 
-            def wrong_owner_stat(path, *, follow_symlinks=True):
-                metadata = real_stat(path, follow_symlinks=follow_symlinks)
-                if Path(path) != config_path:
+            def wrong_owner_fstat(descriptor):
+                metadata = real_fstat(descriptor)
+                if (
+                    metadata.st_dev,
+                    metadata.st_ino,
+                ) != (
+                    config_identity.st_dev,
+                    config_identity.st_ino,
+                ):
                     return metadata
                 fields = list(metadata)
                 fields[4] = os.geteuid() + 1
                 return os.stat_result(fields)
 
-            with patch.object(Path, "stat", new=wrong_owner_stat):
+            with patch.object(os, "fstat", side_effect=wrong_owner_fstat):
                 self.assert_diagnostic_identity_rejected(
-                    config_path,
+                    paths["config"],
                     root,
-                    "owned by the current user",
+                    "selector-diagnostic",
                 )
 
     def test_selector_diagnostic_rejects_config_mode_with_special_bits(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            config_path = root / "selector-diagnostic.toml"
-            config_path.touch(mode=0o600)
-            config_path.chmod(0o4600)
+            paths = self.prepare_diagnostic_workspace(root)
+            paths["config"].chmod(0o4600)
             self.assert_diagnostic_identity_rejected(
-                config_path,
+                paths["config"],
                 root,
-                "permissions must be mode 600",
+                "selector-diagnostic",
             )
 
     def test_selector_diagnostic_rejects_config_symlink(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            target_path = root / "selector-diagnostic-target.toml"
-            target_path.touch(mode=0o600)
-            target_path.chmod(0o600)
-            symlink_path = root / "selector-diagnostic-link.toml"
-            symlink_path.symlink_to(target_path)
+            paths = self.prepare_diagnostic_workspace(root)
+            target_path = paths["config"].with_name(
+                "selector-diagnostic-target.toml"
+            )
+            paths["config"].rename(target_path)
+            paths["config"].symlink_to(target_path.name)
             self.assert_diagnostic_identity_rejected(
-                symlink_path,
+                paths["config"],
                 root,
-                "regular non-symlink file",
+                "selector-diagnostic",
             )
 
     def test_test_mode_dispatch_violation_stops_child(self):
@@ -1398,7 +1609,7 @@ class RunGuardedWrapperTests(unittest.TestCase):
         self.assertIn('"--profile", "single-mint-auto"', result.stdout)
 
     def test_diagnostic_requires_test_mode_and_fixed_config(self):
-        relative_path, config_path = self.prepare_diagnostic_config()
+        relative_path, _config_path = self.prepare_diagnostic_config()
         diagnostic_args = self.diagnostic_args(relative_path)
 
         rejected = [
@@ -1421,15 +1632,6 @@ class RunGuardedWrapperTests(unittest.TestCase):
         arbitrary_args = list(diagnostic_args)
         arbitrary_args[arbitrary_args.index(relative_path)] = "state/arbitrary.toml"
         rejected.append(self.invoke_with_inherited_lock(*arbitrary_args))
-
-        config_path.unlink()
-        config_path.symlink_to(arbitrary)
-        rejected.append(self.invoke_with_inherited_lock(*diagnostic_args))
-        config_path.unlink()
-        config_path.write_text("# fake diagnostic config\n")
-        config_path.chmod(0o640)
-        rejected.append(self.invoke_with_inherited_lock(*diagnostic_args))
-        config_path.chmod(0o600)
 
         for result in rejected:
             self.assertNotEqual(result.returncode, 0, result.stdout)
@@ -1456,70 +1658,6 @@ class RunGuardedWrapperTests(unittest.TestCase):
             (self.root / "guard-launches").read_text().splitlines(),
             ["launch"],
         )
-
-    def test_diagnostic_rejects_symlinked_path_ancestors(self):
-        relative_path, _config_path = self.prepare_diagnostic_config()
-        diagnostic_args = self.diagnostic_args(relative_path)
-        components = (
-            Path("state"),
-            Path("state/mint-runs"),
-            Path("state/mint-runs") / self.DIAGNOSTIC_RUN_ID,
-        )
-
-        for relative_component in components:
-            with self.subTest(component=str(relative_component)):
-                component = self.root / relative_component
-                target = component.with_name(f"{component.name}-real")
-                component.rename(target)
-                component.symlink_to(target.name, target_is_directory=True)
-                before = (
-                    (self.root / "guard-launches").read_text().splitlines()
-                    if (self.root / "guard-launches").exists()
-                    else []
-                )
-                try:
-                    result = self.invoke_with_inherited_lock(*diagnostic_args)
-                finally:
-                    component.unlink()
-                    target.rename(component)
-
-                self.assertNotEqual(result.returncode, 0, result.stdout)
-                after = (
-                    (self.root / "guard-launches").read_text().splitlines()
-                    if (self.root / "guard-launches").exists()
-                    else []
-                )
-                self.assertEqual(after, before)
-
-    def test_diagnostic_requires_private_path_component_modes(self):
-        relative_path, config_path = self.prepare_diagnostic_config()
-        diagnostic_args = self.diagnostic_args(relative_path)
-        components = (
-            self.root / "state",
-            self.root / "state/mint-runs",
-            config_path.parent,
-        )
-
-        for component in components:
-            with self.subTest(component=str(component.relative_to(self.root))):
-                component.chmod(0o755)
-                before = (
-                    (self.root / "guard-launches").read_text().splitlines()
-                    if (self.root / "guard-launches").exists()
-                    else []
-                )
-                try:
-                    result = self.invoke_with_inherited_lock(*diagnostic_args)
-                finally:
-                    component.chmod(0o700)
-
-                self.assertNotEqual(result.returncode, 0, result.stdout)
-                after = (
-                    (self.root / "guard-launches").read_text().splitlines()
-                    if (self.root / "guard-launches").exists()
-                    else []
-                )
-                self.assertEqual(after, before)
 
     def test_rejects_timeout_outside_bounds(self):
         for value in ("29", "301", "invalid"):
