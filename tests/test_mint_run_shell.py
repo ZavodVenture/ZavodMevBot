@@ -10,6 +10,7 @@ from pathlib import Path
 
 
 TARGET_MINT = "So11111111111111111111111111111111111111112"
+DIAGNOSTIC_SENTINEL = "diagnostic-config-private-sentinel"
 
 
 class MintRunShellTests(unittest.TestCase):
@@ -29,6 +30,9 @@ class MintRunShellTests(unittest.TestCase):
             """\
             #!/usr/bin/env bash
             set -euo pipefail
+            [[ "${ZAVOD_LIVE_LOCK_FD:-}" =~ ^[0-9]+$ ]]
+            [[ -e "/proc/$$/fd/$ZAVOD_LIVE_LOCK_FD" ]]
+            printf '%s\n' "$ZAVOD_LIVE_LOCK_FD" >> run-guarded.lock-fds
             printf '%s\n' "$*" >> run-guarded.args
             printf 'reason=timeout\nduration_seconds=60\nlog_path=logs/fake.log\n'
             """
@@ -71,6 +75,11 @@ class MintRunShellTests(unittest.TestCase):
                     tokens.write_bytes(original.read_bytes())
                     tokens.chmod(0o600)
                 (root / "state/.mint-run-active").unlink(missing_ok=True)
+                (
+                    root
+                    / "state/mint-runs/20260724T190000Z/"
+                    "selector-diagnostic.toml"
+                ).unlink(missing_ok=True)
 
             if command == "prepare":
                 if (root / "slow-prepare").exists():
@@ -96,6 +105,18 @@ class MintRunShellTests(unittest.TestCase):
                 write_private(root / "tokens.toml", f'tokens = ["{mint}"]\\n')
                 (root / "prepared-mint").write_text(mint)
                 (root / "owner-prepared").touch()
+                diagnostic = (
+                    args[args.index("--diagnostic") + 1]
+                    if "--diagnostic" in args
+                    else None
+                )
+                if diagnostic is not None:
+                    write_private(
+                        root
+                        / "state/mint-runs/20260724T190000Z/"
+                        "selector-diagnostic.toml",
+                        "diagnostic-config-private-sentinel\\n",
+                    )
                 custom = root / "prepare-output.txt"
                 if custom.exists():
                     print(custom.read_text(), end="")
@@ -109,6 +130,13 @@ class MintRunShellTests(unittest.TestCase):
                     print("preflight=ok")
                     print("loss_limit_lamports=30000000")
                     print("early_stop_lamports=25000000")
+                    if diagnostic is not None:
+                        print("diagnostic_mode=" + diagnostic)
+                        print(
+                            "diagnostic_config="
+                            "state/mint-runs/20260724T190000Z/"
+                            "selector-diagnostic.toml"
+                        )
             elif command == "result-path":
                 if (root / "fail-result-path").exists():
                     raise SystemExit(4)
@@ -141,6 +169,20 @@ class MintRunShellTests(unittest.TestCase):
                     raise SystemExit(7)
                 if tokens != f'tokens = ["{mint}"]\\n'.encode():
                     raise SystemExit(7)
+                if "--diagnostic" in (
+                    root / "helper.calls"
+                ).read_text().splitlines()[0]:
+                    diagnostic_config = (
+                        root
+                        / "state/mint-runs/20260724T190000Z/"
+                        "selector-diagnostic.toml"
+                    )
+                    if (
+                        diagnostic_config.is_symlink()
+                        or not diagnostic_config.is_file()
+                        or diagnostic_config.stat().st_mode & 0o777 != 0o600
+                    ):
+                        raise SystemExit(7)
             elif command == "finalize":
                 (root / "finalize.called").write_text(" ".join(sys.argv))
                 if (root / "fail-finalize").exists():
@@ -185,6 +227,10 @@ class MintRunShellTests(unittest.TestCase):
         if not path.exists():
             return []
         return [line.split()[0] for line in path.read_text().splitlines()]
+
+    def guard_lock_fds(self):
+        path = self.root / "run-guarded.lock-fds"
+        return path.read_text().splitlines() if path.exists() else []
 
     def test_declined_confirmation_never_runs_guard_and_restores(self):
         result = self.invoke("no\n", TARGET_MINT, "--timeout", "60")
@@ -239,6 +285,97 @@ class MintRunShellTests(unittest.TestCase):
         )
         self.assertEqual(result_path.stat().st_mode & 0o777, 0o600)
 
+    def test_d0_uses_exact_guarded_test_mode_launch(self):
+        phrase = f"DIAGNOSE {TARGET_MINT} FOR 60\n"
+
+        result = self.invoke(
+            phrase,
+            TARGET_MINT,
+            "--diagnostic",
+            "d0",
+            "--timeout",
+            "60",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            self.guard_invocations(),
+            [
+                "--live-confirmed --timeout 60 "
+                "--profile selector-diagnostic "
+                "--config state/mint-runs/20260724T190000Z/"
+                "selector-diagnostic.toml --test-mode"
+            ],
+        )
+        self.assertEqual(len(self.guard_lock_fds()), 1)
+        self.assertRegex(self.guard_lock_fds()[0], r"^[0-9]+$")
+        self.assertEqual(
+            [
+                line
+                for line in (self.root / "helper.calls").read_text().splitlines()
+                if line.startswith("prepare ")
+            ],
+            [
+                "prepare --mint "
+                f"{TARGET_MINT} --timeout 60 --diagnostic d0"
+            ],
+        )
+        self.assertNotIn(
+            DIAGNOSTIC_SENTINEL,
+            result.stdout + result.stderr,
+        )
+        self.assertTrue((self.root / "restore.called").exists())
+
+    def test_diagnostic_confirmation_is_single_use(self):
+        exact = f"DIAGNOSE {TARGET_MINT} FOR 60"
+        wrong_answers = (
+            f"RUN {TARGET_MINT} FOR 60\n",
+            f"diagnose {TARGET_MINT} FOR 60\n",
+            f"DIAGNOSE {TARGET_MINT} FOR 61\n",
+            f"{exact}\n{exact}\n",
+        )
+
+        for answer in wrong_answers:
+            with self.subTest(answer=answer):
+                before = len(self.guard_invocations())
+                result = self.invoke(
+                    answer,
+                    TARGET_MINT,
+                    "--diagnostic",
+                    "d0",
+                    "--timeout",
+                    "60",
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(len(self.guard_invocations()), before)
+
+    def test_diagnostic_rejects_unbound_prepare_config(self):
+        (self.root / "prepare-output.txt").write_text(
+            "run_id=20260724T190000Z\n"
+            f"mint={TARGET_MINT}\n"
+            "timeout_seconds=60\n"
+            "cli_version=0.2.2\n"
+            "auto_mode=selector-diagnostic\n"
+            "preflight=deferred\n"
+            "loss_limit_lamports=30000000\n"
+            "early_stop_lamports=25000000\n"
+            "diagnostic_mode=d0\n"
+            "diagnostic_config=state/arbitrary.toml\n"
+        )
+
+        result = self.invoke(
+            f"DIAGNOSE {TARGET_MINT} FOR 60\n",
+            TARGET_MINT,
+            "--diagnostic",
+            "d0",
+            "--timeout",
+            "60",
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.guard_invocations(), [])
+        self.assertTrue((self.root / "restore.called").exists())
+
     def test_invalid_arguments_fail_before_prepare(self):
         invalid_argv = (
             (),
@@ -250,6 +387,13 @@ class MintRunShellTests(unittest.TestCase):
             (TARGET_MINT, "--timeout", "3x"),
             (TARGET_MINT, "--unknown", "60"),
             (TARGET_MINT, "--timeout", "60", "extra"),
+            (TARGET_MINT, "--diagnostic"),
+            (TARGET_MINT, "--diagnostic", ""),
+            (TARGET_MINT, "--diagnostic", "d1"),
+            (TARGET_MINT, "--diagnostic", "d2"),
+            (TARGET_MINT, "--diagnostic", "d0", "--timeout", "29"),
+            (TARGET_MINT, "--diagnostic", "d0", "--timeout", "301"),
+            (TARGET_MINT, "--diagnostic", "d0", "--diagnostic", "d0"),
         )
 
         for argv in invalid_argv:

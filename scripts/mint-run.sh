@@ -6,7 +6,7 @@ root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 cd -- "$root"
 
 usage() {
-  echo 'Usage: ./scripts/mint-run.sh <MINT> [--timeout 30..300]' >&2
+  echo 'Usage: ./scripts/mint-run.sh <MINT> [--timeout 30..300] | ./scripts/mint-run.sh <MINT> --diagnostic d0 [--timeout 30..300]' >&2
   exit 64
 }
 
@@ -15,14 +15,31 @@ mint="$1"
 shift
 [[ -n "$mint" && "$mint" != -* ]] || usage
 timeout_seconds=300
-if [[ "${1:-}" == "--timeout" ]]; then
-  [[ $# -eq 2 ]] || usage
-  timeout_seconds="$2"
-  shift 2
-fi
-[[ $# -eq 0 ]] || usage
+diagnostic_mode=""
+timeout_seen=0
+diagnostic_seen=0
+while (( $# > 0 )); do
+  case "$1" in
+    --timeout)
+      (( $# >= 2 && timeout_seen == 0 )) || usage
+      timeout_seconds="$2"
+      timeout_seen=1
+      shift 2
+      ;;
+    --diagnostic)
+      (( $# >= 2 && diagnostic_seen == 0 )) || usage
+      diagnostic_mode="$2"
+      diagnostic_seen=1
+      shift 2
+      ;;
+    *)
+      usage
+      ;;
+  esac
+done
 [[ "$timeout_seconds" =~ ^[0-9]+$ ]] || usage
 (( timeout_seconds >= 30 && timeout_seconds <= 300 )) || usage
+(( diagnostic_seen == 0 )) || [[ "$diagnostic_mode" == "d0" ]] || usage
 
 run_id=""
 finalized=0
@@ -157,10 +174,18 @@ if (( pending_signal_status != 0 )); then
 fi
 set +e
 prepare_started=1
-python3 scripts/mint_runner.py --root "$root" prepare \
-  --mint "$mint" \
-  --timeout "$timeout_seconds" \
-  >"$prepare_output_path" &
+if [[ -n "$diagnostic_mode" ]]; then
+  python3 scripts/mint_runner.py --root "$root" prepare \
+    --mint "$mint" \
+    --timeout "$timeout_seconds" \
+    --diagnostic "$diagnostic_mode" \
+    >"$prepare_output_path" &
+else
+  python3 scripts/mint_runner.py --root "$root" prepare \
+    --mint "$mint" \
+    --timeout "$timeout_seconds" \
+    >"$prepare_output_path" &
+fi
 prepare_pid=$!
 forward_pending_signal
 while true; do
@@ -188,6 +213,14 @@ prepared_run_id="$(
   printf '%s\n' "$prepare_output" |
     awk -F= '$1 == "run_id" {print $2; exit}'
 )"
+prepared_diagnostic_mode="$(
+  printf '%s\n' "$prepare_output" |
+    awk -F= '$1 == "diagnostic_mode" {print $2; exit}'
+)"
+prepared_diagnostic_config="$(
+  printf '%s\n' "$prepare_output" |
+    awk -F= '$1 == "diagnostic_config" {print $2; exit}'
+)"
 printf '%s\n' "$prepare_output" |
   awk -F= '
     $1 == "run_id" ||
@@ -197,7 +230,9 @@ printf '%s\n' "$prepare_output" |
     $1 == "auto_mode" ||
     $1 == "preflight" ||
     $1 == "loss_limit_lamports" ||
-    $1 == "early_stop_lamports" {
+    $1 == "early_stop_lamports" ||
+    $1 == "diagnostic_mode" ||
+    $1 == "diagnostic_config" {
       print
     }
   '
@@ -206,18 +241,44 @@ printf '%s\n' "$prepare_output" |
   exit 1
 }
 run_id="$prepared_run_id"
+diagnostic_config=""
+if [[ -n "$diagnostic_mode" ]]; then
+  expected_diagnostic_config="state/mint-runs/$run_id/selector-diagnostic.toml"
+  if [[
+    "$prepared_diagnostic_mode" != "$diagnostic_mode" ||
+    "$prepared_diagnostic_config" != "$expected_diagnostic_config"
+  ]]; then
+    echo 'Diagnostic preparation validation failed.' >&2
+    exit 1
+  fi
+  diagnostic_config="$expected_diagnostic_config"
+elif [[
+  -n "$prepared_diagnostic_mode" ||
+  -n "$prepared_diagnostic_config"
+]]; then
+  echo 'Preparation returned unexpected diagnostic state.' >&2
+  exit 1
+fi
 if (( pending_signal_status != 0 )); then
   exit "$pending_signal_status"
 fi
 
-confirmation="RUN $mint FOR $timeout_seconds"
+if [[ -n "$diagnostic_mode" ]]; then
+  confirmation="DIAGNOSE $mint FOR $timeout_seconds"
+else
+  confirmation="RUN $mint FOR $timeout_seconds"
+fi
 printf 'Type exactly: %s\n> ' "$confirmation"
 answer=""
 IFS= read -r answer || true
 if (( pending_signal_status != 0 )); then
   exit "$pending_signal_status"
 fi
-if [[ "$answer" != "$confirmation" ]]; then
+repeated_confirmation=0
+if [[ -n "$diagnostic_mode" ]] && IFS= read -r -t 0.01 repeated_answer; then
+  repeated_confirmation=1
+fi
+if [[ "$answer" != "$confirmation" || "$repeated_confirmation" -ne 0 ]]; then
   echo 'Live run declined; restoring workspace.'
   exit 0
 fi
@@ -269,12 +330,23 @@ if (( pending_signal_status != 0 )); then
 fi
 
 set +e
-ZAVOD_LIVE_LOCK_FD="$live_lock_fd" \
-  ./scripts/run-guarded.sh \
-  --live-confirmed \
-  --timeout "$timeout_seconds" \
-  --profile single-mint-auto \
-  >&"$result_fd" &
+if [[ -n "$diagnostic_mode" ]]; then
+  ZAVOD_LIVE_LOCK_FD="$live_lock_fd" \
+    ./scripts/run-guarded.sh \
+    --live-confirmed \
+    --timeout "$timeout_seconds" \
+    --profile selector-diagnostic \
+    --config "$diagnostic_config" \
+    --test-mode \
+    >&"$result_fd" &
+else
+  ZAVOD_LIVE_LOCK_FD="$live_lock_fd" \
+    ./scripts/run-guarded.sh \
+    --live-confirmed \
+    --timeout "$timeout_seconds" \
+    --profile single-mint-auto \
+    >&"$result_fd" &
+fi
 guard_pid=$!
 forward_pending_signal
 while true; do

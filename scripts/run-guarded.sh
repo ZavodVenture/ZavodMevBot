@@ -6,7 +6,7 @@ root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 cd -- "$root"
 
 usage() {
-  echo 'Usage: run-guarded.sh --live-confirmed [--timeout 30..300] [--profile default|single-mint-auto]' >&2
+  echo 'Usage: run-guarded.sh --live-confirmed [--timeout 30..300] [--profile default|single-mint-auto] | run-guarded.sh --live-confirmed --timeout 30..300 --profile selector-diagnostic --config state/mint-runs/RUN_ID/selector-diagnostic.toml --test-mode' >&2
   exit 64
 }
 
@@ -93,6 +93,35 @@ acquire_live_lock() {
   flock -n "$live_lock_fd" 2>/dev/null || lock_failure
 }
 
+validate_diagnostic_config_path() {
+  local active_marker="$root/state/.mint-run-active"
+  [[ -f "$active_marker" && ! -L "$active_marker" ]] || usage
+
+  local marker_identity marker_owner marker_mode marker_size
+  marker_identity="$(stat -Lc '%u:%a:%s' "$active_marker" 2>/dev/null)" || usage
+  IFS=: read -r marker_owner marker_mode marker_size <<<"$marker_identity"
+  [[
+    "$marker_owner" == "$EUID" &&
+    "$marker_mode" == "600" &&
+    "$marker_size" == "17"
+  ]] || usage
+
+  local active_run_id
+  IFS= read -r active_run_id <"$active_marker" || usage
+  [[ "$active_run_id" =~ ^[0-9]{8}T[0-9]{6}Z$ ]] || usage
+
+  local expected_config_path
+  expected_config_path="state/mint-runs/$active_run_id/selector-diagnostic.toml"
+  [[ "$config_path" == "$expected_config_path" ]] || usage
+
+  local diagnostic_path="$root/$expected_config_path"
+  [[ -f "$diagnostic_path" && ! -L "$diagnostic_path" ]] || usage
+  local config_identity config_owner config_mode
+  config_identity="$(stat -Lc '%u:%a' "$diagnostic_path" 2>/dev/null)" || usage
+  IFS=: read -r config_owner config_mode <<<"$config_identity"
+  [[ "$config_owner" == "$EUID" && "$config_mode" == "600" ]] || usage
+}
+
 [[ "${1:-}" == "--live-confirmed" ]] || {
   echo 'Refusing live run: explicit confirmation is required.' >&2
   exit 64
@@ -101,17 +130,34 @@ shift
 
 timeout_seconds=300
 profile=default
+config_path=config.toml
+timeout_option_count=0
+profile_option_count=0
+config_option_count=0
+test_mode_count=0
 while (( $# > 0 )); do
   case "$1" in
     --timeout)
       (( $# >= 2 )) || usage
       timeout_seconds="$2"
+      (( timeout_option_count += 1 ))
       shift 2
       ;;
     --profile)
       (( $# >= 2 )) || usage
       profile="$2"
+      (( profile_option_count += 1 ))
       shift 2
+      ;;
+    --config)
+      (( $# >= 2 )) || usage
+      config_path="$2"
+      (( config_option_count += 1 ))
+      shift 2
+      ;;
+    --test-mode)
+      (( test_mode_count += 1 ))
+      shift
       ;;
     *)
       usage
@@ -127,7 +173,20 @@ done
   echo 'Timeout must be an integer from 30 through 300.' >&2
   exit 64
 }
-[[ "$profile" == "default" || "$profile" == "single-mint-auto" ]] || usage
+[[ "$profile" == "default" || "$profile" == "single-mint-auto" || "$profile" == "selector-diagnostic" ]] || usage
+
+if [[ "$profile" == "selector-diagnostic" ]]; then
+  ((
+    timeout_option_count == 1 &&
+    profile_option_count == 1 &&
+    config_option_count == 1 &&
+    test_mode_count == 1
+  )) || usage
+  [[ "${ZAVOD_LIVE_LOCK_FD+x}" == "x" ]] || lock_failure
+  validate_diagnostic_config_path
+else
+  (( config_option_count == 0 && test_mode_count == 0 )) || usage
+fi
 
 validate_lock_state_directory
 live_lock_path="$root/state/.zavod-live.lock"
@@ -139,6 +198,15 @@ else
   acquire_live_lock
 fi
 unset ZAVOD_LIVE_LOCK_FD
+
+if [[ "$profile" == "selector-diagnostic" ]]; then
+  exec python3 scripts/zavod_guard.py run \
+    --live-confirmed \
+    --config "$config_path" \
+    --timeout-seconds "$timeout_seconds" \
+    --profile selector-diagnostic \
+    --test-mode
+fi
 
 exec python3 scripts/zavod_guard.py run \
   --live-confirmed \

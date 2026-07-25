@@ -1290,6 +1290,8 @@ class RunGuardedHardeningTests(unittest.TestCase):
 
 
 class RunGuardedWrapperTests(unittest.TestCase):
+    DIAGNOSTIC_RUN_ID = "20260724T190000Z"
+
     def setUp(self):
         self.root = Path(tempfile.mkdtemp())
         (self.root / "scripts").mkdir()
@@ -1326,6 +1328,38 @@ class RunGuardedWrapperTests(unittest.TestCase):
             timeout=5,
         )
 
+    def invoke_with_inherited_lock(self, *args):
+        lock_path = self.root / "state" / ".zavod-live.lock"
+        lock_path.touch(mode=0o600)
+        lock_path.chmod(0o600)
+        descriptor = os.open(lock_path, os.O_RDWR)
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        environment = os.environ.copy()
+        environment["ZAVOD_LIVE_LOCK_FD"] = str(descriptor)
+        try:
+            return self.invoke(
+                *args,
+                env=environment,
+                pass_fds=(descriptor,),
+            )
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
+
+    def prepare_diagnostic_config(self):
+        active = self.root / "state" / ".mint-run-active"
+        active.write_text(f"{self.DIAGNOSTIC_RUN_ID}\n")
+        active.chmod(0o600)
+        relative_path = (
+            f"state/mint-runs/{self.DIAGNOSTIC_RUN_ID}/"
+            "selector-diagnostic.toml"
+        )
+        config_path = self.root / relative_path
+        config_path.parent.mkdir(parents=True)
+        config_path.write_text("# fake diagnostic config\n")
+        config_path.chmod(0o600)
+        return relative_path, config_path
+
     def test_defaults_to_300_seconds(self):
         result = self.invoke("--live-confirmed")
         self.assertEqual(result.returncode, 0)
@@ -1346,6 +1380,75 @@ class RunGuardedWrapperTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('"--profile", "single-mint-auto"', result.stdout)
+
+    def test_diagnostic_requires_test_mode_and_fixed_config(self):
+        relative_path, config_path = self.prepare_diagnostic_config()
+        diagnostic_args = (
+            "--live-confirmed",
+            "--timeout",
+            "60",
+            "--profile",
+            "selector-diagnostic",
+            "--config",
+            relative_path,
+            "--test-mode",
+        )
+
+        rejected = [
+            self.invoke(*diagnostic_args),
+            self.invoke_with_inherited_lock(*diagnostic_args[:-1]),
+            self.invoke_with_inherited_lock(*diagnostic_args, "--test-mode"),
+            self.invoke_with_inherited_lock(
+                "--live-confirmed",
+                "--timeout",
+                "60",
+                "--profile",
+                "single-mint-auto",
+                "--test-mode",
+            ),
+        ]
+
+        arbitrary = self.root / "state" / "arbitrary.toml"
+        arbitrary.write_text("# unrelated config\n")
+        arbitrary.chmod(0o600)
+        arbitrary_args = list(diagnostic_args)
+        arbitrary_args[arbitrary_args.index(relative_path)] = "state/arbitrary.toml"
+        rejected.append(self.invoke_with_inherited_lock(*arbitrary_args))
+
+        config_path.unlink()
+        config_path.symlink_to(arbitrary)
+        rejected.append(self.invoke_with_inherited_lock(*diagnostic_args))
+        config_path.unlink()
+        config_path.write_text("# fake diagnostic config\n")
+        config_path.chmod(0o640)
+        rejected.append(self.invoke_with_inherited_lock(*diagnostic_args))
+        config_path.chmod(0o600)
+
+        for result in rejected:
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertFalse((self.root / "guard-launches").exists())
+
+        accepted = self.invoke_with_inherited_lock(*diagnostic_args)
+
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        self.assertEqual(
+            json.loads(accepted.stdout),
+            [
+                "run",
+                "--live-confirmed",
+                "--config",
+                relative_path,
+                "--timeout-seconds",
+                "60",
+                "--profile",
+                "selector-diagnostic",
+                "--test-mode",
+            ],
+        )
+        self.assertEqual(
+            (self.root / "guard-launches").read_text().splitlines(),
+            ["launch"],
+        )
 
     def test_rejects_timeout_outside_bounds(self):
         for value in ("29", "301", "invalid"):
