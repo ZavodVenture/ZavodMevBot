@@ -1356,7 +1356,12 @@ def _sanitize_generated_artifact(data, policy):
     )
     if policy.contains_protected(rendered):
         raise GeneratedArtifactContentError("generated runtime artifact is invalid")
-    return rendered.encode()
+    try:
+        return rendered.encode()
+    except UnicodeError as exc:
+        raise GeneratedArtifactContentError(
+            "generated runtime artifact is invalid"
+        ) from exc
 
 
 def _capture_generated_artifact(directories, name, policy):
@@ -1366,10 +1371,10 @@ def _capture_generated_artifact(directories, name, policy):
         mode=0o600,
         missing_ok=True,
     )
-    if data is None:
-        return "missing"
     destination = f"generated-{name}"
     _existing_owned_file_at(directories.result_fd, destination)
+    if data is None:
+        return "missing"
     try:
         sanitized = _sanitize_generated_artifact(data, policy)
     except GeneratedArtifactContentError:

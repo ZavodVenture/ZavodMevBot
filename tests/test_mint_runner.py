@@ -828,6 +828,15 @@ class FinalizationTests(MintRunnerTestCase):
                         selected_policy,
                     )
 
+    def test_generated_artifact_lone_surrogate_uses_dedicated_content_error(self):
+        policy = mint_runner.zavod_guard.ProtectedOutputPolicy()
+
+        with self.assertRaises(mint_runner.GeneratedArtifactContentError):
+            mint_runner._sanitize_generated_artifact(
+                b'{"value":"\\ud800"}',
+                policy,
+            )
+
     def test_non_string_json_key_uses_dedicated_content_error(self):
         policy = mint_runner.zavod_guard.ProtectedOutputPolicy()
 
@@ -2218,6 +2227,45 @@ class FinalizationTests(MintRunnerTestCase):
         )
         self.assertFalse((self.root / "state" / ".mint-run-active").exists())
 
+    def test_finalize_records_lone_surrogate_artifact_as_rejected_content(self):
+        prepared = self.prepare()
+        self.write_guard_result(prepared)
+        rejected = b'{"value":"\\ud800"}'
+        generated = self.root / "hot_tokens.json"
+        generated.write_bytes(rejected)
+        generated.chmod(0o600)
+
+        result = mint_runner.finalize_run(
+            self.root,
+            prepared.run_id,
+            guard_exit=0,
+            started_at=100,
+            ended_at=400,
+            chain_aggregator=lambda *args, **kwargs: self.zero_chain(),
+        )
+
+        expected = {
+            "hot_tokens.json": "rejected_content",
+            "routing.json": "missing",
+        }
+        self.assertEqual(result["artifact_status"], expected)
+        manifest_path = prepared.result_dir / "manifest.json"
+        self.assertTrue(manifest_path.exists())
+        self.assertEqual(
+            json.loads(manifest_path.read_text())["artifact_status"],
+            expected,
+        )
+        self.assertNotIn(rejected.decode(), manifest_path.read_text())
+        self.assertFalse(
+            (prepared.result_dir / "generated-hot_tokens.json").exists()
+        )
+        self.assertFalse(generated.exists())
+        self.assertEqual(
+            (self.root / "tokens.toml").read_bytes(),
+            self.original_tokens,
+        )
+        self.assertFalse((self.root / "state" / ".mint-run-active").exists())
+
     def test_finalize_preserves_manifest_after_routing_key_collision(self):
         prepared = self.prepare()
         self.write_guard_result(prepared)
@@ -2385,6 +2433,28 @@ class FinalizationTests(MintRunnerTestCase):
         self.write_guard_result(prepared)
         (self.root / "hot_tokens.json").write_bytes(b"generated artifact")
         (self.root / "hot_tokens.json").chmod(0o600)
+        outside = self.root / "outside-destination"
+        outside.write_bytes(b"must stay unchanged")
+        destination = prepared.result_dir / "generated-hot_tokens.json"
+        destination.symlink_to(outside)
+
+        with self.assertRaises(mint_runner.RunnerError):
+            mint_runner.finalize_run(
+                self.root,
+                prepared.run_id,
+                guard_exit=0,
+                started_at=100,
+                ended_at=400,
+                chain_aggregator=lambda *args, **kwargs: self.zero_chain(),
+            )
+
+        self.assertEqual(outside.read_bytes(), b"must stay unchanged")
+        self.assertEqual((self.root / "tokens.toml").read_bytes(), self.original_tokens)
+        self.assertFalse((self.root / "state" / ".mint-run-active").exists())
+
+    def test_finalize_rejects_unsafe_destination_when_source_is_missing(self):
+        prepared = self.prepare()
+        self.write_guard_result(prepared)
         outside = self.root / "outside-destination"
         outside.write_bytes(b"must stay unchanged")
         destination = prepared.result_dir / "generated-hot_tokens.json"
