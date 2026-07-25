@@ -1443,6 +1443,50 @@ class MintRunnerTestCase(unittest.TestCase):
             {"0": 1, "1": 1},
         )
 
+    def test_selector_log_discards_cap_truncated_marker_tail(self):
+        cases = (
+            ("Fetched 7 mint list.", "selected_count_histogram", {}),
+            (
+                mint_runner.SELECTOR_CONSTRUCTION_MARKER,
+                "candidate_construction",
+                "not_observed_in_log",
+            ),
+            (
+                mint_runner.SELECTOR_DISPATCH_VIOLATION_MARKER,
+                "dispatch",
+                "not_applicable",
+            ),
+        )
+        log = self.root / "selector.log"
+
+        for marker, field, expected in cases:
+            with self.subTest(marker=marker):
+                log.write_bytes((marker + "CONTINUES\n").encode())
+                log.chmod(0o600)
+                with patch.object(
+                    mint_runner,
+                    "SELECTOR_LOG_MAX_BYTES",
+                    len(marker.encode()),
+                ):
+                    summary = mint_runner._selector_diagnostic_summary(
+                        log,
+                        TARGET_MINT,
+                        {},
+                        "timeout",
+                    )
+
+                self.assertEqual(summary[field], expected)
+
+    def test_selector_log_emits_unterminated_text_at_physical_eof(self):
+        log = self.root / "selector.log"
+        log.write_bytes(b"complete-without-newline")
+        log.chmod(0o600)
+
+        self.assertEqual(
+            list(mint_runner._iter_owned_text_lines(log, mode=0o600)),
+            ["complete-without-newline"],
+        )
+
     def test_selector_log_stops_reading_at_total_byte_and_observation_bounds(self):
         log = self.root / "selector.log"
         log.write_bytes(b"Fetched 0 mint list.\n" * 100)

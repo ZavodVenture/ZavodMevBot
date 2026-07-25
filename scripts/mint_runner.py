@@ -1388,9 +1388,11 @@ def _iter_owned_text_lines(path, mode=None, max_bytes=None):
         discarding_line = False
         bytes_read = 0
         while True:
+            physical_eof = False
+            hit_byte_cap = False
             if max_bytes is not None and bytes_read >= max_bytes:
                 chunk = b""
-                final = True
+                hit_byte_cap = True
             else:
                 read_size = SELECTOR_LOG_READ_SIZE
                 if max_bytes is not None:
@@ -1400,11 +1402,16 @@ def _iter_owned_text_lines(path, mode=None, max_bytes=None):
                     )
                 chunk = os.read(descriptor, read_size)
                 bytes_read += len(chunk)
-                final = not chunk or (
-                    max_bytes is not None
+                physical_eof = not chunk
+                hit_byte_cap = (
+                    not physical_eof
+                    and max_bytes is not None
                     and bytes_read >= max_bytes
                 )
-            text = decoder.decode(chunk, final=final)
+            text = decoder.decode(
+                chunk,
+                final=physical_eof or hit_byte_cap,
+            )
             while text:
                 if discarding_line:
                     newline = text.find("\n")
@@ -1434,9 +1441,10 @@ def _iter_owned_text_lines(path, mode=None, max_bytes=None):
                 ):
                     yield (buffer + segment).removesuffix("\r")
                 buffer = ""
-            if final:
+            if physical_eof:
                 if buffer and not discarding_line:
                     yield buffer.removesuffix("\r")
+            if physical_eof or hit_byte_cap:
                 break
     except OSError as exc:
         raise RunnerError("private run paths are invalid") from exc
