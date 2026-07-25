@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import copy
 import hashlib
 import json
 import math
@@ -33,6 +34,8 @@ LOSS_LIMIT_LAMPORTS = 30_000_000
 EARLY_STOP_LAMPORTS = 25_000_000
 REQUIRED_FILES = ("config.toml", "tokens.toml")
 OPTIONAL_FILES = ("hot_tokens.json", "routing.json")
+DIAGNOSTIC_CONFIG_NAME = "selector-diagnostic.toml"
+DIAGNOSTIC_MODES = frozenset({"d0", "d1", "d2"})
 RUN_ID_PATTERN = re.compile(r"[0-9]{8}T[0-9]{6}Z")
 LOG_PATTERNS = {
     "wsol_exists": re.compile(r"WSOL account exists", re.I),
@@ -98,18 +101,26 @@ class PreparedRun:
     cli_version: str
     loss_limit_lamports: int
     early_stop_lamports: int
+    diagnostic_mode: str | None = None
+    diagnostic_config: str | None = None
+    preflight_status: str = "ok"
+    auto_mode: str = "enabled"
 
     def safe_summary(self):
-        return {
+        summary = {
             "run_id": self.run_id,
             "mint": self.mint,
             "timeout_seconds": self.timeout,
             "cli_version": self.cli_version,
-            "auto_mode": "enabled",
-            "preflight": "ok",
+            "auto_mode": self.auto_mode,
+            "preflight": self.preflight_status,
             "loss_limit_lamports": self.loss_limit_lamports,
             "early_stop_lamports": self.early_stop_lamports,
         }
+        if self.diagnostic_mode is not None:
+            summary["diagnostic_mode"] = self.diagnostic_mode
+            summary["diagnostic_config"] = self.diagnostic_config
+        return summary
 
 
 @dataclass
@@ -517,6 +528,285 @@ def _integrity_record(path):
     }
 
 
+def _diagnostic_relative_path(run_id):
+    return f"state/mint-runs/{run_id}/{DIAGNOSTIC_CONFIG_NAME}"
+
+
+def _diagnostic_assignments(mode):
+    assignments = (
+        (("auto",), "force_two_mints", False, bool),
+        (("auto", "filters"), "limit", 1, int),
+        (("bot",), "merge_mints", False, bool),
+    )
+    if mode == "d1":
+        assignments += (
+            (("bot",), "ignore_offchain_bots", False, bool),
+        )
+    return assignments
+
+
+def _parse_diagnostic_toml(data):
+    try:
+        return tomllib.loads(data.decode("utf-8"))
+    except (UnicodeError, tomllib.TOMLDecodeError) as exc:
+        raise RunnerError("diagnostic configuration is invalid") from exc
+
+
+def _nested_config_value(config, section, key):
+    value = config
+    for part in section:
+        if not isinstance(value, dict) or part not in value:
+            raise RunnerError("diagnostic configuration is invalid")
+        value = value[part]
+    if not isinstance(value, dict) or key not in value:
+        raise RunnerError("diagnostic configuration is invalid")
+    return value[key]
+
+
+def _set_nested_config_value(config, section, key, value):
+    destination = config
+    for part in section:
+        destination = destination[part]
+    destination[key] = value
+
+
+def _replace_diagnostic_assignment(lines, section, key, expected_type, replacement):
+    section_name = ".".join(section).encode()
+    section_pattern = re.compile(
+        rb"^[ \t]*\[[ \t]*([^]\r\n]+?)[ \t]*\]"
+        rb"[ \t]*(?:#[^\r\n]*)?(?:\r\n|\n|\r)?$"
+    )
+    if expected_type is bool:
+        value_pattern = rb"(?:true|false)"
+    else:
+        value_pattern = rb"[+-]?[0-9](?:_?[0-9])*"
+    assignment_pattern = re.compile(
+        rb"^([ \t]*"
+        + re.escape(key.encode())
+        + rb"[ \t]*=[ \t]*)("
+        + value_pattern
+        + rb")([ \t]*(?:#[^\r\n]*)?(?:\r\n|\n|\r)?)$"
+    )
+    active_section = None
+    matches = []
+    for index, line in enumerate(lines):
+        header = section_pattern.fullmatch(line)
+        if header is not None:
+            active_section = b"".join(header.group(1).split())
+            continue
+        if active_section != section_name:
+            continue
+        assignment = assignment_pattern.fullmatch(line)
+        if assignment is not None:
+            matches.append((index, assignment))
+    if len(matches) != 1:
+        raise RunnerError("diagnostic configuration is invalid")
+    index, assignment = matches[0]
+    lines[index] = (
+        assignment.group(1)
+        + str(replacement).lower().encode()
+        + assignment.group(3)
+    )
+
+
+def _build_diagnostic_config_bytes(source, mode):
+    if mode not in DIAGNOSTIC_MODES:
+        raise RunnerError("diagnostic configuration is invalid")
+    before = _parse_diagnostic_toml(source)
+    expected = copy.deepcopy(before)
+    lines = source.splitlines(keepends=True)
+    try:
+        for section, key, replacement, expected_type in _diagnostic_assignments(mode):
+            current = _nested_config_value(before, section, key)
+            if (
+                type(current) is not expected_type
+                or (
+                    expected_type is int
+                    and isinstance(current, bool)
+                )
+            ):
+                raise RunnerError("diagnostic configuration is invalid")
+            _replace_diagnostic_assignment(
+                lines,
+                section,
+                key,
+                expected_type,
+                replacement,
+            )
+            _set_nested_config_value(expected, section, key, replacement)
+    except (KeyError, TypeError):
+        raise RunnerError("diagnostic configuration is invalid") from None
+    transformed = b"".join(lines)
+    after = _parse_diagnostic_toml(transformed)
+    if after != expected:
+        raise RunnerError("diagnostic configuration is invalid")
+    return transformed
+
+
+def _validate_diagnostic_config_bytes(source, candidate, mode):
+    if not isinstance(source, bytes) or not isinstance(candidate, bytes):
+        raise RunnerError("diagnostic configuration is invalid")
+    if candidate != _build_diagnostic_config_bytes(source, mode):
+        raise RunnerError("diagnostic configuration is invalid")
+
+
+def _validate_diagnostic_request(mode, mint, control_mint=None):
+    try:
+        if mode not in DIAGNOSTIC_MODES:
+            raise ValueError("invalid mode")
+        decode_pubkey(mint)
+        if mode == "d2":
+            decode_pubkey(control_mint)
+            if control_mint == mint:
+                raise ValueError("control mint must be distinct")
+            return [mint, control_mint]
+        if control_mint is not None:
+            raise ValueError("control mint is not allowed")
+        return [mint]
+    except (RunnerError, TypeError, ValueError) as exc:
+        raise RunnerError("diagnostic request is invalid") from exc
+
+
+def _write_private_exclusive(root, run_id, data):
+    directories = _open_finalization_directories(root, run_id)
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptor = None
+    created = False
+    try:
+        _validate_held_result(directories, run_id)
+        descriptor = os.open(
+            DIAGNOSTIC_CONFIG_NAME,
+            flags,
+            0o600,
+            dir_fd=directories.result_fd,
+        )
+        created = True
+        os.fchmod(descriptor, 0o600)
+        view = memoryview(data)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError("short write")
+            view = view[written:]
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = None
+        if (
+            _read_owned_file_at(
+                directories.result_fd,
+                DIAGNOSTIC_CONFIG_NAME,
+                mode=0o600,
+            )
+            != data
+        ):
+            raise OSError("verification failed")
+        _validate_held_result(directories, run_id)
+    except BaseException as exc:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        if created:
+            try:
+                os.unlink(
+                    DIAGNOSTIC_CONFIG_NAME,
+                    dir_fd=directories.result_fd,
+                )
+            except OSError:
+                pass
+        if isinstance(exc, KeyboardInterrupt):
+            raise
+        raise RunnerError("diagnostic configuration preparation failed") from exc
+    finally:
+        directories.close()
+
+
+def _diagnostic_metadata(metadata):
+    diagnostic = metadata.get("diagnostic")
+    if diagnostic is None:
+        return None
+    try:
+        if (
+            not isinstance(diagnostic, dict)
+            or set(diagnostic)
+            != {"config_name", "config_sha256", "mints", "mode"}
+            or diagnostic["config_name"] != DIAGNOSTIC_CONFIG_NAME
+            or diagnostic["mode"] not in DIAGNOSTIC_MODES
+            or not isinstance(diagnostic["config_sha256"], str)
+            or re.fullmatch(
+                r"[0-9a-f]{64}",
+                diagnostic["config_sha256"],
+            )
+            is None
+            or not isinstance(diagnostic["mints"], list)
+            or len(diagnostic["mints"])
+            != (2 if diagnostic["mode"] == "d2" else 1)
+            or diagnostic["mints"][0] != metadata.get("mint")
+        ):
+            raise ValueError("invalid diagnostic metadata")
+        for mint in diagnostic["mints"]:
+            decode_pubkey(mint)
+        if len(set(diagnostic["mints"])) != len(diagnostic["mints"]):
+            raise ValueError("duplicate diagnostic mint")
+    except (KeyError, RunnerError, TypeError, ValueError) as exc:
+        raise RunnerError("private recovery data is invalid") from exc
+    return diagnostic
+
+
+def _validate_diagnostic_file(root, backup_dir, run_id, diagnostic):
+    directories = _open_finalization_directories(root, run_id)
+    try:
+        _validate_held_result(directories, run_id)
+        candidate = _read_owned_file_at(
+            directories.result_fd,
+            DIAGNOSTIC_CONFIG_NAME,
+            mode=0o600,
+        )
+        if hashlib.sha256(candidate).hexdigest() != diagnostic["config_sha256"]:
+            raise RunnerError("diagnostic configuration is invalid")
+        source = _read_owned_file_no_follow(
+            backup_dir / "config.toml",
+            mode=0o600,
+        )
+        _validate_diagnostic_config_bytes(source, candidate, diagnostic["mode"])
+        _validate_held_result(directories, run_id)
+        return Path(root) / _diagnostic_relative_path(run_id)
+    finally:
+        directories.close()
+
+
+def _remove_diagnostic_file(root, run_id):
+    path = Path(root) / _diagnostic_relative_path(run_id)
+    if not _path_exists_no_follow(path.parent):
+        return
+    directories = _open_finalization_directories(root, run_id)
+    try:
+        _validate_held_result(directories, run_id)
+        try:
+            os.stat(
+                DIAGNOSTIC_CONFIG_NAME,
+                dir_fd=directories.result_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            return
+        os.unlink(
+            DIAGNOSTIC_CONFIG_NAME,
+            dir_fd=directories.result_fd,
+        )
+        _validate_held_result(directories, run_id)
+    except OSError as exc:
+        raise RunnerError("diagnostic configuration cleanup failed") from exc
+    finally:
+        directories.close()
+
+
 def _load_workspace_config(root):
     config_path = root / "config.toml"
     try:
@@ -618,13 +908,37 @@ def prepare_run(
     preflight_runner=None,
     now=None,
     process_checker=None,
+    diagnostic=None,
+    control_mint=None,
 ):
     root = Path(root).resolve()
     timeout = validate_timeout(timeout)
-    _config, rpc_url = _load_workspace_config(root)
+    diagnostic_mints = None
+    diagnostic_bytes = None
+    source_config_bytes = None
+    if diagnostic is None:
+        if control_mint is not None:
+            raise RunnerError("diagnostic request is invalid")
+        _config, rpc_url = _load_workspace_config(root)
+    else:
+        diagnostic_mints = _validate_diagnostic_request(
+            diagnostic,
+            mint,
+            control_mint,
+        )
+        source_config_bytes = _read_owned_file_no_follow(
+            root / "config.toml",
+            mode=0o600,
+        )
+        diagnostic_bytes = _build_diagnostic_config_bytes(
+            source_config_bytes,
+            diagnostic,
+        )
+        rpc_url = None
     if (process_checker or _active_process_exists)():
         raise RunnerError("another ZavodMevBot process is active")
-    validate_mint_account(rpc_url, mint, transport)
+    if diagnostic is None:
+        validate_mint_account(rpc_url, mint, transport)
     instant = (now or (lambda: datetime.now(timezone.utc)))()
     run_id = instant.strftime("%Y%m%dT%H%M%SZ")
     backup_dir = root / "state" / "backups" / f"mint-run-{run_id}"
@@ -642,12 +956,29 @@ def prepare_run(
         "timeout_seconds": timeout,
         "optional_files": {},
     }
+    if diagnostic is not None:
+        metadata["diagnostic"] = {
+            "config_name": DIAGNOSTIC_CONFIG_NAME,
+            "config_sha256": hashlib.sha256(diagnostic_bytes).hexdigest(),
+            "mints": diagnostic_mints,
+            "mode": diagnostic,
+        }
+    diagnostic_created = False
     try:
         for name in REQUIRED_FILES:
             source = root / name
             if not source.is_file():
                 raise RunnerError(f"{name} is missing")
             _safe_copy(source, backup_dir / name)
+        if (
+            diagnostic is not None
+            and _read_owned_file_no_follow(
+                backup_dir / "config.toml",
+                mode=0o600,
+            )
+            != source_config_bytes
+        ):
+            raise RunnerError("diagnostic configuration preparation failed")
         for name in OPTIONAL_FILES:
             source = root / name
             existed = source.is_file()
@@ -667,20 +998,49 @@ def prepare_run(
             backup_dir / "metadata.json",
             (json.dumps(metadata, sort_keys=True) + "\n").encode(),
         )
+        if diagnostic is not None:
+            _write_private_exclusive(
+                root,
+                run_id,
+                diagnostic_bytes,
+            )
+            diagnostic_created = True
         _atomic_write(active_marker, f"{run_id}\n".encode())
 
         for name in OPTIONAL_FILES:
             source = root / name
             if metadata["optional_files"][name]:
                 source.unlink()
-        _atomic_write(root / "tokens.toml", f'tokens = ["{mint}"]\n'.encode())
+        selected_mints = diagnostic_mints or [mint]
+        rendered_mints = ", ".join(f'"{value}"' for value in selected_mints)
+        _atomic_write(
+            root / "tokens.toml",
+            f"tokens = [{rendered_mints}]\n".encode(),
+        )
         with (root / "tokens.toml").open("rb") as handle:
             tokens = tomllib.load(handle)
-        if tokens != {"tokens": [mint]}:
+        if tokens != {"tokens": selected_mints}:
             raise RunnerError("temporary tokens.toml validation failed")
 
-        preflight = (preflight_runner or _run_preflight)(root)
-        cli_version, loss_limit, early_stop = _validate_preflight(preflight)
+        if diagnostic is None:
+            preflight = (preflight_runner or _run_preflight)(root)
+            cli_version, loss_limit, early_stop = _validate_preflight(preflight)
+            preflight_status = "ok"
+            auto_mode = "enabled"
+            diagnostic_config = None
+        else:
+            _validate_diagnostic_file(
+                root,
+                backup_dir,
+                run_id,
+                metadata["diagnostic"],
+            )
+            cli_version = EXPECTED_CLI_VERSION
+            loss_limit = LOSS_LIMIT_LAMPORTS
+            early_stop = EARLY_STOP_LAMPORTS
+            preflight_status = "deferred"
+            auto_mode = "selector-diagnostic"
+            diagnostic_config = _diagnostic_relative_path(run_id)
         return PreparedRun(
             run_id=run_id,
             mint=mint,
@@ -690,10 +1050,18 @@ def prepare_run(
             cli_version=cli_version,
             loss_limit_lamports=loss_limit,
             early_stop_lamports=early_stop,
+            diagnostic_mode=diagnostic,
+            diagnostic_config=diagnostic_config,
+            preflight_status=preflight_status,
+            auto_mode=auto_mode,
         )
     except BaseException:
         if (backup_dir / "metadata.json").exists():
-            restore_run(root, run_id)
+            restore_run(
+                root,
+                run_id,
+                _allow_missing_diagnostic=not diagnostic_created,
+            )
         raise
 
 
@@ -760,6 +1128,7 @@ def _validate_recovery_data(backup_dir, run_id):
                 or _integrity_record(backup_dir / name) != integrity
             ):
                 raise ValueError("recovery file integrity check failed")
+        _diagnostic_metadata(metadata)
     except (OSError, UnicodeError, ValueError, TypeError, json.JSONDecodeError) as exc:
         raise RunnerError("private recovery data is invalid") from exc
     return metadata
@@ -772,13 +1141,25 @@ def validate_live_state(root, run_id):
     metadata = _validate_recovery_data(backup_dir, run_id)
     if _path_exists_no_follow(backup_dir / "restored"):
         raise RunnerError("live run state validation failed")
+    diagnostic = _diagnostic_metadata(metadata)
     expected_marker = f"{run_id}\n".encode()
-    expected_tokens = f'tokens = ["{metadata["mint"]}"]\n'.encode()
+    selected_mints = (
+        diagnostic["mints"] if diagnostic is not None else [metadata["mint"]]
+    )
+    rendered_mints = ", ".join(f'"{value}"' for value in selected_mints)
+    expected_tokens = f"tokens = [{rendered_mints}]\n".encode()
     try:
         marker = _read_owned_file_no_follow(
             root / "state" / ".mint-run-active",
             mode=0o600,
         )
+        if diagnostic is not None:
+            _validate_diagnostic_file(
+                root,
+                backup_dir,
+                run_id,
+                diagnostic,
+            )
         tokens = _read_owned_file_no_follow(
             root / "tokens.toml",
             mode=0o600,
@@ -791,34 +1172,66 @@ def validate_live_state(root, run_id):
         raise RunnerError("live run state validation failed")
 
 
-def restore_run(root, run_id):
+def restore_run(root, run_id, _allow_missing_diagnostic=False):
     root = Path(root).resolve()
     run_id = _validate_run_id(run_id)
     backup_dir = root / "state" / "backups" / f"mint-run-{run_id}"
-    metadata = _validate_recovery_data(backup_dir, run_id)
+    try:
+        metadata = _validate_recovery_data(backup_dir, run_id)
+    except BaseException:
+        _remove_diagnostic_file(root, run_id)
+        raise
+    diagnostic = _diagnostic_metadata(metadata)
+    restored_marker = backup_dir / "restored"
+    diagnostic_error = None
+    if (
+        diagnostic is not None
+        and not _path_exists_no_follow(restored_marker)
+        and not _allow_missing_diagnostic
+    ):
+        try:
+            _validate_diagnostic_file(
+                root,
+                backup_dir,
+                run_id,
+                diagnostic,
+            )
+        except RunnerError as exc:
+            diagnostic_error = exc
     optional_files = metadata["optional_files"]
-    for name in REQUIRED_FILES:
-        _atomic_copy(backup_dir / name, root / name)
-    for name in OPTIONAL_FILES:
-        existed = optional_files[name]
-        current = root / name
-        backup = backup_dir / name
-        if existed:
-            _atomic_copy(backup, current)
-        elif not existed and _path_exists_no_follow(current):
-            current.unlink()
-    active_marker = root / "state" / ".mint-run-active"
-    if active_marker.exists() and active_marker.read_text().strip() == run_id:
-        active_marker.unlink()
-    _atomic_write(backup_dir / "restored", b"restored\n")
+    try:
+        for name in REQUIRED_FILES:
+            _atomic_copy(backup_dir / name, root / name)
+        for name in OPTIONAL_FILES:
+            existed = optional_files[name]
+            current = root / name
+            backup = backup_dir / name
+            if existed:
+                _atomic_copy(backup, current)
+            elif not existed and _path_exists_no_follow(current):
+                current.unlink()
+        active_marker = root / "state" / ".mint-run-active"
+        if _path_exists_no_follow(active_marker):
+            marker = _read_owned_file_no_follow(active_marker, mode=0o600)
+            if marker == f"{run_id}\n".encode():
+                active_marker.unlink()
+        _atomic_write(restored_marker, b"restored\n")
+    finally:
+        if diagnostic is not None:
+            _remove_diagnostic_file(root, run_id)
+    if diagnostic_error is not None:
+        raise RunnerError("diagnostic configuration cleanup failed") from diagnostic_error
 
 
 def restore_active(root):
     root = Path(root).resolve()
     marker = root / "state" / ".mint-run-active"
-    if not marker.exists():
+    if not _path_exists_no_follow(marker):
         return
-    run_id = marker.read_text().strip()
+    try:
+        run_id = _read_owned_file_no_follow(marker, mode=0o600).decode().strip()
+    except UnicodeError as exc:
+        raise RunnerError("private recovery data is invalid") from exc
     _validate_run_id(run_id)
     restore_run(root, run_id)
 
@@ -1253,7 +1666,15 @@ def _validate_finalization_context(
         raise RunnerError("private run paths are invalid")
     if _path_exists_no_follow(backup_dir / "restored"):
         raise RunnerError("private run paths are invalid")
-    _validate_recovery_data(backup_dir, run_id)
+    recovery_metadata = _validate_recovery_data(backup_dir, run_id)
+    diagnostic = _diagnostic_metadata(recovery_metadata)
+    if diagnostic is not None:
+        _validate_diagnostic_file(
+            root,
+            backup_dir,
+            run_id,
+            diagnostic,
+        )
     try:
         metadata = json.loads(
             _read_owned_file_no_follow(
@@ -1511,7 +1932,10 @@ def finalize_run(
         _record_state(root, heading, bullets)
         return manifest
     finally:
-        directories.close()
+        try:
+            _remove_diagnostic_file(root, run_id)
+        finally:
+            directories.close()
 
 
 def _record_failure_safely(root, command):
@@ -1535,7 +1959,13 @@ def _sigterm_as_keyboard_interrupt(signum, frame):
     raise KeyboardInterrupt()
 
 
-def _prepare_with_signal_handlers(root, mint, timeout):
+def _prepare_with_signal_handlers(
+    root,
+    mint,
+    timeout,
+    diagnostic=None,
+    control_mint=None,
+):
     previous_handlers = {
         signum: signal.getsignal(signum)
         for signum in (signal.SIGINT, signal.SIGTERM)
@@ -1543,7 +1973,13 @@ def _prepare_with_signal_handlers(root, mint, timeout):
     for signum in previous_handlers:
         signal.signal(signum, _sigterm_as_keyboard_interrupt)
     try:
-        return prepare_run(root, mint, timeout)
+        return prepare_run(
+            root,
+            mint,
+            timeout,
+            diagnostic=diagnostic,
+            control_mint=control_mint,
+        )
     finally:
         for signum, previous_handler in previous_handlers.items():
             signal.signal(signum, previous_handler)
@@ -1566,6 +2002,8 @@ def main(argv=None):
     prepare_parser = subparsers.add_parser("prepare")
     prepare_parser.add_argument("--mint", required=True)
     prepare_parser.add_argument("--timeout", default="300")
+    prepare_parser.add_argument("--diagnostic", choices=sorted(DIAGNOSTIC_MODES))
+    prepare_parser.add_argument("--control-mint")
     restore_parser = subparsers.add_parser("restore")
     restore_parser.add_argument("--run-id", required=True)
     subparsers.add_parser("restore-active")
@@ -1587,7 +2025,11 @@ def main(argv=None):
     try:
         if args.command == "prepare":
             prepared = _prepare_with_signal_handlers(
-                root, args.mint, args.timeout
+                root,
+                args.mint,
+                args.timeout,
+                diagnostic=args.diagnostic,
+                control_mint=args.control_mint,
             )
             _print_safe_summary(prepared)
             return 0

@@ -1,5 +1,6 @@
 import contextlib
 import copy
+import hashlib
 import io
 import json
 import os
@@ -18,6 +19,54 @@ from scripts import mint_runner
 
 
 TARGET_MINT = "So11111111111111111111111111111111111111112"
+CONTROL_MINT = "11111111111111111111111111111111"
+DIAGNOSTIC_SECRET = "fixture-wallet-material-never-render"
+DIAGNOSTIC_SOURCE = (
+    b"# selector fixture; formatting and comments must survive\n"
+    b"[wallet]\n"
+    b'private_key = "fixture-wallet-material-never-render"\n'
+    b"[rpc]\n"
+    b'url = "https://fixture.invalid/fixture-uuid"\n'
+    b"\n"
+    b"[auto]\n"
+    b"enabled = true\n"
+    b"force_two_mints = true # preserve this comment\n"
+    b"\n"
+    b"[auto.filters]\n"
+    b"limit = 17\n"
+    b"\n"
+    b"[bot]\n"
+    b"merge_mints = true\n"
+    b"ignore_offchain_bots = true\n"
+    b"\n"
+    b"[unchanged]\n"
+    b'value = "keep exactly"\n'
+)
+DIAGNOSTIC_D0 = (
+    b"# selector fixture; formatting and comments must survive\n"
+    b"[wallet]\n"
+    b'private_key = "fixture-wallet-material-never-render"\n'
+    b"[rpc]\n"
+    b'url = "https://fixture.invalid/fixture-uuid"\n'
+    b"\n"
+    b"[auto]\n"
+    b"enabled = true\n"
+    b"force_two_mints = false # preserve this comment\n"
+    b"\n"
+    b"[auto.filters]\n"
+    b"limit = 1\n"
+    b"\n"
+    b"[bot]\n"
+    b"merge_mints = false\n"
+    b"ignore_offchain_bots = true\n"
+    b"\n"
+    b"[unchanged]\n"
+    b'value = "keep exactly"\n'
+)
+DIAGNOSTIC_D1 = DIAGNOSTIC_D0.replace(
+    b"ignore_offchain_bots = true",
+    b"ignore_offchain_bots = false",
+)
 
 
 class MintRunnerTestCase(unittest.TestCase):
@@ -77,6 +126,14 @@ class MintRunnerTestCase(unittest.TestCase):
         }
         args.update(overrides)
         return mint_runner.prepare_run(**args)
+
+    def install_diagnostic_source(self, data=DIAGNOSTIC_SOURCE):
+        (self.root / "config.toml").write_bytes(data)
+        (self.root / "config.toml").chmod(0o600)
+        self.original_config = data
+
+    def diagnostic_path(self, prepared):
+        return self.root / prepared.diagnostic_config
 
     def test_timeout_is_bounded(self):
         self.assertEqual(mint_runner.validate_timeout("30"), 30)
@@ -594,6 +651,242 @@ class MintRunnerTestCase(unittest.TestCase):
         prepared = self.prepare()
         rendered = json.dumps(prepared.safe_summary(), sort_keys=True)
         self.assertNotIn("https://secret.invalid", rendered)
+
+    def test_diagnostic_config_changes_only_cardinality_controls(self):
+        self.install_diagnostic_source()
+        production_hash = hashlib.sha256(DIAGNOSTIC_SOURCE).hexdigest()
+
+        prepared = self.prepare(
+            diagnostic="d0",
+            transport=lambda *args: self.fail("diagnostic preparation contacted RPC"),
+            preflight_runner=lambda *args: self.fail(
+                "diagnostic preparation ran preflight"
+            ),
+        )
+
+        diagnostic_path = self.diagnostic_path(prepared)
+        self.assertEqual(
+            prepared.diagnostic_config,
+            f"state/mint-runs/{prepared.run_id}/selector-diagnostic.toml",
+        )
+        self.assertEqual(diagnostic_path.read_bytes(), DIAGNOSTIC_D0)
+        self.assertEqual(
+            hashlib.sha256((self.root / "config.toml").read_bytes()).hexdigest(),
+            production_hash,
+        )
+
+    def test_diagnostic_config_rejects_ambiguous_assignments(self):
+        cases = {
+            "missing": DIAGNOSTIC_SOURCE.replace(
+                b"force_two_mints = true # preserve this comment\n",
+                b"",
+            ),
+            "duplicate": DIAGNOSTIC_SOURCE.replace(
+                b"force_two_mints = true # preserve this comment\n",
+                (
+                    b"force_two_mints = true # preserve this comment\n"
+                    b"force_two_mints = false\n"
+                ),
+            ),
+            "wrong_boolean_type": DIAGNOSTIC_SOURCE.replace(
+                b"merge_mints = true",
+                b'merge_mints = "true"',
+            ),
+            "wrong_integer_type": DIAGNOSTIC_SOURCE.replace(
+                b"limit = 17",
+                b'limit = "17"',
+            ),
+        }
+        for index, (label, source) in enumerate(cases.items(), start=1):
+            with self.subTest(label=label):
+                self.install_diagnostic_source(source)
+                with self.assertRaisesRegex(
+                    mint_runner.RunnerError,
+                    "^diagnostic configuration is invalid$",
+                ):
+                    self.prepare(
+                        diagnostic="d0",
+                        now=lambda second=index: datetime(
+                            2026,
+                            7,
+                            24,
+                            18,
+                            40,
+                            second,
+                            tzinfo=timezone.utc,
+                        ),
+                    )
+                self.assertEqual((self.root / "config.toml").read_bytes(), source)
+                self.assertFalse(
+                    any(
+                        (self.root / "state" / "mint-runs").glob(
+                            "*/selector-diagnostic.toml"
+                        )
+                    )
+                )
+
+    def test_diagnostic_config_is_private_and_production_unchanged(self):
+        self.install_diagnostic_source()
+        production_hash = hashlib.sha256(DIAGNOSTIC_SOURCE).hexdigest()
+
+        prepared = self.prepare(diagnostic="d0")
+        diagnostic_path = self.diagnostic_path(prepared)
+        metadata_path = prepared.backup_dir / "metadata.json"
+        metadata = json.loads(metadata_path.read_bytes())
+        rendered_summary = json.dumps(prepared.safe_summary(), sort_keys=True)
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            mint_runner._print_safe_summary(prepared)
+        persisted = (
+            metadata_path.read_text()
+            + rendered_summary
+            + stdout.getvalue()
+            + (self.root / "state" / "CURRENT.md").read_text()
+            + (self.root / "state" / "EXPERIMENTS.md").read_text()
+        )
+
+        self.assertEqual(stat.S_IMODE(diagnostic_path.stat().st_mode), 0o600)
+        self.assertEqual(
+            hashlib.sha256((self.root / "config.toml").read_bytes()).hexdigest(),
+            production_hash,
+        )
+        self.assertNotIn(DIAGNOSTIC_SECRET, persisted)
+        self.assertNotIn("fixture-uuid", persisted)
+        self.assertEqual(
+            metadata["diagnostic"],
+            {
+                "config_name": "selector-diagnostic.toml",
+                "config_sha256": hashlib.sha256(DIAGNOSTIC_D0).hexdigest(),
+                "mints": [TARGET_MINT],
+                "mode": "d0",
+            },
+        )
+
+    def test_diagnostic_d1_changes_only_ignore_offchain_bots_beyond_d0(self):
+        self.install_diagnostic_source()
+        prepared = self.prepare(
+            diagnostic="d1",
+            now=lambda: datetime(2026, 7, 24, 18, 41, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(self.diagnostic_path(prepared).read_bytes(), DIAGNOSTIC_D1)
+        mint_runner._validate_diagnostic_config_bytes(
+            DIAGNOSTIC_SOURCE,
+            DIAGNOSTIC_D1,
+            "d1",
+        )
+        with self.assertRaisesRegex(
+            mint_runner.RunnerError,
+            "^diagnostic configuration is invalid$",
+        ):
+            mint_runner._validate_diagnostic_config_bytes(
+                DIAGNOSTIC_SOURCE,
+                DIAGNOSTIC_D1,
+                "d0",
+            )
+
+    def test_diagnostic_d2_allows_exactly_target_and_control_mints(self):
+        self.install_diagnostic_source()
+        prepared = self.prepare(
+            diagnostic="d2",
+            control_mint=CONTROL_MINT,
+            now=lambda: datetime(2026, 7, 24, 18, 42, tzinfo=timezone.utc),
+        )
+        metadata = json.loads((prepared.backup_dir / "metadata.json").read_bytes())
+
+        self.assertEqual(metadata["diagnostic"]["mints"], [TARGET_MINT, CONTROL_MINT])
+        self.assertEqual(
+            (self.root / "tokens.toml").read_bytes(),
+            (
+                f'tokens = ["{TARGET_MINT}", "{CONTROL_MINT}"]\n'
+            ).encode(),
+        )
+        self.assertEqual(self.diagnostic_path(prepared).read_bytes(), DIAGNOSTIC_D0)
+        for invalid in (None, TARGET_MINT, "not-a-public-key"):
+            with self.subTest(control=invalid):
+                with self.assertRaises(mint_runner.RunnerError):
+                    mint_runner._validate_diagnostic_request(
+                        "d2",
+                        TARGET_MINT,
+                        invalid,
+                    )
+
+    def test_diagnostic_config_removed_after_prepare_failure_and_interrupt(self):
+        self.install_diagnostic_source()
+        real_atomic_write = mint_runner._atomic_write
+        active_marker = self.root / "state" / ".mint-run-active"
+
+        def fail_after_diagnostic_write(path, data, mode=0o600):
+            if Path(path) == active_marker:
+                raise mint_runner.RunnerError("fixture failure")
+            return real_atomic_write(path, data, mode)
+
+        with patch.object(
+            mint_runner,
+            "_atomic_write",
+            side_effect=fail_after_diagnostic_write,
+        ):
+            with self.assertRaises(mint_runner.RunnerError):
+                self.prepare(
+                    diagnostic="d0",
+                    now=lambda: datetime(
+                        2026, 7, 24, 18, 43, tzinfo=timezone.utc
+                    ),
+                )
+        self.assertFalse(
+            any(
+                (self.root / "state" / "mint-runs").glob(
+                    "*/selector-diagnostic.toml"
+                )
+            )
+        )
+
+        def interrupt_after_diagnostic_write(path, data, mode=0o600):
+            if Path(path) == active_marker:
+                raise KeyboardInterrupt()
+            return real_atomic_write(path, data, mode)
+
+        with patch.object(
+            mint_runner,
+            "_atomic_write",
+            side_effect=interrupt_after_diagnostic_write,
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                self.prepare(
+                    diagnostic="d0",
+                    now=lambda: datetime(
+                        2026, 7, 24, 18, 44, tzinfo=timezone.utc
+                    ),
+                )
+        self.assertFalse(
+            any(
+                (self.root / "state" / "mint-runs").glob(
+                    "*/selector-diagnostic.toml"
+                )
+            )
+        )
+
+    def test_diagnostic_config_removed_by_restore_and_stale_active_recovery(self):
+        self.install_diagnostic_source()
+        prepared = self.prepare(
+            diagnostic="d0",
+            now=lambda: datetime(2026, 7, 24, 18, 45, tzinfo=timezone.utc),
+        )
+        diagnostic_path = self.diagnostic_path(prepared)
+        self.assertTrue(diagnostic_path.exists())
+
+        mint_runner.restore_run(self.root, prepared.run_id)
+        self.assertFalse(diagnostic_path.exists())
+        self.assertEqual((self.root / "config.toml").read_bytes(), DIAGNOSTIC_SOURCE)
+
+        prepared = self.prepare(
+            diagnostic="d0",
+            now=lambda: datetime(2026, 7, 24, 18, 46, tzinfo=timezone.utc),
+        )
+        diagnostic_path = self.diagnostic_path(prepared)
+        mint_runner.restore_active(self.root)
+        self.assertFalse(diagnostic_path.exists())
+        self.assertFalse((self.root / "state" / ".mint-run-active").exists())
 
     def test_prepare_cli_failure_records_generic_state_entry(self):
         stderr = io.StringIO()
@@ -1793,6 +2086,68 @@ class FinalizationTests(MintRunnerTestCase):
         )
         self.assertEqual(len(state_backups), 1)
         self.assertEqual(stat.S_IMODE(state_backups[0].stat().st_mode), 0o600)
+
+    def test_diagnostic_config_removed_on_every_terminal_path(self):
+        self.install_diagnostic_source()
+        prepared = self.prepare(
+            diagnostic="d0",
+            now=lambda: datetime(2026, 7, 24, 18, 47, tzinfo=timezone.utc),
+        )
+        diagnostic_path = self.diagnostic_path(prepared)
+        self.write_guard_result(prepared)
+
+        mint_runner.finalize_run(
+            self.root,
+            prepared.run_id,
+            guard_exit=0,
+            started_at=100,
+            ended_at=400,
+            chain_aggregator=lambda *args, **kwargs: self.zero_chain(),
+        )
+
+        self.assertFalse(diagnostic_path.exists())
+        self.assertEqual((self.root / "config.toml").read_bytes(), DIAGNOSTIC_SOURCE)
+        self.assertFalse((self.root / "state" / ".mint-run-active").exists())
+
+        prepared = self.prepare(
+            diagnostic="d0",
+            now=lambda: datetime(2026, 7, 24, 18, 48, tzinfo=timezone.utc),
+        )
+        diagnostic_path = self.diagnostic_path(prepared)
+        self.write_guard_result(
+            prepared,
+            content="reason=timeout\nduration_seconds=not-a-number\n",
+        )
+        with self.assertRaises(mint_runner.RunnerError):
+            mint_runner.finalize_run(
+                self.root,
+                prepared.run_id,
+                guard_exit=0,
+                started_at=100,
+                ended_at=400,
+                chain_aggregator=lambda *args, **kwargs: self.zero_chain(),
+            )
+        self.assertFalse(diagnostic_path.exists())
+        self.assertEqual((self.root / "config.toml").read_bytes(), DIAGNOSTIC_SOURCE)
+
+        prepared = self.prepare(
+            diagnostic="d0",
+            now=lambda: datetime(2026, 7, 24, 18, 49, tzinfo=timezone.utc),
+        )
+        diagnostic_path = self.diagnostic_path(prepared)
+        diagnostic_path.write_bytes(DIAGNOSTIC_D1)
+        diagnostic_path.chmod(0o600)
+        self.write_guard_result(prepared)
+        with self.assertRaises(mint_runner.RunnerError):
+            mint_runner.finalize_run(
+                self.root,
+                prepared.run_id,
+                guard_exit=0,
+                started_at=100,
+                ended_at=400,
+                chain_aggregator=lambda *args, **kwargs: self.zero_chain(),
+            )
+        self.assertFalse(diagnostic_path.exists())
 
     def test_finalize_records_missing_optional_artifacts(self):
         prepared = self.prepare()
