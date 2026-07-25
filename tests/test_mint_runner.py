@@ -2781,6 +2781,80 @@ class FinalizationTests(MintRunnerTestCase):
             state,
         )
 
+    def test_diagnostic_finalize_rejects_preexisting_generated_artifact(self):
+        self.install_diagnostic_source()
+        prepared = self.prepare(
+            diagnostic="d0",
+            now=lambda: datetime(
+                2026,
+                7,
+                24,
+                18,
+                47,
+                tzinfo=timezone.utc,
+            ),
+        )
+        self.write_guard_result(prepared)
+        destination = prepared.result_dir / "generated-hot_tokens.json"
+        evidence = b'{"preexisting": "diagnostic evidence"}\n'
+        destination.write_bytes(evidence)
+        destination.chmod(0o600)
+
+        with self.assertRaises(mint_runner.RunnerError):
+            mint_runner.finalize_run(
+                self.root,
+                prepared.run_id,
+                guard_exit=0,
+                started_at=100,
+                ended_at=160,
+                chain_aggregator=lambda *args, **kwargs: self.zero_chain(),
+        )
+
+        self.assertEqual(destination.read_bytes(), evidence)
+        self.assertEqual(
+            (self.root / "tokens.toml").read_bytes(),
+            self.original_tokens,
+        )
+        self.assertFalse((self.root / "state" / ".mint-run-active").exists())
+
+    def test_diagnostic_finalize_rejects_symlink_generated_artifact_destination(self):
+        self.install_diagnostic_source()
+        prepared = self.prepare(
+            diagnostic="d0",
+            now=lambda: datetime(
+                2026,
+                7,
+                24,
+                18,
+                48,
+                tzinfo=timezone.utc,
+            ),
+        )
+        self.write_guard_result(prepared)
+        outside = self.root / "outside-diagnostic-evidence"
+        evidence = b"must stay unchanged"
+        outside.write_bytes(evidence)
+        destination = prepared.result_dir / "generated-hot_tokens.json"
+        destination.symlink_to(outside)
+
+        with self.assertRaises(mint_runner.RunnerError):
+            mint_runner.finalize_run(
+                self.root,
+                prepared.run_id,
+                guard_exit=0,
+                started_at=100,
+                ended_at=160,
+                chain_aggregator=lambda *args, **kwargs: self.zero_chain(),
+            )
+
+        self.assertTrue(destination.is_symlink())
+        self.assertEqual(outside.read_bytes(), evidence)
+        self.assertEqual(
+            (self.root / "tokens.toml").read_bytes(),
+            self.original_tokens,
+        )
+        self.assertFalse((self.root / "state" / ".mint-run-active").exists())
+
     def test_diagnostic_finalize_marks_malformed_captured_shape_unavailable(self):
         self.install_diagnostic_source()
         prepared = self.prepare(

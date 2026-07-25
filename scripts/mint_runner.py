@@ -2171,6 +2171,9 @@ def _capture_generated_artifact(directories, name, policy):
 
 
 def _read_generated_artifact_value(directories, name, policy):
+    destination = f"generated-{name}"
+    if _existing_owned_file_at(directories.result_fd, destination):
+        raise RunnerError("private run paths are invalid")
     data = _read_owned_file_at(
         directories.root_fd,
         name,
