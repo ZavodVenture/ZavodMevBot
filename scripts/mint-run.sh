@@ -215,11 +215,21 @@ prepared_run_id="$(
 )"
 prepared_diagnostic_mode="$(
   printf '%s\n' "$prepare_output" |
-    awk -F= '$1 == "diagnostic_mode" {print $2; exit}'
+    awk '
+      index($0, "diagnostic_mode=") == 1 {
+        print substr($0, length("diagnostic_mode=") + 1)
+        exit
+      }
+    '
 )"
 prepared_diagnostic_config="$(
   printf '%s\n' "$prepare_output" |
-    awk -F= '$1 == "diagnostic_config" {print $2; exit}'
+    awk '
+      index($0, "diagnostic_config=") == 1 {
+        print substr($0, length("diagnostic_config=") + 1)
+        exit
+      }
+    '
 )"
 printf '%s\n' "$prepare_output" |
   awk -F= '
@@ -230,9 +240,7 @@ printf '%s\n' "$prepare_output" |
     $1 == "auto_mode" ||
     $1 == "preflight" ||
     $1 == "loss_limit_lamports" ||
-    $1 == "early_stop_lamports" ||
-    $1 == "diagnostic_mode" ||
-    $1 == "diagnostic_config" {
+    $1 == "early_stop_lamports" {
       print
     }
   '
@@ -252,6 +260,8 @@ if [[ -n "$diagnostic_mode" ]]; then
     exit 1
   fi
   diagnostic_config="$expected_diagnostic_config"
+  printf 'diagnostic_mode=%s\n' "$diagnostic_mode"
+  printf 'diagnostic_config=%s\n' "$diagnostic_config"
 elif [[
   -n "$prepared_diagnostic_mode" ||
   -n "$prepared_diagnostic_config"
@@ -274,11 +284,7 @@ IFS= read -r answer || true
 if (( pending_signal_status != 0 )); then
   exit "$pending_signal_status"
 fi
-repeated_confirmation=0
-if [[ -n "$diagnostic_mode" ]] && IFS= read -r -t 0.01 repeated_answer; then
-  repeated_confirmation=1
-fi
-if [[ "$answer" != "$confirmation" || "$repeated_confirmation" -ne 0 ]]; then
+if [[ "$answer" != "$confirmation" ]]; then
   echo 'Live run declined; restoring workspace.'
   exit 0
 fi

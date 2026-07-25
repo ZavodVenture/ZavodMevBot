@@ -1347,6 +1347,8 @@ class RunGuardedWrapperTests(unittest.TestCase):
             os.close(descriptor)
 
     def prepare_diagnostic_config(self):
+        state_path = self.root / "state"
+        state_path.chmod(0o700)
         active = self.root / "state" / ".mint-run-active"
         active.write_text(f"{self.DIAGNOSTIC_RUN_ID}\n")
         active.chmod(0o600)
@@ -1356,9 +1358,23 @@ class RunGuardedWrapperTests(unittest.TestCase):
         )
         config_path = self.root / relative_path
         config_path.parent.mkdir(parents=True)
+        (state_path / "mint-runs").chmod(0o700)
+        config_path.parent.chmod(0o700)
         config_path.write_text("# fake diagnostic config\n")
         config_path.chmod(0o600)
         return relative_path, config_path
+
+    def diagnostic_args(self, relative_path):
+        return (
+            "--live-confirmed",
+            "--timeout",
+            "60",
+            "--profile",
+            "selector-diagnostic",
+            "--config",
+            relative_path,
+            "--test-mode",
+        )
 
     def test_defaults_to_300_seconds(self):
         result = self.invoke("--live-confirmed")
@@ -1383,16 +1399,7 @@ class RunGuardedWrapperTests(unittest.TestCase):
 
     def test_diagnostic_requires_test_mode_and_fixed_config(self):
         relative_path, config_path = self.prepare_diagnostic_config()
-        diagnostic_args = (
-            "--live-confirmed",
-            "--timeout",
-            "60",
-            "--profile",
-            "selector-diagnostic",
-            "--config",
-            relative_path,
-            "--test-mode",
-        )
+        diagnostic_args = self.diagnostic_args(relative_path)
 
         rejected = [
             self.invoke(*diagnostic_args),
@@ -1449,6 +1456,70 @@ class RunGuardedWrapperTests(unittest.TestCase):
             (self.root / "guard-launches").read_text().splitlines(),
             ["launch"],
         )
+
+    def test_diagnostic_rejects_symlinked_path_ancestors(self):
+        relative_path, _config_path = self.prepare_diagnostic_config()
+        diagnostic_args = self.diagnostic_args(relative_path)
+        components = (
+            Path("state"),
+            Path("state/mint-runs"),
+            Path("state/mint-runs") / self.DIAGNOSTIC_RUN_ID,
+        )
+
+        for relative_component in components:
+            with self.subTest(component=str(relative_component)):
+                component = self.root / relative_component
+                target = component.with_name(f"{component.name}-real")
+                component.rename(target)
+                component.symlink_to(target.name, target_is_directory=True)
+                before = (
+                    (self.root / "guard-launches").read_text().splitlines()
+                    if (self.root / "guard-launches").exists()
+                    else []
+                )
+                try:
+                    result = self.invoke_with_inherited_lock(*diagnostic_args)
+                finally:
+                    component.unlink()
+                    target.rename(component)
+
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                after = (
+                    (self.root / "guard-launches").read_text().splitlines()
+                    if (self.root / "guard-launches").exists()
+                    else []
+                )
+                self.assertEqual(after, before)
+
+    def test_diagnostic_requires_private_path_component_modes(self):
+        relative_path, config_path = self.prepare_diagnostic_config()
+        diagnostic_args = self.diagnostic_args(relative_path)
+        components = (
+            self.root / "state",
+            self.root / "state/mint-runs",
+            config_path.parent,
+        )
+
+        for component in components:
+            with self.subTest(component=str(component.relative_to(self.root))):
+                component.chmod(0o755)
+                before = (
+                    (self.root / "guard-launches").read_text().splitlines()
+                    if (self.root / "guard-launches").exists()
+                    else []
+                )
+                try:
+                    result = self.invoke_with_inherited_lock(*diagnostic_args)
+                finally:
+                    component.chmod(0o700)
+
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                after = (
+                    (self.root / "guard-launches").read_text().splitlines()
+                    if (self.root / "guard-launches").exists()
+                    else []
+                )
+                self.assertEqual(after, before)
 
     def test_rejects_timeout_outside_bounds(self):
         for value in ("29", "301", "invalid"):

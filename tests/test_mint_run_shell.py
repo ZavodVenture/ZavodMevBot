@@ -1,4 +1,5 @@
 import os
+import select
 import signal
 import shutil
 import subprocess
@@ -332,7 +333,6 @@ class MintRunShellTests(unittest.TestCase):
             f"RUN {TARGET_MINT} FOR 60\n",
             f"diagnose {TARGET_MINT} FOR 60\n",
             f"DIAGNOSE {TARGET_MINT} FOR 61\n",
-            f"{exact}\n{exact}\n",
         )
 
         for answer in wrong_answers:
@@ -349,7 +349,23 @@ class MintRunShellTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(len(self.guard_invocations()), before)
 
+        repeated = self.invoke(
+            f"{exact}\n{exact}\n",
+            TARGET_MINT,
+            "--diagnostic",
+            "d0",
+            "--timeout",
+            "60",
+        )
+
+        self.assertEqual(repeated.returncode, 0, repeated.stderr)
+        self.assertEqual(len(self.guard_invocations()), 1)
+
     def test_diagnostic_rejects_unbound_prepare_config(self):
+        secret = "do-not-print-malicious-helper-value"
+        expected_prefix = (
+            "state/mint-runs/20260724T190000Z/selector-diagnostic.toml"
+        )
         (self.root / "prepare-output.txt").write_text(
             "run_id=20260724T190000Z\n"
             f"mint={TARGET_MINT}\n"
@@ -360,7 +376,7 @@ class MintRunShellTests(unittest.TestCase):
             "loss_limit_lamports=30000000\n"
             "early_stop_lamports=25000000\n"
             "diagnostic_mode=d0\n"
-            "diagnostic_config=state/arbitrary.toml\n"
+            f"diagnostic_config={expected_prefix}={secret}\n"
         )
 
         result = self.invoke(
@@ -373,6 +389,56 @@ class MintRunShellTests(unittest.TestCase):
         )
 
         self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.guard_invocations(), [])
+        self.assertTrue((self.root / "restore.called").exists())
+        self.assertNotIn(secret, result.stdout + result.stderr)
+
+    def test_signal_during_diagnostic_confirmation_restores_without_launch(self):
+        process = subprocess.Popen(
+            [
+                "bash",
+                "scripts/mint-run.sh",
+                TARGET_MINT,
+                "--diagnostic",
+                "d0",
+                "--timeout",
+                "60",
+            ],
+            cwd=self.root,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        prompt = (
+            f"Type exactly: DIAGNOSE {TARGET_MINT} FOR 60\n> ".encode()
+        )
+        observed = b""
+        try:
+            for _ in range(200):
+                ready, _writable, _exceptional = select.select(
+                    [process.stdout],
+                    [],
+                    [],
+                    0.01,
+                )
+                if ready:
+                    observed += os.read(process.stdout.fileno(), 4096)
+                if prompt in observed:
+                    break
+            else:
+                process.kill()
+                process.communicate()
+                self.fail("diagnostic confirmation prompt was not reached")
+
+            os.kill(process.pid, signal.SIGTERM)
+            stdout, stderr = process.communicate(timeout=5)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.communicate()
+
+        self.assertEqual(process.returncode, 143, stderr.decode())
+        self.assertIn(prompt, observed + stdout)
         self.assertEqual(self.guard_invocations(), [])
         self.assertTrue((self.root / "restore.called").exists())
 

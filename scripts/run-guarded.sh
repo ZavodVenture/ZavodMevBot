@@ -93,33 +93,108 @@ acquire_live_lock() {
   flock -n "$live_lock_fd" 2>/dev/null || lock_failure
 }
 
-validate_diagnostic_config_path() {
-  local active_marker="$root/state/.mint-run-active"
-  [[ -f "$active_marker" && ! -L "$active_marker" ]] || usage
+open_validated_path() {
+  local path="$1"
+  local kind="$2"
+  local required_mode="$3"
+  validated_path_fd=""
 
-  local marker_identity marker_owner marker_mode marker_size
-  marker_identity="$(stat -Lc '%u:%a:%s' "$active_marker" 2>/dev/null)" || usage
-  IFS=: read -r marker_owner marker_mode marker_size <<<"$marker_identity"
+  case "$kind" in
+    directory)
+      [[ -d "$path" && ! -L "$path" ]] || usage
+      ;;
+    file)
+      [[ -f "$path" && ! -L "$path" ]] || usage
+      ;;
+    *)
+      usage
+      ;;
+  esac
+
+  local path_identity descriptor_identity
+  path_identity="$(stat -c '%d:%i:%u:%a' "$path" 2>/dev/null)" || usage
+  if ! { exec {validated_path_fd}<"$path"; } 2>/dev/null; then
+    usage
+  fi
+  descriptor_identity="$(
+    stat -Lc '%d:%i:%u:%a' "/proc/$$/fd/$validated_path_fd" 2>/dev/null
+  )" || {
+    exec {validated_path_fd}>&-
+    usage
+  }
+  [[ "$descriptor_identity" == "$path_identity" ]] || {
+    exec {validated_path_fd}>&-
+    usage
+  }
+
+  case "$kind" in
+    directory)
+      [[ -d "/proc/$$/fd/$validated_path_fd" ]] || {
+        exec {validated_path_fd}>&-
+        usage
+      }
+      ;;
+    file)
+      [[ -f "/proc/$$/fd/$validated_path_fd" ]] || {
+        exec {validated_path_fd}>&-
+        usage
+      }
+      ;;
+  esac
+
+  local device inode owner mode
+  IFS=: read -r device inode owner mode <<<"$descriptor_identity"
   [[
-    "$marker_owner" == "$EUID" &&
-    "$marker_mode" == "600" &&
-    "$marker_size" == "17"
-  ]] || usage
+    -n "$device" &&
+    -n "$inode" &&
+    "$owner" == "$EUID" &&
+    "$mode" == "$required_mode"
+  ]] || {
+    exec {validated_path_fd}>&-
+    usage
+  }
+}
+
+validate_diagnostic_config_path() {
+  local state_path="$root/state"
+  open_validated_path "$state_path" directory 700
+  exec {validated_path_fd}>&-
+
+  local active_marker="$state_path/.mint-run-active"
+  open_validated_path "$active_marker" file 600
+  local marker_fd="$validated_path_fd"
+  local marker_size
+  marker_size="$(
+    stat -Lc '%s' "/proc/$$/fd/$marker_fd" 2>/dev/null
+  )" || {
+    exec {marker_fd}>&-
+    usage
+  }
+  [[ "$marker_size" == "17" ]] || {
+    exec {marker_fd}>&-
+    usage
+  }
 
   local active_run_id
-  IFS= read -r active_run_id <"$active_marker" || usage
+  IFS= read -r active_run_id <&"$marker_fd" || {
+    exec {marker_fd}>&-
+    usage
+  }
+  exec {marker_fd}>&-
   [[ "$active_run_id" =~ ^[0-9]{8}T[0-9]{6}Z$ ]] || usage
 
   local expected_config_path
   expected_config_path="state/mint-runs/$active_run_id/selector-diagnostic.toml"
   [[ "$config_path" == "$expected_config_path" ]] || usage
 
+  open_validated_path "$state_path/mint-runs" directory 700
+  exec {validated_path_fd}>&-
+  open_validated_path "$state_path/mint-runs/$active_run_id" directory 700
+  exec {validated_path_fd}>&-
+
   local diagnostic_path="$root/$expected_config_path"
-  [[ -f "$diagnostic_path" && ! -L "$diagnostic_path" ]] || usage
-  local config_identity config_owner config_mode
-  config_identity="$(stat -Lc '%u:%a' "$diagnostic_path" 2>/dev/null)" || usage
-  IFS=: read -r config_owner config_mode <<<"$config_identity"
-  [[ "$config_owner" == "$EUID" && "$config_mode" == "600" ]] || usage
+  open_validated_path "$diagnostic_path" file 600
+  exec {validated_path_fd}>&-
 }
 
 [[ "${1:-}" == "--live-confirmed" ]] || {
