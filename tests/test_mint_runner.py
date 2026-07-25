@@ -888,6 +888,75 @@ class MintRunnerTestCase(unittest.TestCase):
         self.assertFalse(diagnostic_path.exists())
         self.assertFalse((self.root / "state" / ".mint-run-active").exists())
 
+    def test_restore_removes_fixed_diagnostic_config_without_metadata_contract(self):
+        self.install_diagnostic_source()
+
+        def omit_diagnostic_metadata(prepared):
+            metadata_path = prepared.backup_dir / "metadata.json"
+            metadata = json.loads(metadata_path.read_bytes())
+            metadata.pop("diagnostic")
+            metadata_path.write_bytes(
+                (json.dumps(metadata, sort_keys=True) + "\n").encode()
+            )
+            metadata_path.chmod(0o600)
+
+        prepared = self.prepare(
+            diagnostic="d0",
+            now=lambda: datetime(2026, 7, 24, 18, 50, tzinfo=timezone.utc),
+        )
+        diagnostic_path = self.diagnostic_path(prepared)
+        omit_diagnostic_metadata(prepared)
+
+        mint_runner.restore_run(self.root, prepared.run_id)
+
+        self.assertFalse(diagnostic_path.exists())
+        self.assertEqual((self.root / "config.toml").read_bytes(), DIAGNOSTIC_SOURCE)
+
+        prepared = self.prepare(
+            diagnostic="d0",
+            now=lambda: datetime(2026, 7, 24, 18, 51, tzinfo=timezone.utc),
+        )
+        diagnostic_path = self.diagnostic_path(prepared)
+        omit_diagnostic_metadata(prepared)
+
+        mint_runner.restore_active(self.root)
+
+        self.assertFalse(diagnostic_path.exists())
+        self.assertFalse((self.root / "state" / ".mint-run-active").exists())
+
+    def test_restore_cleanup_failure_preserves_retryable_active_state(self):
+        self.install_diagnostic_source()
+        prepared = self.prepare(
+            diagnostic="d0",
+            now=lambda: datetime(2026, 7, 24, 18, 52, tzinfo=timezone.utc),
+        )
+        diagnostic_path = self.diagnostic_path(prepared)
+        active_marker = self.root / "state" / ".mint-run-active"
+        restored_marker = prepared.backup_dir / "restored"
+
+        with patch.object(
+            mint_runner,
+            "_remove_diagnostic_file",
+            side_effect=mint_runner.RunnerError(DIAGNOSTIC_SECRET),
+        ):
+            with self.assertRaisesRegex(
+                mint_runner.RunnerError,
+                "^diagnostic configuration cleanup failed$",
+            ):
+                mint_runner.restore_run(self.root, prepared.run_id)
+
+        self.assertTrue(diagnostic_path.exists())
+        self.assertEqual(active_marker.read_bytes(), f"{prepared.run_id}\n".encode())
+        self.assertFalse(restored_marker.exists())
+        self.assertEqual((self.root / "config.toml").read_bytes(), DIAGNOSTIC_SOURCE)
+        self.assertEqual((self.root / "tokens.toml").read_bytes(), self.original_tokens)
+
+        mint_runner.restore_active(self.root)
+
+        self.assertFalse(diagnostic_path.exists())
+        self.assertFalse(active_marker.exists())
+        self.assertTrue(restored_marker.exists())
+
     def test_prepare_cli_failure_records_generic_state_entry(self):
         stderr = io.StringIO()
         protected_detail = "https://secret.invalid/uuid/api-key"

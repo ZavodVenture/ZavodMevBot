@@ -807,6 +807,13 @@ def _remove_diagnostic_file(root, run_id):
         directories.close()
 
 
+def _remove_diagnostic_file_for_restore(root, run_id):
+    try:
+        _remove_diagnostic_file(root, run_id)
+    except Exception as exc:
+        raise RunnerError("diagnostic configuration cleanup failed") from exc
+
+
 def _load_workspace_config(root):
     config_path = root / "config.toml"
     try:
@@ -1179,7 +1186,7 @@ def restore_run(root, run_id, _allow_missing_diagnostic=False):
     try:
         metadata = _validate_recovery_data(backup_dir, run_id)
     except BaseException:
-        _remove_diagnostic_file(root, run_id)
+        _remove_diagnostic_file_for_restore(root, run_id)
         raise
     diagnostic = _diagnostic_metadata(metadata)
     restored_marker = backup_dir / "restored"
@@ -1210,15 +1217,16 @@ def restore_run(root, run_id, _allow_missing_diagnostic=False):
                 _atomic_copy(backup, current)
             elif not existed and _path_exists_no_follow(current):
                 current.unlink()
-        active_marker = root / "state" / ".mint-run-active"
-        if _path_exists_no_follow(active_marker):
-            marker = _read_owned_file_no_follow(active_marker, mode=0o600)
-            if marker == f"{run_id}\n".encode():
-                active_marker.unlink()
-        _atomic_write(restored_marker, b"restored\n")
-    finally:
-        if diagnostic is not None:
-            _remove_diagnostic_file(root, run_id)
+    except BaseException:
+        _remove_diagnostic_file_for_restore(root, run_id)
+        raise
+    _remove_diagnostic_file_for_restore(root, run_id)
+    _atomic_write(restored_marker, b"restored\n")
+    active_marker = root / "state" / ".mint-run-active"
+    if _path_exists_no_follow(active_marker):
+        marker = _read_owned_file_no_follow(active_marker, mode=0o600)
+        if marker == f"{run_id}\n".encode():
+            active_marker.unlink()
     if diagnostic_error is not None:
         raise RunnerError("diagnostic configuration cleanup failed") from diagnostic_error
 
