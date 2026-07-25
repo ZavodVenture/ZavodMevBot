@@ -50,6 +50,17 @@ LOG_PATTERNS = {
     "sent_events": re.compile(r"Transaction sent successfully", re.I),
     "error_events": re.compile(r"error|failed", re.I),
 }
+SELECTOR_REFRESH_PATTERN = re.compile(
+    r"Fetched ([0-9]{1,18}) mint list\.",
+    re.ASCII,
+)
+SELECTOR_CONSTRUCTION_MARKER = (
+    "SELECTOR_DIAGNOSTIC candidate_construction=observed"
+)
+SELECTOR_DISPATCH_VIOLATION_MARKER = (
+    "SELECTOR_DIAGNOSTIC dispatch=test_mode_dispatch_violation"
+)
+SELECTOR_UNAVAILABLE = "unavailable"
 CHAIN_SUMMARY_KEYS = (
     "landed",
     "successful",
@@ -68,6 +79,7 @@ STOP_REASONS = frozenset(
         "operator_signal",
         "output_error",
         "rpc_error",
+        "test_mode_dispatch_violation",
         "timeout",
     }
 )
@@ -1252,6 +1264,129 @@ def aggregate_log(log_path):
     }
 
 
+def _selector_artifact_entry(artifact, required_lists, target_mint):
+    if (
+        not isinstance(artifact, dict)
+        or set(artifact) != {"mints"}
+        or not isinstance(artifact["mints"], list)
+    ):
+        return False, None
+    expected_keys = {"mint", *required_lists}
+    target = None
+    observed_mints = set()
+    for entry in artifact["mints"]:
+        if (
+            not isinstance(entry, dict)
+            or set(entry) != expected_keys
+            or not isinstance(entry["mint"], str)
+            or entry["mint"] in observed_mints
+            or any(not isinstance(entry[name], list) for name in required_lists)
+        ):
+            return False, None
+        observed_mints.add(entry["mint"])
+        if entry["mint"] == target_mint:
+            target = entry
+    return True, target
+
+
+def _selector_diagnostic_summary(
+    log_path,
+    target_mint,
+    artifacts,
+    guard_reason,
+):
+    if log_path is None:
+        lines = []
+    else:
+        text = _read_owned_file_no_follow(log_path, mode=0o600).decode(
+            errors="replace"
+        )
+        lines = text.splitlines()
+    selected_counts = []
+    for line in lines:
+        match = SELECTOR_REFRESH_PATTERN.fullmatch(line)
+        if match is not None:
+            selected_counts.append(int(match.group(1)))
+    histogram = {
+        str(count): selected_counts.count(count)
+        for count in sorted(set(selected_counts))
+    }
+
+    artifact_values = artifacts if isinstance(artifacts, dict) else {}
+    hot_shape_available, hot_entry = _selector_artifact_entry(
+        artifact_values.get("hot_tokens.json"),
+        ("pools",),
+        target_mint,
+    )
+    routing_shape_available, routing_entry = _selector_artifact_entry(
+        artifact_values.get("routing.json"),
+        ("luts", "runtime_observations"),
+        target_mint,
+    )
+    construction_observed = SELECTOR_CONSTRUCTION_MARKER in lines
+    dispatch_violation = (
+        guard_reason == "test_mode_dispatch_violation"
+        or SELECTOR_DISPATCH_VIOLATION_MARKER in lines
+    )
+    return {
+        "refresh_count": len(selected_counts),
+        "zero_refresh_count": selected_counts.count(0),
+        "selected_count_histogram": histogram,
+        "selected_count_min": (
+            min(selected_counts) if selected_counts else SELECTOR_UNAVAILABLE
+        ),
+        "selected_count_max": (
+            max(selected_counts) if selected_counts else SELECTOR_UNAVAILABLE
+        ),
+        "target_artifact_present": (
+            hot_entry is not None or routing_entry is not None
+        ),
+        "target_pool_count": (
+            len(hot_entry["pools"])
+            if hot_entry is not None
+            else 0 if hot_shape_available else SELECTOR_UNAVAILABLE
+        ),
+        "target_lut_count": (
+            len(routing_entry["luts"])
+            if routing_entry is not None
+            else 0 if routing_shape_available else SELECTOR_UNAVAILABLE
+        ),
+        "target_runtime_observation_count": (
+            len(routing_entry["runtime_observations"])
+            if routing_entry is not None
+            else 0 if routing_shape_available else SELECTOR_UNAVAILABLE
+        ),
+        "candidate_construction": (
+            "observed_in_log"
+            if construction_observed
+            else "not_observed_in_log"
+        ),
+        "dispatch": (
+            "test_mode_dispatch_violation"
+            if dispatch_violation
+            else "not_applicable"
+        ),
+    }
+
+
+def _captured_artifact_values(directories, artifact_status):
+    artifacts = {}
+    for name in OPTIONAL_FILES:
+        if artifact_status.get(name) != "captured":
+            continue
+        try:
+            artifacts[name] = json.loads(
+                _read_owned_file_at(
+                    directories.result_fd,
+                    f"generated-{name}",
+                    mode=0o600,
+                )
+            )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            artifacts[name] = None
+    return artifacts
+
+
 def _parse_guard_result(path):
     return _parse_guard_result_bytes(
         _read_owned_file_no_follow(path, mode=0o600)
@@ -1900,16 +2035,17 @@ def finalize_run(
                 )
             if isinstance(guard_exit, bool):
                 raise RunnerError("guard result is invalid")
+            stop_reason = (
+                guard["reason"]
+                if guard.get("reason") in STOP_REASONS
+                else "unknown"
+            )
             manifest = {
                 "run_id": run_id,
                 "mint": metadata["mint"],
                 "timeout_seconds": metadata["timeout_seconds"],
                 "guard_exit": int(guard_exit),
-                "stop_reason": (
-                    guard["reason"]
-                    if guard.get("reason") in STOP_REASONS
-                    else "unknown"
-                ),
+                "stop_reason": stop_reason,
                 "duration_seconds": duration,
                 "started_at": started_at,
                 "ended_at": ended_at,
@@ -1918,6 +2054,18 @@ def finalize_run(
                 "log_events": log_summary,
                 "chain": chain,
             }
+            if _diagnostic_metadata(metadata) is not None:
+                manifest["selector_diagnostic"] = (
+                    _selector_diagnostic_summary(
+                        log_path,
+                        metadata["mint"],
+                        _captured_artifact_values(
+                            directories,
+                            artifact_status,
+                        ),
+                        guard.get("reason"),
+                    )
+                )
             _atomic_write_at(
                 directories.result_fd,
                 "manifest.json",

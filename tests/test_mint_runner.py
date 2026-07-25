@@ -20,6 +20,7 @@ from scripts import mint_runner
 
 TARGET_MINT = "So11111111111111111111111111111111111111112"
 CONTROL_MINT = "11111111111111111111111111111111"
+UNRELATED_MINT = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
 DIAGNOSTIC_SECRET = "fixture-wallet-material-never-render"
 DIAGNOSTIC_SOURCE = (
     b"# selector fixture; formatting and comments must survive\n"
@@ -1105,6 +1106,108 @@ class MintRunnerTestCase(unittest.TestCase):
             ),
         )
 
+    def test_selector_histogram_tracks_zero_one_two(self):
+        log = self.root / "selector.log"
+        log.write_text(
+            "Fetched 0 mint list.\n"
+            "Fetched 1 mint list.\n"
+            "Fetched 2 mint list.\n"
+            "fetched 9 mint list.\n"
+            "Fetched 7 mint list\n"
+            "prefix Fetched 8 mint list.\n"
+            "Fetched 6 mint list. https://source.invalid/private\n"
+        )
+        log.chmod(0o600)
+
+        self.assertEqual(
+            mint_runner._selector_diagnostic_summary(
+                log,
+                TARGET_MINT,
+                {},
+                "timeout",
+            ),
+            {
+                "refresh_count": 3,
+                "zero_refresh_count": 1,
+                "selected_count_histogram": {"0": 1, "1": 1, "2": 1},
+                "selected_count_min": 0,
+                "selected_count_max": 2,
+                "target_artifact_present": False,
+                "target_pool_count": "unavailable",
+                "target_lut_count": "unavailable",
+                "target_runtime_observation_count": "unavailable",
+                "candidate_construction": "not_observed_in_log",
+                "dispatch": "not_applicable",
+            },
+        )
+
+    def test_selector_summary_separates_discovery_from_selection(self):
+        protected_url = "https://source.invalid/private-route"
+        protected_signature = "unrelated-signature-fixture"
+        log = self.root / "selector.log"
+        log.write_text(
+            "Fetched 2 mint list.\n"
+            "Transaction sent successfully\n"
+            "SELECTOR_DIAGNOSTIC candidate_construction=observed\n"
+        )
+        log.chmod(0o600)
+        artifacts = {
+            "hot_tokens.json": {
+                "mints": [
+                    {
+                        "mint": UNRELATED_MINT,
+                        "pools": [protected_url] * 9,
+                    },
+                    {
+                        "mint": TARGET_MINT,
+                        "pools": [{}, {}, {}],
+                    },
+                ],
+            },
+            "routing.json": {
+                "mints": [
+                    {
+                        "mint": UNRELATED_MINT,
+                        "luts": [protected_signature] * 8,
+                        "runtime_observations": [protected_url] * 7,
+                    },
+                    {
+                        "mint": TARGET_MINT,
+                        "luts": [{}, {}, {}, {}],
+                        "runtime_observations": [{}, {}, {}, {}, {}],
+                    },
+                ],
+            },
+        }
+
+        summary = mint_runner._selector_diagnostic_summary(
+            log,
+            TARGET_MINT,
+            artifacts,
+            "timeout",
+        )
+
+        self.assertEqual(
+            summary,
+            {
+                "refresh_count": 1,
+                "zero_refresh_count": 0,
+                "selected_count_histogram": {"2": 1},
+                "selected_count_min": 2,
+                "selected_count_max": 2,
+                "target_artifact_present": True,
+                "target_pool_count": 3,
+                "target_lut_count": 4,
+                "target_runtime_observation_count": 5,
+                "candidate_construction": "observed_in_log",
+                "dispatch": "not_applicable",
+            },
+        )
+        rendered = json.dumps(summary, sort_keys=True)
+        self.assertNotIn(UNRELATED_MINT, rendered)
+        self.assertNotIn(protected_url, rendered)
+        self.assertNotIn(protected_signature, rendered)
+
 
 class FinalizationTests(MintRunnerTestCase):
     @staticmethod
@@ -1269,6 +1372,112 @@ class FinalizationTests(MintRunnerTestCase):
                 "sent_events": 2,
                 "error_events": 0,
             },
+        )
+
+    def test_selector_artifact_counts_require_fixed_shapes(self):
+        log = self.root / "selector.log"
+        log.write_text("")
+        log.chmod(0o600)
+        target_absent = {
+            "hot_tokens.json": {
+                "mints": [{"mint": UNRELATED_MINT, "pools": [{}, {}]}],
+            },
+            "routing.json": {
+                "mints": [
+                    {
+                        "mint": UNRELATED_MINT,
+                        "luts": [{}, {}, {}],
+                        "runtime_observations": [{}, {}, {}, {}],
+                    }
+                ],
+            },
+        }
+        unknown_shape = {
+            "hot_tokens.json": {
+                "nested": {TARGET_MINT: {"pools": [{}, {}, {}]}},
+            },
+            "routing.json": {
+                "nested": {
+                    TARGET_MINT: {
+                        "luts": [{}, {}, {}, {}],
+                        "runtime_observations": [{}, {}, {}, {}, {}],
+                    }
+                },
+            },
+        }
+
+        absent = mint_runner._selector_diagnostic_summary(
+            log,
+            TARGET_MINT,
+            target_absent,
+            "timeout",
+        )
+        unavailable = mint_runner._selector_diagnostic_summary(
+            log,
+            TARGET_MINT,
+            unknown_shape,
+            "timeout",
+        )
+
+        self.assertEqual(absent["refresh_count"], 0)
+        self.assertEqual(absent["selected_count_histogram"], {})
+        self.assertEqual(absent["selected_count_min"], "unavailable")
+        self.assertEqual(absent["selected_count_max"], "unavailable")
+        self.assertFalse(absent["target_artifact_present"])
+        self.assertEqual(absent["target_pool_count"], 0)
+        self.assertEqual(absent["target_lut_count"], 0)
+        self.assertEqual(absent["target_runtime_observation_count"], 0)
+        self.assertFalse(unavailable["target_artifact_present"])
+        self.assertEqual(unavailable["target_pool_count"], "unavailable")
+        self.assertEqual(unavailable["target_lut_count"], "unavailable")
+        self.assertEqual(
+            unavailable["target_runtime_observation_count"],
+            "unavailable",
+        )
+
+    def test_selector_stage_markers_must_be_exact(self):
+        log = self.root / "selector.log"
+        log.write_text(
+            "candidate construction observed\n"
+            "Transaction sent successfully\n"
+            "dispatch=test_mode_dispatch_violation trailing\n"
+        )
+        log.chmod(0o600)
+
+        summary = mint_runner._selector_diagnostic_summary(
+            log,
+            TARGET_MINT,
+            {},
+            "timeout",
+        )
+
+        self.assertEqual(
+            summary["candidate_construction"],
+            "not_observed_in_log",
+        )
+        self.assertEqual(summary["dispatch"], "not_applicable")
+
+        log.write_text(
+            "SELECTOR_DIAGNOSTIC candidate_construction=observed\n"
+            "SELECTOR_DIAGNOSTIC dispatch=test_mode_dispatch_violation\n"
+        )
+        self.assertEqual(
+            mint_runner._selector_diagnostic_summary(
+                log,
+                TARGET_MINT,
+                {},
+                "timeout",
+            )["candidate_construction"],
+            "observed_in_log",
+        )
+        self.assertEqual(
+            mint_runner._selector_diagnostic_summary(
+                log,
+                TARGET_MINT,
+                {},
+                "timeout",
+            )["dispatch"],
+            "test_mode_dispatch_violation",
         )
 
     def test_chain_aggregation_uses_exact_window_and_finalized_entries(self):
@@ -3102,6 +3311,50 @@ class FinalizationTests(MintRunnerTestCase):
         self.assertNotIn(protected, rendered)
         for name in ("CURRENT.md", "EXPERIMENTS.md"):
             self.assertNotIn(protected, (self.root / "state" / name).read_text())
+
+    def test_manifest_records_test_mode_dispatch_violation(self):
+        self.install_diagnostic_source()
+        prepared = self.prepare(diagnostic="d0")
+        log = self.write_guard_result(
+            prepared,
+            content=(
+                "reason=test_mode_dispatch_violation\n"
+                "duration_seconds=1\n"
+                "log_path=logs/run.log\n"
+            ),
+        )
+        log.write_text("Fetched 0 mint list.\n")
+
+        result = mint_runner.finalize_run(
+            self.root,
+            prepared.run_id,
+            guard_exit=1,
+            started_at=100,
+            ended_at=101,
+            chain_aggregator=lambda *args, **kwargs: self.zero_chain(),
+        )
+
+        self.assertEqual(result["stop_reason"], "test_mode_dispatch_violation")
+        self.assertEqual(
+            result["selector_diagnostic"],
+            {
+                "refresh_count": 1,
+                "zero_refresh_count": 1,
+                "selected_count_histogram": {"0": 1},
+                "selected_count_min": 0,
+                "selected_count_max": 0,
+                "target_artifact_present": False,
+                "target_pool_count": "unavailable",
+                "target_lut_count": "unavailable",
+                "target_runtime_observation_count": "unavailable",
+                "candidate_construction": "not_observed_in_log",
+                "dispatch": "test_mode_dispatch_violation",
+            },
+        )
+        rendered = (prepared.result_dir / "manifest.json").read_text()
+        self.assertNotIn(UNRELATED_MINT, rendered)
+        self.assertNotIn("https://fixture.invalid/fixture-uuid", rendered)
+        self.assertNotIn("signature", rendered.lower())
 
     def test_finalize_cli_passes_exact_window_and_outputs_only_safe_paths(self):
         manifest = {
