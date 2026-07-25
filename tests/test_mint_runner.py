@@ -828,6 +828,12 @@ class FinalizationTests(MintRunnerTestCase):
                         selected_policy,
                     )
 
+    def test_non_string_json_key_uses_dedicated_content_error(self):
+        policy = mint_runner.zavod_guard.ProtectedOutputPolicy()
+
+        with self.assertRaises(mint_runner.GeneratedArtifactContentError):
+            mint_runner._sanitize_json_value({1: "value"}, policy)
+
     @staticmethod
     def target_transaction(
         mint=TARGET_MINT,

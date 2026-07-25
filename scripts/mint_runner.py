@@ -1313,7 +1313,9 @@ def _sanitize_json_value(value, policy, depth=0):
         sanitized = {}
         for key, item in value.items():
             if not isinstance(key, str):
-                raise RunnerError("generated runtime artifact is invalid")
+                raise GeneratedArtifactContentError(
+                    "generated runtime artifact is invalid"
+                )
             safe_key = policy.redact_text(key)
             if safe_key in sanitized:
                 raise GeneratedArtifactContentError(
