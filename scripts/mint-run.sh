@@ -59,6 +59,24 @@ lock_failure() {
   exit 75
 }
 
+extract_unique_field() {
+  local payload="$1"
+  local key="$2"
+  printf '%s\n' "$payload" |
+    awk -v key="$key" '
+      index($0, key "=") == 1 {
+        count += 1
+        value = substr($0, length(key) + 2)
+      }
+      END {
+        if (count != 1) {
+          exit 1
+        }
+        print value
+      }
+    '
+}
+
 acquire_live_lock() {
   [[ -d "$root/state" && ! -L "$root/state" ]] || lock_failure
   local state_owner
@@ -213,24 +231,6 @@ prepared_run_id="$(
   printf '%s\n' "$prepare_output" |
     awk -F= '$1 == "run_id" {print $2; exit}'
 )"
-prepared_diagnostic_mode="$(
-  printf '%s\n' "$prepare_output" |
-    awk '
-      index($0, "diagnostic_mode=") == 1 {
-        print substr($0, length("diagnostic_mode=") + 1)
-        exit
-      }
-    '
-)"
-prepared_diagnostic_config="$(
-  printf '%s\n' "$prepare_output" |
-    awk '
-      index($0, "diagnostic_config=") == 1 {
-        print substr($0, length("diagnostic_config=") + 1)
-        exit
-      }
-    '
-)"
 printf '%s\n' "$prepare_output" |
   awk -F= '
     $1 == "run_id" ||
@@ -250,24 +250,56 @@ printf '%s\n' "$prepare_output" |
 }
 run_id="$prepared_run_id"
 diagnostic_config=""
+prepared_diagnostic_mode=""
+prepared_diagnostic_target=""
+prepared_diagnostic_config_sha256=""
+prepared_diagnostic_tokens_sha256=""
 if [[ -n "$diagnostic_mode" ]]; then
-  expected_diagnostic_config="state/mint-runs/$run_id/selector-diagnostic.toml"
+  if ! prepared_diagnostic_mode="$(
+    extract_unique_field "$prepare_output" "diagnostic_mode"
+  )" ||
+    ! prepared_diagnostic_target="$(
+      extract_unique_field "$prepare_output" "diagnostic_target"
+    )" ||
+    ! prepared_diagnostic_config_sha256="$(
+      extract_unique_field "$prepare_output" "diagnostic_config_sha256"
+    )" ||
+    ! prepared_diagnostic_tokens_sha256="$(
+      extract_unique_field "$prepare_output" "diagnostic_tokens_sha256"
+    )"; then
+    echo 'Diagnostic preparation validation failed.' >&2
+    exit 1
+  fi
   if [[
     "$prepared_diagnostic_mode" != "$diagnostic_mode" ||
-    "$prepared_diagnostic_config" != "$expected_diagnostic_config"
+    "$prepared_diagnostic_target" != "$mint" ||
+    ! "$prepared_diagnostic_config_sha256" =~ ^[0-9a-f]{64}$ ||
+    ! "$prepared_diagnostic_tokens_sha256" =~ ^[0-9a-f]{64}$
   ]]; then
     echo 'Diagnostic preparation validation failed.' >&2
     exit 1
   fi
-  diagnostic_config="$expected_diagnostic_config"
-  printf 'diagnostic_mode=%s\n' "$diagnostic_mode"
-  printf 'diagnostic_config=%s\n' "$diagnostic_config"
-elif [[
-  -n "$prepared_diagnostic_mode" ||
-  -n "$prepared_diagnostic_config"
-]]; then
-  echo 'Preparation returned unexpected diagnostic state.' >&2
-  exit 1
+  diagnostic_config="state/mint-runs/$run_id/selector-diagnostic.toml"
+  printf 'diagnostic_mode=%s\n' "$prepared_diagnostic_mode"
+  printf 'diagnostic_target=%s\n' "$prepared_diagnostic_target"
+  printf 'diagnostic_config_sha256=%s\n' \
+    "$prepared_diagnostic_config_sha256"
+  printf 'diagnostic_tokens_sha256=%s\n' \
+    "$prepared_diagnostic_tokens_sha256"
+else
+  diagnostic_contract_fields="$(
+    printf '%s\n' "$prepare_output" |
+      awk '
+        /^(diagnostic_mode|diagnostic_target|diagnostic_config_sha256|diagnostic_tokens_sha256)=/ {
+          count += 1
+        }
+        END { print count + 0 }
+      '
+  )"
+  if (( diagnostic_contract_fields != 0 )); then
+    echo 'Preparation returned unexpected diagnostic state.' >&2
+    exit 1
+  fi
 fi
 if (( pending_signal_status != 0 )); then
   exit "$pending_signal_status"
@@ -330,7 +362,32 @@ if (( pending_signal_status != 0 )); then
   exit "$pending_signal_status"
 fi
 
-python3 scripts/mint_runner.py --root "$root" validate-live --run-id "$run_id"
+if [[ -n "$diagnostic_mode" ]]; then
+  set +e
+  validated_diagnostic_contract="$(
+    python3 scripts/mint_runner.py --root "$root" validate-live \
+      --run-id "$run_id"
+  )"
+  validation_status=$?
+  set -e
+  if (( validation_status != 0 )); then
+    exit "$validation_status"
+  fi
+  expected_diagnostic_contract="$(
+    printf 'diagnostic_mode=%s\n' "$prepared_diagnostic_mode"
+    printf 'diagnostic_target=%s\n' "$prepared_diagnostic_target"
+    printf 'diagnostic_config_sha256=%s\n' \
+      "$prepared_diagnostic_config_sha256"
+    printf 'diagnostic_tokens_sha256=%s\n' \
+      "$prepared_diagnostic_tokens_sha256"
+  )"
+  if [[ "$validated_diagnostic_contract" != "$expected_diagnostic_contract" ]]; then
+    echo 'Diagnostic live validation failed.' >&2
+    exit 1
+  fi
+else
+  python3 scripts/mint_runner.py --root "$root" validate-live --run-id "$run_id"
+fi
 if (( pending_signal_status != 0 )); then
   exit "$pending_signal_status"
 fi
@@ -344,6 +401,10 @@ if [[ -n "$diagnostic_mode" ]]; then
     --profile selector-diagnostic \
     --config "$diagnostic_config" \
     --test-mode \
+    --diagnostic-mode "$prepared_diagnostic_mode" \
+    --diagnostic-target "$prepared_diagnostic_target" \
+    --config-sha256 "$prepared_diagnostic_config_sha256" \
+    --tokens-sha256 "$prepared_diagnostic_tokens_sha256" \
     >&"$result_fd" &
 else
   ZAVOD_LIVE_LOCK_FD="$live_lock_fd" \

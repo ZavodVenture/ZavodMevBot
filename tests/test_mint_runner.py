@@ -35,10 +35,10 @@ DIAGNOSTIC_SOURCE = (
     b"\n"
     b"[auto.filters]\n"
     b"limit = 17\n"
+    b"ignore_offchain_bots = true\n"
     b"\n"
     b"[bot]\n"
     b"merge_mints = true\n"
-    b"ignore_offchain_bots = true\n"
     b"\n"
     b"[unchanged]\n"
     b'value = "keep exactly"\n'
@@ -56,10 +56,10 @@ DIAGNOSTIC_D0 = (
     b"\n"
     b"[auto.filters]\n"
     b"limit = 1\n"
+    b"ignore_offchain_bots = true\n"
     b"\n"
     b"[bot]\n"
     b"merge_mints = false\n"
-    b"ignore_offchain_bots = true\n"
     b"\n"
     b"[unchanged]\n"
     b'value = "keep exactly"\n'
@@ -68,6 +68,69 @@ DIAGNOSTIC_D1 = DIAGNOSTIC_D0.replace(
     b"ignore_offchain_bots = true",
     b"ignore_offchain_bots = false",
 )
+
+# Sanitized structural fixture derived from the observed artifact schema.
+# All identities and list elements are deterministic test-only placeholders.
+SANITIZED_FIXTURE_TARGET = "US517G5965aydkZ46HS38QLi7UQiSojurfbQfKCELFx"
+SANITIZED_OBSERVED_HOT_TOKEN_JSON = b"""{
+  "count": 1,
+  "arb_mint_info": [{
+    "arbs_count": 180,
+    "bridge_mint": "sanitized-bridge",
+    "bridge_pool_ids_info": [],
+    "cross_pool_ids_info": [],
+    "lookup_table_accounts": [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,88,89,90,91,92,93,94,95,96,97,98,99,100,101,102,103,104,105,106,107,108,109,110,111,112,113,114,115,116,117,118,119,120,121,122,123,124,125,126,127,128,129,130,131,132,133,134,135,136,137,138,139,140,141,142,143,144,145,146,147,148,149,150,151,152],
+    "mint": "US517G5965aydkZ46HS38QLi7UQiSojurfbQfKCELFx",
+    "pool_ids": ["sanitized-pool-a", "sanitized-pool-b", "sanitized-pool-c"],
+    "pool_ids_info": [],
+    "roi": 0,
+    "total_fee": 0,
+    "total_liquidity_lamports": 0,
+    "total_profit": 0,
+    "total_volume": 0,
+    "txs": [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,88,89,90,91,92,93,94,95,96,97,98,99,100,101,102,103,104,105,106,107,108,109,110,111,112,113,114,115,116,117,118,119,120,121,122,123,124,125,126,127,128,129,130,131,132,133,134,135,136,137,138,139,140,141,142,143,144,145,146,147,148,149,150,151,152,153,154,155,156,157,158,159,160,161,162,163,164,165,166,167,168,169,170,171,172,173,174,175,176,177,178,179]
+  }]
+}
+"""
+
+
+def sanitized_hot_token_entry(
+    mint,
+    pool_count,
+    lut_count,
+    runtime_count,
+    prefix,
+):
+    return {
+        "arbs_count": runtime_count,
+        "bridge_mint": f"{prefix}-bridge",
+        "bridge_pool_ids_info": [],
+        "cross_pool_ids_info": [],
+        "lookup_table_accounts": [
+            f"{prefix}-lut-{index}" for index in range(lut_count)
+        ],
+        "mint": mint,
+        "pool_ids": [
+            f"{prefix}-pool-{index}" for index in range(pool_count)
+        ],
+        "pool_ids_info": [],
+        "roi": 0,
+        "total_fee": 0,
+        "total_liquidity_lamports": 0,
+        "total_profit": 0,
+        "total_volume": 0,
+        "txs": [
+            {"observation": f"{prefix}-tx-{index}"}
+            for index in range(runtime_count)
+        ],
+    }
+
+
+def sanitized_hot_token_artifact(entries):
+    return {
+        "count": len(entries),
+        "arb_mint_info": entries,
+    }
 
 
 class MintRunnerTestCase(unittest.TestCase):
@@ -676,6 +739,36 @@ class MintRunnerTestCase(unittest.TestCase):
             production_hash,
         )
 
+    def test_d0_prepare_and_live_validation_expose_exact_launch_contract(self):
+        self.install_diagnostic_source()
+        prepared = self.prepare(diagnostic="d0")
+        expected_contract = {
+            "diagnostic_mode": "d0",
+            "diagnostic_target": TARGET_MINT,
+            "diagnostic_config_sha256": hashlib.sha256(
+                DIAGNOSTIC_D0
+            ).hexdigest(),
+            "diagnostic_tokens_sha256": hashlib.sha256(
+                f'tokens = ["{TARGET_MINT}"]\n'.encode()
+            ).hexdigest(),
+        }
+
+        summary = prepared.safe_summary()
+
+        self.assertEqual(
+            {
+                key: summary.get(key)
+                for key in expected_contract
+            },
+            expected_contract,
+        )
+        self.assertNotIn("diagnostic_config", summary)
+        self.assertEqual(
+            mint_runner.validate_live_state(self.root, prepared.run_id),
+            expected_contract,
+        )
+        self.assertNotIn(DIAGNOSTIC_SECRET, json.dumps(summary, sort_keys=True))
+
     def test_diagnostic_config_rejects_ambiguous_assignments(self):
         cases = {
             "missing": DIAGNOSTIC_SOURCE.replace(
@@ -726,6 +819,18 @@ class MintRunnerTestCase(unittest.TestCase):
                     )
                 )
 
+    def test_diagnostic_toml_parser_rejects_nonfinite_numbers(self):
+        source = DIAGNOSTIC_SOURCE.replace(
+            b'value = "keep exactly"\n',
+            b'value = "keep exactly"\nmetric = nan\n',
+        )
+
+        with self.assertRaisesRegex(
+            mint_runner.RunnerError,
+            "^diagnostic configuration is invalid$",
+        ):
+            mint_runner._parse_diagnostic_toml(source)
+
     def test_diagnostic_config_is_private_and_production_unchanged(self):
         self.install_diagnostic_source()
         production_hash = hashlib.sha256(DIAGNOSTIC_SOURCE).hexdigest()
@@ -760,6 +865,9 @@ class MintRunnerTestCase(unittest.TestCase):
                 "config_sha256": hashlib.sha256(DIAGNOSTIC_D0).hexdigest(),
                 "mints": [TARGET_MINT],
                 "mode": "d0",
+                "tokens_sha256": hashlib.sha256(
+                    f'tokens = ["{TARGET_MINT}"]\n'.encode()
+                ).hexdigest(),
             },
         )
 
@@ -1222,33 +1330,29 @@ class MintRunnerTestCase(unittest.TestCase):
             "SELECTOR_DIAGNOSTIC candidate_construction=observed\n"
         )
         log.chmod(0o600)
+        unrelated = sanitized_hot_token_entry(
+            UNRELATED_MINT,
+            9,
+            8,
+            7,
+            "unrelated",
+        )
+        unrelated["pool_ids"] = [protected_url] * 9
+        unrelated["lookup_table_accounts"] = [protected_signature] * 8
+        unrelated["txs"] = [{"route": protected_url}] * 7
         artifacts = {
-            "hot_tokens.json": {
-                "mints": [
-                    {
-                        "mint": UNRELATED_MINT,
-                        "pools": [protected_url] * 9,
-                    },
-                    {
-                        "mint": TARGET_MINT,
-                        "pools": [{}, {}, {}],
-                    },
-                ],
-            },
-            "routing.json": {
-                "mints": [
-                    {
-                        "mint": UNRELATED_MINT,
-                        "luts": [protected_signature] * 8,
-                        "runtime_observations": [protected_url] * 7,
-                    },
-                    {
-                        "mint": TARGET_MINT,
-                        "luts": [{}, {}, {}, {}],
-                        "runtime_observations": [{}, {}, {}, {}, {}],
-                    },
-                ],
-            },
+            "hot_tokens.json": sanitized_hot_token_artifact(
+                [
+                    unrelated,
+                    sanitized_hot_token_entry(
+                        TARGET_MINT,
+                        3,
+                        4,
+                        5,
+                        "target",
+                    ),
+                ]
+            ),
         }
 
         summary = mint_runner._selector_diagnostic_summary(
@@ -1278,6 +1382,120 @@ class MintRunnerTestCase(unittest.TestCase):
         self.assertNotIn(UNRELATED_MINT, rendered)
         self.assertNotIn(protected_url, rendered)
         self.assertNotIn(protected_signature, rendered)
+
+    def test_selector_summary_supports_observed_sanitized_hot_token_shape(self):
+        log = self.root / "selector.log"
+        log.write_text("Fetched 0 mint list.\n")
+        log.chmod(0o600)
+        artifact = json.loads(SANITIZED_OBSERVED_HOT_TOKEN_JSON)
+
+        summary = mint_runner._selector_diagnostic_summary(
+            log,
+            SANITIZED_FIXTURE_TARGET,
+            {"hot_tokens.json": artifact},
+            "timeout",
+        )
+
+        self.assertTrue(summary["target_artifact_present"])
+        self.assertEqual(summary["target_pool_count"], 3)
+        self.assertEqual(summary["target_lut_count"], 153)
+        self.assertEqual(
+            summary["target_runtime_observation_count"],
+            180,
+        )
+
+    def test_selector_log_uses_bounded_reads_and_observation_cap(self):
+        log = self.root / "selector.log"
+        log.write_text(
+            "Fetched 0 mint list.\n"
+            "Fetched 1 mint list.\n"
+            "Fetched 2 mint list.\n"
+        )
+        log.chmod(0o600)
+        real_read = os.read
+        requested_sizes = []
+
+        def bounded_read(descriptor, size):
+            requested_sizes.append(size)
+            return real_read(descriptor, size)
+
+        with (
+            patch.object(mint_runner.os, "read", side_effect=bounded_read),
+            patch.object(
+                mint_runner,
+                "SELECTOR_MAX_OBSERVATIONS",
+                2,
+                create=True,
+            ),
+        ):
+            summary = mint_runner._selector_diagnostic_summary(
+                log,
+                TARGET_MINT,
+                {},
+                "timeout",
+            )
+
+        self.assertTrue(requested_sizes)
+        self.assertLessEqual(max(requested_sizes), 64 * 1024)
+        self.assertEqual(summary["refresh_count"], 2)
+        self.assertEqual(
+            summary["selected_count_histogram"],
+            {"0": 1, "1": 1},
+        )
+
+    def test_selector_log_stops_reading_at_total_byte_and_observation_bounds(self):
+        log = self.root / "selector.log"
+        log.write_bytes(b"Fetched 0 mint list.\n" * 100)
+        log.chmod(0o600)
+        real_read = os.read
+        read_calls = []
+
+        def bounded_source(descriptor, size):
+            read_calls.append(size)
+            if len(read_calls) > 2:
+                raise AssertionError("selector log read beyond hard byte bound")
+            return real_read(descriptor, size)
+
+        with (
+            patch.object(mint_runner.os, "read", side_effect=bounded_source),
+            patch.object(mint_runner, "SELECTOR_LOG_READ_SIZE", 32),
+            patch.object(mint_runner, "SELECTOR_LOG_MAX_BYTES", 64),
+            patch.object(mint_runner, "SELECTOR_MAX_OBSERVATIONS", 1000),
+        ):
+            summary = mint_runner._selector_diagnostic_summary(
+                log,
+                SANITIZED_FIXTURE_TARGET,
+                {},
+                "timeout",
+            )
+
+        self.assertEqual(read_calls, [32, 32])
+        self.assertGreater(summary["refresh_count"], 0)
+
+        def endless_observations():
+            for index in range(4):
+                if index == 3:
+                    raise AssertionError(
+                        "selector continued after observation cap"
+                    )
+                yield "Fetched 0 mint list."
+
+        with (
+            patch.object(
+                mint_runner,
+                "_iter_owned_text_lines",
+                return_value=endless_observations(),
+            ),
+            patch.object(mint_runner, "SELECTOR_MAX_OBSERVATIONS", 2),
+        ):
+            capped = mint_runner._selector_diagnostic_summary(
+                log,
+                SANITIZED_FIXTURE_TARGET,
+                {},
+                "timeout",
+            )
+
+        self.assertEqual(capped["refresh_count"], 2)
 
 
 class FinalizationTests(MintRunnerTestCase):
@@ -1450,30 +1668,21 @@ class FinalizationTests(MintRunnerTestCase):
         log.write_text("")
         log.chmod(0o600)
         target_absent = {
-            "hot_tokens.json": {
-                "mints": [{"mint": UNRELATED_MINT, "pools": [{}, {}]}],
-            },
-            "routing.json": {
-                "mints": [
-                    {
-                        "mint": UNRELATED_MINT,
-                        "luts": [{}, {}, {}],
-                        "runtime_observations": [{}, {}, {}, {}],
-                    }
-                ],
-            },
+            "hot_tokens.json": sanitized_hot_token_artifact(
+                [
+                    sanitized_hot_token_entry(
+                        UNRELATED_MINT,
+                        2,
+                        3,
+                        4,
+                        "unrelated",
+                    )
+                ]
+            ),
         }
         unknown_shape = {
             "hot_tokens.json": {
                 "nested": {TARGET_MINT: {"pools": [{}, {}, {}]}},
-            },
-            "routing.json": {
-                "nested": {
-                    TARGET_MINT: {
-                        "luts": [{}, {}, {}, {}],
-                        "runtime_observations": [{}, {}, {}, {}, {}],
-                    }
-                },
             },
         }
 
@@ -1505,6 +1714,45 @@ class FinalizationTests(MintRunnerTestCase):
             unavailable["target_runtime_observation_count"],
             "unavailable",
         )
+
+        valid_entry = sanitized_hot_token_entry(
+            TARGET_MINT,
+            3,
+            4,
+            5,
+            "target",
+        )
+        malformed_artifacts = []
+        wrong_count = sanitized_hot_token_artifact([copy.deepcopy(valid_entry)])
+        wrong_count["count"] = 2
+        malformed_artifacts.append(wrong_count)
+        wrong_arbs = sanitized_hot_token_artifact([copy.deepcopy(valid_entry)])
+        wrong_arbs["arb_mint_info"][0]["arbs_count"] = 4
+        malformed_artifacts.append(wrong_arbs)
+        wrong_list = sanitized_hot_token_artifact([copy.deepcopy(valid_entry)])
+        wrong_list["arb_mint_info"][0]["lookup_table_accounts"] = {}
+        malformed_artifacts.append(wrong_list)
+        for artifact in malformed_artifacts:
+            with self.subTest(artifact=artifact):
+                malformed = mint_runner._selector_diagnostic_summary(
+                    log,
+                    TARGET_MINT,
+                    {"hot_tokens.json": artifact},
+                    "timeout",
+                )
+                self.assertFalse(malformed["target_artifact_present"])
+                self.assertEqual(
+                    malformed["target_pool_count"],
+                    "unavailable",
+                )
+                self.assertEqual(
+                    malformed["target_lut_count"],
+                    "unavailable",
+                )
+                self.assertEqual(
+                    malformed["target_runtime_observation_count"],
+                    "unavailable",
+                )
 
     def test_selector_stage_markers_must_be_exact(self):
         log = self.root / "selector.log"
@@ -2435,6 +2683,126 @@ class FinalizationTests(MintRunnerTestCase):
         )
         self.assertEqual(len(state_backups), 1)
         self.assertEqual(stat.S_IMODE(state_backups[0].stat().st_mode), 0o600)
+
+    def test_diagnostic_finalize_uses_sanitized_selector_evidence_only(self):
+        self.install_diagnostic_source()
+        prepared = self.prepare(
+            mint=SANITIZED_FIXTURE_TARGET,
+            diagnostic="d0",
+            now=lambda: datetime(
+                2026,
+                7,
+                24,
+                18,
+                46,
+                tzinfo=timezone.utc,
+            ),
+        )
+        log = self.write_guard_result(prepared)
+        log.write_text(
+            "Fetched 0 mint list.\n"
+            "SELECTOR_DIAGNOSTIC candidate_construction=observed\n"
+        )
+        log.chmod(0o600)
+        (self.root / "hot_tokens.json").write_bytes(
+            SANITIZED_OBSERVED_HOT_TOKEN_JSON
+        )
+        (self.root / "hot_tokens.json").chmod(0o600)
+        chain_calls = []
+
+        def chain_must_not_run(*args, **kwargs):
+            chain_calls.append((args, kwargs))
+            return self.zero_chain()
+
+        result = mint_runner.finalize_run(
+            self.root,
+            prepared.run_id,
+            guard_exit=0,
+            started_at=100,
+            ended_at=160,
+            chain_aggregator=chain_must_not_run,
+        )
+
+        self.assertEqual(chain_calls, [])
+        self.assertEqual(result["aggregation_status"], "not_applicable")
+        self.assertEqual(
+            result["chain"],
+            {
+                key: "not_applicable"
+                for key in mint_runner.CHAIN_SUMMARY_KEYS
+            },
+        )
+        self.assertEqual(
+            result["log_events"],
+            {
+                key: "not_applicable"
+                for key in mint_runner.LOG_PATTERNS
+            },
+        )
+        self.assertEqual(
+            result["selector_diagnostic"],
+            {
+                "refresh_count": 1,
+                "zero_refresh_count": 1,
+                "selected_count_histogram": {"0": 1},
+                "selected_count_min": 0,
+                "selected_count_max": 0,
+                "target_artifact_present": True,
+                "target_pool_count": 3,
+                "target_lut_count": 153,
+                "target_runtime_observation_count": 180,
+                "candidate_construction": "observed_in_log",
+                "dispatch": "not_applicable",
+            },
+        )
+        state = (
+            (self.root / "state" / "CURRENT.md").read_text()
+            + (self.root / "state" / "EXPERIMENTS.md").read_text()
+        )
+        self.assertIn(
+            "Chain landing, execution, swaps, and PnL are not applicable",
+            state,
+        )
+
+    def test_diagnostic_finalize_marks_malformed_captured_shape_unavailable(self):
+        self.install_diagnostic_source()
+        prepared = self.prepare(
+            mint=SANITIZED_FIXTURE_TARGET,
+            diagnostic="d0",
+            now=lambda: datetime(
+                2026,
+                7,
+                24,
+                18,
+                45,
+                tzinfo=timezone.utc,
+            ),
+        )
+        self.write_guard_result(prepared)
+        malformed = json.loads(SANITIZED_OBSERVED_HOT_TOKEN_JSON)
+        malformed["arb_mint_info"][0]["arbs_count"] = 179
+        (self.root / "hot_tokens.json").write_text(
+            json.dumps(malformed)
+        )
+        (self.root / "hot_tokens.json").chmod(0o600)
+
+        result = mint_runner.finalize_run(
+            self.root,
+            prepared.run_id,
+            guard_exit=0,
+            started_at=100,
+            ended_at=160,
+            chain_aggregator=lambda *args, **kwargs: self.zero_chain(),
+        )
+
+        selector = result["selector_diagnostic"]
+        self.assertFalse(selector["target_artifact_present"])
+        self.assertEqual(selector["target_pool_count"], "unavailable")
+        self.assertEqual(selector["target_lut_count"], "unavailable")
+        self.assertEqual(
+            selector["target_runtime_observation_count"],
+            "unavailable",
+        )
 
     def test_diagnostic_config_removed_on_every_terminal_path(self):
         self.install_diagnostic_source()
@@ -3426,6 +3794,49 @@ class FinalizationTests(MintRunnerTestCase):
         self.assertNotIn(UNRELATED_MINT, rendered)
         self.assertNotIn("https://fixture.invalid/fixture-uuid", rendered)
         self.assertNotIn("signature", rendered.lower())
+
+    def test_manifest_preserves_fixed_diagnostic_violation_reasons(self):
+        reasons = (
+            "diagnostic_loss_violation",
+            "input_integrity_violation",
+            "protected_output_violation",
+            "token_account_growth_violation",
+        )
+        for index, reason in enumerate(reasons, start=1):
+            with self.subTest(reason=reason):
+                self.install_diagnostic_source()
+                prepared = self.prepare(
+                    diagnostic="d0",
+                    now=lambda second=index: datetime(
+                        2026,
+                        7,
+                        24,
+                        19,
+                        10,
+                        second,
+                        tzinfo=timezone.utc,
+                    ),
+                )
+                self.write_guard_result(
+                    prepared,
+                    content=(
+                        f"reason={reason}\n"
+                        "duration_seconds=1\n"
+                        "log_path=logs/run.log\n"
+                    ),
+                )
+
+                result = mint_runner.finalize_run(
+                    self.root,
+                    prepared.run_id,
+                    guard_exit=1,
+                    started_at=100,
+                    ended_at=101,
+                    chain_aggregator=lambda *args, **kwargs: self.zero_chain(),
+                )
+
+                self.assertEqual(result["stop_reason"], reason)
+                self.assertEqual(result["guard_exit"], 1)
 
     def test_non_diagnostic_manifest_sanitizes_dispatch_violation_reason(self):
         prepared = self.prepare()

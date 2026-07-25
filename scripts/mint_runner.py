@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import codecs
 import copy
 import hashlib
 import json
@@ -61,6 +62,38 @@ SELECTOR_DISPATCH_VIOLATION_MARKER = (
     "SELECTOR_DIAGNOSTIC dispatch=test_mode_dispatch_violation"
 )
 SELECTOR_UNAVAILABLE = "unavailable"
+SELECTOR_LOG_READ_SIZE = 64 * 1024
+SELECTOR_LOG_MAX_BYTES = 8 * 1024 * 1024
+SELECTOR_LOG_MAX_LINE_CHARS = 64 * 1024
+SELECTOR_MAX_OBSERVATIONS = 100_000
+HOT_TOKEN_ENTRY_KEYS = frozenset(
+    {
+        "arbs_count",
+        "bridge_mint",
+        "bridge_pool_ids_info",
+        "cross_pool_ids_info",
+        "lookup_table_accounts",
+        "mint",
+        "pool_ids",
+        "pool_ids_info",
+        "roi",
+        "total_fee",
+        "total_liquidity_lamports",
+        "total_profit",
+        "total_volume",
+        "txs",
+    }
+)
+HOT_TOKEN_LIST_KEYS = frozenset(
+    {
+        "bridge_pool_ids_info",
+        "cross_pool_ids_info",
+        "lookup_table_accounts",
+        "pool_ids",
+        "pool_ids_info",
+        "txs",
+    }
+)
 CHAIN_SUMMARY_KEYS = (
     "landed",
     "successful",
@@ -75,10 +108,14 @@ STOP_REASONS = frozenset(
     {
         "child_exit",
         "cleanup_failed",
+        "diagnostic_loss_violation",
+        "input_integrity_violation",
         "loss_threshold",
         "operator_signal",
         "output_error",
+        "protected_output_violation",
         "rpc_error",
+        "token_account_growth_violation",
         "timeout",
     }
 )
@@ -114,6 +151,8 @@ class PreparedRun:
     early_stop_lamports: int
     diagnostic_mode: str | None = None
     diagnostic_config: str | None = None
+    diagnostic_config_sha256: str | None = None
+    diagnostic_tokens_sha256: str | None = None
     preflight_status: str = "ok"
     auto_mode: str = "enabled"
 
@@ -130,7 +169,13 @@ class PreparedRun:
         }
         if self.diagnostic_mode is not None:
             summary["diagnostic_mode"] = self.diagnostic_mode
-            summary["diagnostic_config"] = self.diagnostic_config
+            summary["diagnostic_target"] = self.mint
+            summary["diagnostic_config_sha256"] = (
+                self.diagnostic_config_sha256
+            )
+            summary["diagnostic_tokens_sha256"] = (
+                self.diagnostic_tokens_sha256
+            )
         return summary
 
 
@@ -543,6 +588,11 @@ def _diagnostic_relative_path(run_id):
     return f"state/mint-runs/{run_id}/{DIAGNOSTIC_CONFIG_NAME}"
 
 
+def _render_tokens_bytes(mints):
+    rendered_mints = ", ".join(f'"{value}"' for value in mints)
+    return f"tokens = [{rendered_mints}]\n".encode()
+
+
 def _diagnostic_assignments(mode):
     assignments = (
         (("auto",), "force_two_mints", False, bool),
@@ -551,16 +601,26 @@ def _diagnostic_assignments(mode):
     )
     if mode == "d1":
         assignments += (
-            (("bot",), "ignore_offchain_bots", False, bool),
+            (("auto", "filters"), "ignore_offchain_bots", False, bool),
         )
     return assignments
 
 
 def _parse_diagnostic_toml(data):
     try:
-        return tomllib.loads(data.decode("utf-8"))
+        parsed = tomllib.loads(data.decode("utf-8"))
     except (UnicodeError, tomllib.TOMLDecodeError) as exc:
         raise RunnerError("diagnostic configuration is invalid") from exc
+    pending = [parsed]
+    while pending:
+        value = pending.pop()
+        if isinstance(value, float) and not math.isfinite(value):
+            raise RunnerError("diagnostic configuration is invalid")
+        if isinstance(value, dict):
+            pending.extend(value.values())
+        elif isinstance(value, list):
+            pending.extend(value)
+    return parsed
 
 
 def _nested_config_value(config, section, key):
@@ -582,6 +642,13 @@ def _set_nested_config_value(config, section, key, value):
 
 
 def _replace_diagnostic_assignment(lines, section, key, expected_type, replacement):
+    """Mutate canonical bare-key TOML assignments only.
+
+    Accepted grammar is a plain dotted table header followed by one exact bare
+    key, `=`, a literal `true`/`false` or signed decimal integer (underscores
+    allowed), and an optional comment. Quoted/dotted keys, inline tables,
+    floats, NaN/Inf, and duplicate assignments are outside this launch grammar.
+    """
     section_name = ".".join(section).encode()
     section_pattern = re.compile(
         rb"^[ \t]*\[[ \t]*([^]\r\n]+?)[ \t]*\]"
@@ -746,7 +813,13 @@ def _diagnostic_metadata(metadata):
         if (
             not isinstance(diagnostic, dict)
             or set(diagnostic)
-            != {"config_name", "config_sha256", "mints", "mode"}
+            != {
+                "config_name",
+                "config_sha256",
+                "mints",
+                "mode",
+                "tokens_sha256",
+            }
             or diagnostic["config_name"] != DIAGNOSTIC_CONFIG_NAME
             or diagnostic["mode"] not in DIAGNOSTIC_MODES
             or not isinstance(diagnostic["config_sha256"], str)
@@ -759,15 +832,39 @@ def _diagnostic_metadata(metadata):
             or len(diagnostic["mints"])
             != (2 if diagnostic["mode"] == "d2" else 1)
             or diagnostic["mints"][0] != metadata.get("mint")
+            or not isinstance(diagnostic["tokens_sha256"], str)
+            or re.fullmatch(
+                r"[0-9a-f]{64}",
+                diagnostic["tokens_sha256"],
+            )
+            is None
         ):
             raise ValueError("invalid diagnostic metadata")
         for mint in diagnostic["mints"]:
             decode_pubkey(mint)
         if len(set(diagnostic["mints"])) != len(diagnostic["mints"]):
             raise ValueError("duplicate diagnostic mint")
+        if (
+            hashlib.sha256(
+                _render_tokens_bytes(diagnostic["mints"])
+            ).hexdigest()
+            != diagnostic["tokens_sha256"]
+        ):
+            raise ValueError("invalid diagnostic tokens integrity")
     except (KeyError, RunnerError, TypeError, ValueError) as exc:
         raise RunnerError("private recovery data is invalid") from exc
     return diagnostic
+
+
+def _diagnostic_launch_contract(metadata, diagnostic):
+    if diagnostic is None:
+        return None
+    return {
+        "diagnostic_mode": diagnostic["mode"],
+        "diagnostic_target": metadata["mint"],
+        "diagnostic_config_sha256": diagnostic["config_sha256"],
+        "diagnostic_tokens_sha256": diagnostic["tokens_sha256"],
+    }
 
 
 def _validate_diagnostic_file(root, backup_dir, run_id, diagnostic):
@@ -974,12 +1071,17 @@ def prepare_run(
         "timeout_seconds": timeout,
         "optional_files": {},
     }
+    selected_mints = diagnostic_mints or [mint]
+    selected_tokens_bytes = _render_tokens_bytes(selected_mints)
     if diagnostic is not None:
         metadata["diagnostic"] = {
             "config_name": DIAGNOSTIC_CONFIG_NAME,
             "config_sha256": hashlib.sha256(diagnostic_bytes).hexdigest(),
             "mints": diagnostic_mints,
             "mode": diagnostic,
+            "tokens_sha256": hashlib.sha256(
+                selected_tokens_bytes
+            ).hexdigest(),
         }
     diagnostic_created = False
     try:
@@ -1029,11 +1131,9 @@ def prepare_run(
             source = root / name
             if metadata["optional_files"][name]:
                 source.unlink()
-        selected_mints = diagnostic_mints or [mint]
-        rendered_mints = ", ".join(f'"{value}"' for value in selected_mints)
         _atomic_write(
             root / "tokens.toml",
-            f"tokens = [{rendered_mints}]\n".encode(),
+            selected_tokens_bytes,
         )
         with (root / "tokens.toml").open("rb") as handle:
             tokens = tomllib.load(handle)
@@ -1070,6 +1170,16 @@ def prepare_run(
             early_stop_lamports=early_stop,
             diagnostic_mode=diagnostic,
             diagnostic_config=diagnostic_config,
+            diagnostic_config_sha256=(
+                metadata["diagnostic"]["config_sha256"]
+                if diagnostic is not None
+                else None
+            ),
+            diagnostic_tokens_sha256=(
+                metadata["diagnostic"]["tokens_sha256"]
+                if diagnostic is not None
+                else None
+            ),
             preflight_status=preflight_status,
             auto_mode=auto_mode,
         )
@@ -1164,8 +1274,7 @@ def validate_live_state(root, run_id):
     selected_mints = (
         diagnostic["mints"] if diagnostic is not None else [metadata["mint"]]
     )
-    rendered_mints = ", ".join(f'"{value}"' for value in selected_mints)
-    expected_tokens = f"tokens = [{rendered_mints}]\n".encode()
+    expected_tokens = _render_tokens_bytes(selected_mints)
     try:
         marker = _read_owned_file_no_follow(
             root / "state" / ".mint-run-active",
@@ -1188,6 +1297,7 @@ def validate_live_state(root, run_id):
         raise RunnerError("live run state validation failed") from exc
     if marker != expected_marker or tokens != expected_tokens:
         raise RunnerError("live run state validation failed")
+    return _diagnostic_launch_contract(metadata, diagnostic)
 
 
 def restore_run(root, run_id, _allow_missing_diagnostic=False):
@@ -1255,31 +1365,119 @@ def restore_active(root):
     restore_run(root, run_id)
 
 
+def _iter_owned_text_lines(path, mode=None, max_bytes=None):
+    path = Path(path)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise RunnerError("private run paths are invalid") from exc
+    try:
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.getuid()
+            or (
+                mode is not None
+                and stat.S_IMODE(info.st_mode) != mode
+            )
+        ):
+            raise RunnerError("private run paths are invalid")
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        buffer = ""
+        discarding_line = False
+        bytes_read = 0
+        while True:
+            if max_bytes is not None and bytes_read >= max_bytes:
+                chunk = b""
+                final = True
+            else:
+                read_size = SELECTOR_LOG_READ_SIZE
+                if max_bytes is not None:
+                    read_size = min(
+                        read_size,
+                        max_bytes - bytes_read,
+                    )
+                chunk = os.read(descriptor, read_size)
+                bytes_read += len(chunk)
+                final = not chunk or (
+                    max_bytes is not None
+                    and bytes_read >= max_bytes
+                )
+            text = decoder.decode(chunk, final=final)
+            while text:
+                if discarding_line:
+                    newline = text.find("\n")
+                    if newline < 0:
+                        text = ""
+                        continue
+                    text = text[newline + 1:]
+                    discarding_line = False
+                    continue
+                newline = text.find("\n")
+                if newline < 0:
+                    if (
+                        len(buffer) + len(text)
+                        > SELECTOR_LOG_MAX_LINE_CHARS
+                    ):
+                        buffer = ""
+                        discarding_line = True
+                    else:
+                        buffer += text
+                    text = ""
+                    continue
+                segment = text[:newline]
+                text = text[newline + 1:]
+                if (
+                    len(buffer) + len(segment)
+                    <= SELECTOR_LOG_MAX_LINE_CHARS
+                ):
+                    yield (buffer + segment).removesuffix("\r")
+                buffer = ""
+            if final:
+                if buffer and not discarding_line:
+                    yield buffer.removesuffix("\r")
+                break
+    except OSError as exc:
+        raise RunnerError("private run paths are invalid") from exc
+    finally:
+        os.close(descriptor)
+
+
 def aggregate_log(log_path):
-    text = _read_owned_file_no_follow(log_path).decode(errors="replace")
-    return {
-        name: len(pattern.findall(text))
-        for name, pattern in LOG_PATTERNS.items()
-    }
+    counts = {name: 0 for name in LOG_PATTERNS}
+    for line in _iter_owned_text_lines(log_path):
+        for name, pattern in LOG_PATTERNS.items():
+            counts[name] += len(pattern.findall(line))
+    return counts
 
 
-def _selector_artifact_entry(artifact, required_lists, target_mint):
+def _selector_artifact_entry(artifact, target_mint):
     if (
         not isinstance(artifact, dict)
-        or set(artifact) != {"mints"}
-        or not isinstance(artifact["mints"], list)
+        or set(artifact) != {"count", "arb_mint_info"}
+        or type(artifact["count"]) is not int
+        or artifact["count"] < 0
+        or not isinstance(artifact["arb_mint_info"], list)
+        or artifact["count"] != len(artifact["arb_mint_info"])
     ):
         return False, None
-    expected_keys = {"mint", *required_lists}
     target = None
     observed_mints = set()
-    for entry in artifact["mints"]:
+    for entry in artifact["arb_mint_info"]:
         if (
             not isinstance(entry, dict)
-            or set(entry) != expected_keys
+            or set(entry) != HOT_TOKEN_ENTRY_KEYS
             or not isinstance(entry["mint"], str)
+            or not isinstance(entry["bridge_mint"], str)
             or entry["mint"] in observed_mints
-            or any(not isinstance(entry[name], list) for name in required_lists)
+            or any(
+                not isinstance(entry[name], list)
+                for name in HOT_TOKEN_LIST_KEYS
+            )
+            or type(entry["arbs_count"]) is not int
+            or entry["arbs_count"] < 0
+            or entry["arbs_count"] != len(entry["txs"])
         ):
             return False, None
         observed_mints.add(entry["mint"])
@@ -1294,21 +1492,32 @@ def _selector_diagnostic_summary(
     artifacts,
     guard_reason,
 ):
-    if log_path is None:
-        lines = []
-    else:
-        text = _read_owned_file_no_follow(log_path, mode=0o600).decode(
-            errors="replace"
-        )
-        lines = text.splitlines()
     refresh_count = 0
     zero_refresh_count = 0
     histogram_counts = {}
     selected_count_min = None
     selected_count_max = None
+    construction_observed = False
+    dispatch_marker_observed = False
+    lines = (
+        ()
+        if log_path is None
+        else _iter_owned_text_lines(
+            log_path,
+            mode=0o600,
+            max_bytes=SELECTOR_LOG_MAX_BYTES,
+        )
+    )
     for line in lines:
+        if line == SELECTOR_CONSTRUCTION_MARKER:
+            construction_observed = True
+        if line == SELECTOR_DISPATCH_VIOLATION_MARKER:
+            dispatch_marker_observed = True
         match = SELECTOR_REFRESH_PATTERN.fullmatch(line)
-        if match is not None:
+        if (
+            match is not None
+            and refresh_count < SELECTOR_MAX_OBSERVATIONS
+        ):
             count = int(match.group(1))
             refresh_count += 1
             if count == 0:
@@ -1318,6 +1527,8 @@ def _selector_diagnostic_summary(
                 selected_count_min = count
             if selected_count_max is None or count > selected_count_max:
                 selected_count_max = count
+            if refresh_count >= SELECTOR_MAX_OBSERVATIONS:
+                break
     histogram = {
         str(count): occurrences
         for count, occurrences in histogram_counts.items()
@@ -1326,18 +1537,11 @@ def _selector_diagnostic_summary(
     artifact_values = artifacts if isinstance(artifacts, dict) else {}
     hot_shape_available, hot_entry = _selector_artifact_entry(
         artifact_values.get("hot_tokens.json"),
-        ("pools",),
         target_mint,
     )
-    routing_shape_available, routing_entry = _selector_artifact_entry(
-        artifact_values.get("routing.json"),
-        ("luts", "runtime_observations"),
-        target_mint,
-    )
-    construction_observed = SELECTOR_CONSTRUCTION_MARKER in lines
     dispatch_violation = (
         guard_reason == "test_mode_dispatch_violation"
-        or SELECTOR_DISPATCH_VIOLATION_MARKER in lines
+        or dispatch_marker_observed
     )
     return {
         "refresh_count": refresh_count,
@@ -1354,22 +1558,22 @@ def _selector_diagnostic_summary(
             else SELECTOR_UNAVAILABLE
         ),
         "target_artifact_present": (
-            hot_entry is not None or routing_entry is not None
+            hot_entry is not None
         ),
         "target_pool_count": (
-            len(hot_entry["pools"])
+            len(hot_entry["pool_ids"])
             if hot_entry is not None
             else 0 if hot_shape_available else SELECTOR_UNAVAILABLE
         ),
         "target_lut_count": (
-            len(routing_entry["luts"])
-            if routing_entry is not None
-            else 0 if routing_shape_available else SELECTOR_UNAVAILABLE
+            len(hot_entry["lookup_table_accounts"])
+            if hot_entry is not None
+            else 0 if hot_shape_available else SELECTOR_UNAVAILABLE
         ),
         "target_runtime_observation_count": (
-            len(routing_entry["runtime_observations"])
-            if routing_entry is not None
-            else 0 if routing_shape_available else SELECTOR_UNAVAILABLE
+            len(hot_entry["txs"])
+            if hot_entry is not None
+            else 0 if hot_shape_available else SELECTOR_UNAVAILABLE
         ),
         "candidate_construction": (
             "observed_in_log"
@@ -1997,11 +2201,18 @@ def finalize_run(
                 )
             )
             log_path = _validate_log_path(root, guard.get("log_path"))
-            log_summary = (
-                aggregate_log(log_path)
-                if log_path is not None
-                else {name: 0 for name in LOG_PATTERNS}
-            )
+            diagnostic = _diagnostic_metadata(metadata)
+            if diagnostic is None:
+                log_summary = (
+                    aggregate_log(log_path)
+                    if log_path is not None
+                    else {name: 0 for name in LOG_PATTERNS}
+                )
+            else:
+                log_summary = {
+                    name: "not_applicable"
+                    for name in LOG_PATTERNS
+                }
             if isinstance(started_at, bool) or isinstance(ended_at, bool):
                 raise RunnerError("run window is invalid")
             started_at = int(started_at)
@@ -2026,21 +2237,28 @@ def finalize_run(
             output_policy = zavod_guard.ProtectedOutputPolicy.from_config(
                 config
             )
-            try:
-                chain = _sanitize_chain_summary(
-                    (chain_aggregator or aggregate_chain)(
-                        config,
-                        metadata["mint"],
-                        started_at,
-                        ended_at,
-                        transport=transport,
-                        pubkey_resolver=pubkey_resolver,
+            if diagnostic is None:
+                try:
+                    chain = _sanitize_chain_summary(
+                        (chain_aggregator or aggregate_chain)(
+                            config,
+                            metadata["mint"],
+                            started_at,
+                            ended_at,
+                            transport=transport,
+                            pubkey_resolver=pubkey_resolver,
+                        )
                     )
-                )
-                aggregation_status = "ok"
-            except Exception:
-                chain = _empty_chain_summary()
-                aggregation_status = "failed"
+                    aggregation_status = "ok"
+                except Exception:
+                    chain = _empty_chain_summary()
+                    aggregation_status = "failed"
+            else:
+                chain = {
+                    name: "not_applicable"
+                    for name in CHAIN_SUMMARY_KEYS
+                }
+                aggregation_status = "not_applicable"
             artifact_status = {}
             for name in OPTIONAL_FILES:
                 artifact_status[name] = _capture_generated_artifact(
@@ -2050,7 +2268,6 @@ def finalize_run(
                 )
             if isinstance(guard_exit, bool):
                 raise RunnerError("guard result is invalid")
-            diagnostic = _diagnostic_metadata(metadata)
             stop_reason = (
                 guard["reason"]
                 if (
@@ -2100,14 +2317,24 @@ def finalize_run(
             restore_run(root, run_id)
         if manifest is None:
             raise RunnerError("finalization failed")
-        heading = f"{run_id} — single-mint guarded run"
-        bullets = [
-            f"Target mint recorded in private run manifest; timeout `{metadata['timeout_seconds']} s`.",
-            f"Stop reason `{manifest['stop_reason']}`; landed `{chain['landed']}`, successful `{chain['successful']}`, failed `{chain['failed']}`.",
-            f"Fees `{chain['fees_lamports']}`, rent `{chain['rent_lamports']}`, transfers `{chain['transfers_lamports']}` lamports.",
-            f"SOL delta `{chain['sol_delta_lamports']}` lamports; wSOL delta `{chain['wsol_delta_raw']}` raw units.",
-            "Original config, token list, and runtime artifacts restored; no automatic retry.",
-        ]
+        if diagnostic is None:
+            heading = f"{run_id} — single-mint guarded run"
+            bullets = [
+                f"Target mint recorded in private run manifest; timeout `{metadata['timeout_seconds']} s`.",
+                f"Stop reason `{manifest['stop_reason']}`; landed `{chain['landed']}`, successful `{chain['successful']}`, failed `{chain['failed']}`.",
+                f"Fees `{chain['fees_lamports']}`, rent `{chain['rent_lamports']}`, transfers `{chain['transfers_lamports']}` lamports.",
+                f"SOL delta `{chain['sol_delta_lamports']}` lamports; wSOL delta `{chain['wsol_delta_raw']}` raw units.",
+                "Original config, token list, and runtime artifacts restored; no automatic retry.",
+            ]
+        else:
+            selector = manifest["selector_diagnostic"]
+            heading = f"{run_id} — selector diagnostic"
+            bullets = [
+                f"Target identity recorded in private run manifest; timeout `{metadata['timeout_seconds']} s`.",
+                f"Stop reason `{manifest['stop_reason']}`; selector refreshes `{selector['refresh_count']}`.",
+                "Chain landing, execution, swaps, and PnL are not applicable in test mode.",
+                "Original config, token list, and runtime artifacts restored; no automatic retry.",
+            ]
         _record_state(root, heading, bullets)
         return manifest
     finally:
@@ -2219,7 +2446,10 @@ def main(argv=None):
             restore_active(root)
             return 0
         if args.command == "validate-live":
-            validate_live_state(root, args.run_id)
+            contract = validate_live_state(root, args.run_id)
+            if contract is not None:
+                for key, value in contract.items():
+                    print(f"{key}={value}")
             return 0
         if args.command == "result-path":
             run_id = _validate_run_id(args.run_id)

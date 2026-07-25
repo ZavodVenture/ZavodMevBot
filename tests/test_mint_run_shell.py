@@ -1,3 +1,4 @@
+import hashlib
 import os
 import select
 import signal
@@ -12,6 +13,12 @@ from pathlib import Path
 
 TARGET_MINT = "So11111111111111111111111111111111111111112"
 DIAGNOSTIC_SENTINEL = "diagnostic-config-private-sentinel"
+DIAGNOSTIC_CONFIG_SHA256 = hashlib.sha256(
+    f"{DIAGNOSTIC_SENTINEL}\n".encode()
+).hexdigest()
+DIAGNOSTIC_TOKENS_SHA256 = hashlib.sha256(
+    f'tokens = ["{TARGET_MINT}"]\n'.encode()
+).hexdigest()
 
 
 class MintRunShellTests(unittest.TestCase):
@@ -33,7 +40,23 @@ class MintRunShellTests(unittest.TestCase):
             set -euo pipefail
             [[ "${ZAVOD_LIVE_LOCK_FD:-}" =~ ^[0-9]+$ ]]
             [[ -e "/proc/$$/fd/$ZAVOD_LIVE_LOCK_FD" ]]
+            descriptor_identity="$(
+              stat -Lc '%d:%i' "/proc/$$/fd/$ZAVOD_LIVE_LOCK_FD"
+            )"
+            path_identity="$(stat -Lc '%d:%i' state/.zavod-live.lock)"
+            [[ "$descriptor_identity" == "$path_identity" ]]
+            exec {probe_fd}<> state/.zavod-live.lock
+            set +e
+            flock -n -E 73 "$probe_fd"
+            probe_status=$?
+            set -e
+            [[ "$probe_status" -eq 73 ]]
+            exec {probe_fd}>&-
             printf '%s\n' "$ZAVOD_LIVE_LOCK_FD" >> run-guarded.lock-fds
+            printf '%s %s\n' \
+              "$descriptor_identity" "$path_identity" \
+              >> run-guarded.lock-identities
+            printf '%s\n' "$probe_status" >> run-guarded.lock-held
             printf '%s\n' "$*" >> run-guarded.args
             printf 'reason=timeout\nduration_seconds=60\nlog_path=logs/fake.log\n'
             """
@@ -53,6 +76,7 @@ class MintRunShellTests(unittest.TestCase):
             "scripts/mint_runner.py",
             """\
             #!/usr/bin/env python3
+            import hashlib
             import pathlib
             import signal
             import sys
@@ -133,10 +157,22 @@ class MintRunShellTests(unittest.TestCase):
                     print("early_stop_lamports=25000000")
                     if diagnostic is not None:
                         print("diagnostic_mode=" + diagnostic)
+                        print("diagnostic_target=" + mint)
                         print(
-                            "diagnostic_config="
-                            "state/mint-runs/20260724T190000Z/"
-                            "selector-diagnostic.toml"
+                            "diagnostic_config_sha256="
+                            + hashlib.sha256(
+                                (
+                                    root
+                                    / "state/mint-runs/20260724T190000Z/"
+                                    "selector-diagnostic.toml"
+                                ).read_bytes()
+                            ).hexdigest()
+                        )
+                        print(
+                            "diagnostic_tokens_sha256="
+                            + hashlib.sha256(
+                                (root / "tokens.toml").read_bytes()
+                            ).hexdigest()
                         )
             elif command == "result-path":
                 if (root / "fail-result-path").exists():
@@ -184,6 +220,22 @@ class MintRunShellTests(unittest.TestCase):
                         or diagnostic_config.stat().st_mode & 0o777 != 0o600
                     ):
                         raise SystemExit(7)
+                    custom = root / "validate-output.txt"
+                    if custom.exists():
+                        print(custom.read_text(), end="")
+                    else:
+                        print("diagnostic_mode=d0")
+                        print("diagnostic_target=" + mint)
+                        print(
+                            "diagnostic_config_sha256="
+                            + hashlib.sha256(
+                                diagnostic_config.read_bytes()
+                            ).hexdigest()
+                        )
+                        print(
+                            "diagnostic_tokens_sha256="
+                            + hashlib.sha256(tokens).hexdigest()
+                        )
             elif command == "finalize":
                 (root / "finalize.called").write_text(" ".join(sys.argv))
                 if (root / "fail-finalize").exists():
@@ -231,6 +283,14 @@ class MintRunShellTests(unittest.TestCase):
 
     def guard_lock_fds(self):
         path = self.root / "run-guarded.lock-fds"
+        return path.read_text().splitlines() if path.exists() else []
+
+    def guard_lock_identities(self):
+        path = self.root / "run-guarded.lock-identities"
+        return path.read_text().splitlines() if path.exists() else []
+
+    def guard_lock_probe_statuses(self):
+        path = self.root / "run-guarded.lock-held"
         return path.read_text().splitlines() if path.exists() else []
 
     def test_declined_confirmation_never_runs_guard_and_restores(self):
@@ -305,11 +365,20 @@ class MintRunShellTests(unittest.TestCase):
                 "--live-confirmed --timeout 60 "
                 "--profile selector-diagnostic "
                 "--config state/mint-runs/20260724T190000Z/"
-                "selector-diagnostic.toml --test-mode"
+                "selector-diagnostic.toml --test-mode "
+                "--diagnostic-mode d0 "
+                f"--diagnostic-target {TARGET_MINT} "
+                f"--config-sha256 {DIAGNOSTIC_CONFIG_SHA256} "
+                f"--tokens-sha256 {DIAGNOSTIC_TOKENS_SHA256}"
             ],
         )
         self.assertEqual(len(self.guard_lock_fds()), 1)
         self.assertRegex(self.guard_lock_fds()[0], r"^[0-9]+$")
+        descriptor_identity, path_identity = (
+            self.guard_lock_identities()[0].split()
+        )
+        self.assertEqual(descriptor_identity, path_identity)
+        self.assertEqual(self.guard_lock_probe_statuses(), ["73"])
         self.assertEqual(
             [
                 line
@@ -326,6 +395,70 @@ class MintRunShellTests(unittest.TestCase):
             result.stdout + result.stderr,
         )
         self.assertTrue((self.root / "restore.called").exists())
+
+    def test_diagnostic_live_validation_must_repeat_prepared_contract(self):
+        (self.root / "validate-output.txt").write_text(
+            "diagnostic_mode=d0\n"
+            f"diagnostic_target={TARGET_MINT}\n"
+            f"diagnostic_config_sha256={DIAGNOSTIC_CONFIG_SHA256}\n"
+            f"diagnostic_tokens_sha256={'0' * 64}\n"
+        )
+
+        result = self.invoke(
+            f"DIAGNOSE {TARGET_MINT} FOR 60\n",
+            TARGET_MINT,
+            "--diagnostic",
+            "d0",
+            "--timeout",
+            "60",
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.guard_invocations(), [])
+        self.assertTrue((self.root / "restore.called").exists())
+
+    def test_diagnostic_prepare_contract_fields_must_be_unique(self):
+        base = (
+            "run_id=20260724T190000Z\n"
+            f"mint={TARGET_MINT}\n"
+            "timeout_seconds=60\n"
+            "cli_version=0.2.2\n"
+            "auto_mode=selector-diagnostic\n"
+            "preflight=deferred\n"
+            "loss_limit_lamports=30000000\n"
+            "early_stop_lamports=25000000\n"
+            "diagnostic_mode=d0\n"
+            f"diagnostic_target={TARGET_MINT}\n"
+            f"diagnostic_config_sha256={DIAGNOSTIC_CONFIG_SHA256}\n"
+            f"diagnostic_tokens_sha256={DIAGNOSTIC_TOKENS_SHA256}\n"
+        )
+        duplicate_lines = (
+            "diagnostic_mode=d0\n",
+            f"diagnostic_target={TARGET_MINT}\n",
+            f"diagnostic_config_sha256={DIAGNOSTIC_CONFIG_SHA256}\n",
+            f"diagnostic_tokens_sha256={DIAGNOSTIC_TOKENS_SHA256}\n",
+        )
+        for duplicate in duplicate_lines:
+            with self.subTest(field=duplicate.partition("=")[0]):
+                (self.root / "prepare-output.txt").write_text(
+                    base + duplicate
+                )
+                before = len(self.guard_invocations())
+                result = self.invoke(
+                    f"DIAGNOSE {TARGET_MINT} FOR 60\n",
+                    TARGET_MINT,
+                    "--diagnostic",
+                    "d0",
+                    "--timeout",
+                    "60",
+                )
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(len(self.guard_invocations()), before)
+                self.assertNotIn(
+                    DIAGNOSTIC_SENTINEL,
+                    result.stdout + result.stderr,
+                )
 
     def test_diagnostic_confirmation_is_single_use(self):
         exact = f"DIAGNOSE {TARGET_MINT} FOR 60"
@@ -512,6 +645,71 @@ class MintRunShellTests(unittest.TestCase):
         )
         self.assertTrue((self.root / "finalize.called").exists())
         self.assertTrue((self.root / "restore.called").exists())
+
+    def test_diagnostic_guard_status_is_exact_and_never_retried(self):
+        expected_launch = (
+            "--live-confirmed --timeout 60 "
+            "--profile selector-diagnostic "
+            "--config state/mint-runs/20260724T190000Z/"
+            "selector-diagnostic.toml --test-mode "
+            "--diagnostic-mode d0 "
+            f"--diagnostic-target {TARGET_MINT} "
+            f"--config-sha256 {DIAGNOSTIC_CONFIG_SHA256} "
+            f"--tokens-sha256 {DIAGNOSTIC_TOKENS_SHA256}"
+        )
+        for guard_status in (1, 23):
+            with self.subTest(guard_status=guard_status):
+                for name in (
+                    "run-guarded.args",
+                    "finalize.called",
+                    "restore.called",
+                    "helper.calls",
+                ):
+                    (self.root / name).unlink(missing_ok=True)
+                (
+                    self.root
+                    / "state/mint-runs/20260724T190000Z/guard-result.txt"
+                ).unlink(missing_ok=True)
+                self._write_guard(
+                    f"""\
+                    #!/usr/bin/env bash
+                    printf '%s\\n' "$*" >> run-guarded.args
+                    printf 'reason=diagnostic_loss_violation\\nduration_seconds=1\\nlog_path=logs/fake.log\\n'
+                    exit {guard_status}
+                    """
+                )
+
+                result = self.invoke(
+                    f"DIAGNOSE {TARGET_MINT} FOR 60\n",
+                    TARGET_MINT,
+                    "--diagnostic",
+                    "d0",
+                    "--timeout",
+                    "60",
+                )
+
+                self.assertEqual(
+                    result.returncode,
+                    guard_status,
+                    result.stderr,
+                )
+                self.assertEqual(
+                    self.guard_invocations(),
+                    [expected_launch],
+                )
+                self.assertEqual(
+                    self.helper_commands().count("finalize"),
+                    1,
+                )
+                self.assertEqual(
+                    self.helper_commands().count("prepare"),
+                    1,
+                )
+                self.assertIn(
+                    f"--guard-exit {guard_status}",
+                    (self.root / "finalize.called").read_text(),
+                )
+                self.assertTrue((self.root / "restore.called").exists())
 
     def test_guard_failure_has_priority_over_finalize_failure(self):
         (self.root / "fail-finalize").touch()

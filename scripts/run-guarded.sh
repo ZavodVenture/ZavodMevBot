@@ -6,7 +6,7 @@ root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 cd -- "$root"
 
 usage() {
-  echo 'Usage: run-guarded.sh --live-confirmed [--timeout 30..300] [--profile default|single-mint-auto] | run-guarded.sh --live-confirmed --timeout 30..300 --profile selector-diagnostic --config state/mint-runs/RUN_ID/selector-diagnostic.toml --test-mode' >&2
+  echo 'Usage: run-guarded.sh --live-confirmed [--timeout 30..300] [--profile default|single-mint-auto] | run-guarded.sh --live-confirmed --timeout 30..300 --profile selector-diagnostic --config state/mint-runs/RUN_ID/selector-diagnostic.toml --test-mode --diagnostic-mode d0 --diagnostic-target MINT --config-sha256 SHA256 --tokens-sha256 SHA256' >&2
   exit 64
 }
 
@@ -108,10 +108,18 @@ shift
 timeout_seconds=300
 profile=default
 config_path=config.toml
+diagnostic_mode=""
+diagnostic_target=""
+config_sha256=""
+tokens_sha256=""
 timeout_option_count=0
 profile_option_count=0
 config_option_count=0
 test_mode_count=0
+diagnostic_mode_count=0
+diagnostic_target_count=0
+config_sha256_count=0
+tokens_sha256_count=0
 while (( $# > 0 )); do
   case "$1" in
     --timeout)
@@ -136,6 +144,30 @@ while (( $# > 0 )); do
       (( test_mode_count += 1 ))
       shift
       ;;
+    --diagnostic-mode)
+      (( $# >= 2 )) || usage
+      diagnostic_mode="$2"
+      (( diagnostic_mode_count += 1 ))
+      shift 2
+      ;;
+    --diagnostic-target)
+      (( $# >= 2 )) || usage
+      diagnostic_target="$2"
+      (( diagnostic_target_count += 1 ))
+      shift 2
+      ;;
+    --config-sha256)
+      (( $# >= 2 )) || usage
+      config_sha256="$2"
+      (( config_sha256_count += 1 ))
+      shift 2
+      ;;
+    --tokens-sha256)
+      (( $# >= 2 )) || usage
+      tokens_sha256="$2"
+      (( tokens_sha256_count += 1 ))
+      shift 2
+      ;;
     *)
       usage
       ;;
@@ -157,12 +189,27 @@ if [[ "$profile" == "selector-diagnostic" ]]; then
     timeout_option_count == 1 &&
     profile_option_count == 1 &&
     config_option_count == 1 &&
-    test_mode_count == 1
+    test_mode_count == 1 &&
+    diagnostic_mode_count == 1 &&
+    diagnostic_target_count == 1 &&
+    config_sha256_count == 1 &&
+    tokens_sha256_count == 1
   )) || usage
+  [[ "$diagnostic_mode" == "d0" ]] || usage
+  [[ "$diagnostic_target" =~ ^[1-9A-HJ-NP-Za-km-z]{32,44}$ ]] || usage
+  [[ "$config_sha256" =~ ^[0-9a-f]{64}$ ]] || usage
+  [[ "$tokens_sha256" =~ ^[0-9a-f]{64}$ ]] || usage
   [[ "${ZAVOD_LIVE_LOCK_FD+x}" == "x" ]] || lock_failure
   validate_diagnostic_config_path
 else
-  (( config_option_count == 0 && test_mode_count == 0 )) || usage
+  ((
+    config_option_count == 0 &&
+    test_mode_count == 0 &&
+    diagnostic_mode_count == 0 &&
+    diagnostic_target_count == 0 &&
+    config_sha256_count == 0 &&
+    tokens_sha256_count == 0
+  )) || usage
 fi
 
 validate_lock_state_directory
@@ -182,7 +229,11 @@ if [[ "$profile" == "selector-diagnostic" ]]; then
     --config "$config_path" \
     --timeout-seconds "$timeout_seconds" \
     --profile selector-diagnostic \
-    --test-mode
+    --test-mode \
+    --diagnostic-mode "$diagnostic_mode" \
+    --diagnostic-target "$diagnostic_target" \
+    --config-sha256 "$config_sha256" \
+    --tokens-sha256 "$tokens_sha256"
 fi
 
 exec python3 scripts/zavod_guard.py run \

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import codecs
+import hashlib
 import json
 import os
 import re
@@ -36,6 +37,26 @@ PROFILE_SENDERS = {
 LOSS_LIMIT_LAMPORTS = 30_000_000
 EARLY_STOP_LAMPORTS = 25_000_000
 DEFAULT_TIMEOUT_SECONDS = 300
+TOKEN_PROGRAM_ID = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+TOKEN_2022_PROGRAM_ID = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+DISPATCH_SCAN_OVERLAP = 256
+TEST_MODE_DISPATCH_PATTERN = re.compile(
+    r"(?:\bTransaction\s+sent\s+successfully\b|"
+    r"\b(?:sending|dispatch(?:ing|ed)?)\s+"
+    r"(?:a\s+)?(?:transaction|bundle)\b)",
+    re.IGNORECASE,
+)
+DIAGNOSTIC_VIOLATION_REASONS = frozenset(
+    {
+        "cleanup_failed",
+        "diagnostic_loss_violation",
+        "input_integrity_violation",
+        "protected_output_violation",
+        "rpc_error",
+        "test_mode_dispatch_violation",
+        "token_account_growth_violation",
+    }
+)
 MANUAL_SINGLE_MINT = "FB44zC6s2jkysjaB2NC8u6XqwhPJwir1DYFzEhXbpump"
 MANUAL_SINGLE_POOLS = frozenset(
     {
@@ -60,6 +81,16 @@ MANUAL_SINGLE_LUTS = frozenset(
 
 
 class GuardError(RuntimeError):
+    pass
+
+
+class _GuardArgumentParser(argparse.ArgumentParser):
+    def error(self, message):
+        del message
+        raise GuardError("invalid command arguments")
+
+
+class _DiagnosticLaunchSkipped(RuntimeError):
     pass
 
 
@@ -402,13 +433,14 @@ def redact_text(text, config):
 
 
 class StreamingRedactor:
-    def __init__(self, sink, policy):
+    def __init__(self, sink, policy, on_protected=None):
         self.sink = sink
         self.policy = (
             policy
             if isinstance(policy, ProtectedOutputPolicy)
             else ProtectedOutputPolicy(policy)
         )
+        self.on_protected = on_protected
         self.buffer = ""
         self.closed = False
         self._discard_url = False
@@ -436,6 +468,11 @@ class StreamingRedactor:
             if kind == "url":
                 self._discard_url = False
 
+    def _write_redacted(self):
+        self.sink.write("<redacted>")
+        if self.on_protected is not None:
+            self.on_protected()
+
     def _drain_one(self, final=False):
         if not self.buffer:
             return False
@@ -450,20 +487,20 @@ class StreamingRedactor:
 
         for secret in self.policy.secrets:
             if self.buffer.startswith(secret):
-                self.sink.write("<redacted>")
+                self._write_redacted()
                 self.buffer = self.buffer[len(secret):]
                 return True
 
         url_scheme_match = self.policy.URL_SCHEME_PATTERN.match(self.buffer)
         if url_scheme_match is not None:
-            self.sink.write("<redacted>")
+            self._write_redacted()
             self.buffer = self.buffer[url_scheme_match.end():]
             self._discard_url = True
             return True
 
         uuid_match = self.policy.UUID_PATTERN.match(self.buffer)
         if uuid_match is not None:
-            self.sink.write("<redacted>")
+            self._write_redacted()
             self.buffer = self.buffer[uuid_match.end():]
             return True
 
@@ -479,7 +516,7 @@ class StreamingRedactor:
                 if token_complete:
                     token = self.buffer[:signature_end]
                     if self.policy.is_signature_token(token):
-                        self.sink.write("<redacted>")
+                        self._write_redacted()
                         self.buffer = self.buffer[signature_end:]
                         return True
 
@@ -511,12 +548,14 @@ class StreamingRedactor:
 class OutputPump:
     def __init__(self, source, sink, config, test_mode=False):
         self.source = source
+        self.output_error_event = threading.Event()
+        self.protected_output_event = threading.Event()
+        self.test_mode_dispatch_event = threading.Event()
         self.redactor = StreamingRedactor(
             sink,
             ProtectedOutputPolicy.from_config(config),
+            on_protected=self.protected_output_event.set,
         )
-        self.output_error_event = threading.Event()
-        self.test_mode_dispatch_event = threading.Event()
         self.test_mode = test_mode
         self._dispatch_buffer = ""
         self.stop_event = threading.Event()
@@ -546,16 +585,12 @@ class OutputPump:
                     chunk = self.decoder.decode(chunk, final=False)
                 if chunk:
                     if self.test_mode:
-                        self._dispatch_buffer = (
-                            self._dispatch_buffer + chunk
-                        )[-256:]
-                        if re.search(
-                            r"\b(?:sending|dispatch(?:ing|ed)?)\s+"
-                            r"(?:a\s+)?(?:transaction|bundle)\b",
-                            self._dispatch_buffer,
-                            re.IGNORECASE,
-                        ):
+                        dispatch_text = self._dispatch_buffer + chunk
+                        if TEST_MODE_DISPATCH_PATTERN.search(dispatch_text):
                             self.test_mode_dispatch_event.set()
+                        self._dispatch_buffer = dispatch_text[
+                            -DISPATCH_SCAN_OVERLAP:
+                        ]
                     self.redactor.feed(chunk)
         except Exception:
             self.output_error_event.set()
@@ -635,6 +670,68 @@ def get_balance_lamports(rpc_url, pubkey, transport=None):
         return value
     except Exception as exc:
         raise GuardError("RPC balance check failed") from exc
+
+
+def validate_token_mint_account(rpc_url, mint, transport=None):
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getAccountInfo",
+        "params": [
+            mint,
+            {"encoding": "jsonParsed", "commitment": "confirmed"},
+        ],
+    }
+    try:
+        if len(base58_decode(mint)) != 32:
+            raise ValueError("invalid mint identity")
+        body = (transport or _http_transport)(rpc_url, payload, 5)
+        value = body["result"]["value"]
+        parsed = value["data"]["parsed"] if value is not None else None
+        if (
+            not isinstance(value, dict)
+            or value.get("executable") is not False
+            or value.get("owner")
+            not in (TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID)
+            or not isinstance(parsed, dict)
+            or parsed.get("type") != "mint"
+            or parsed.get("info", {}).get("isInitialized") is not True
+        ):
+            raise ValueError("invalid token mint")
+    except Exception as exc:
+        raise GuardError("RPC mint-account check failed") from exc
+
+
+def get_token_account_pubkeys(rpc_url, pubkey, transport=None):
+    accounts = set()
+    try:
+        for program_id in (TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID):
+            payload = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "getTokenAccountsByOwner",
+                "params": [
+                    pubkey,
+                    {"programId": program_id},
+                    {"encoding": "base64", "commitment": "confirmed"},
+                ],
+            }
+            body = (transport or _http_transport)(
+                rpc_url,
+                payload,
+                5,
+            )
+            values = body["result"]["value"]
+            if not isinstance(values, list):
+                raise ValueError("invalid token accounts")
+            for value in values:
+                account = value.get("pubkey") if isinstance(value, dict) else None
+                if not isinstance(account, str) or not account:
+                    raise ValueError("invalid token account")
+                accounts.add(account)
+        return frozenset(accounts)
+    except Exception as exc:
+        raise GuardError("RPC token-account check failed") from exc
 
 
 def should_stop_for_loss(start_balance, current_balance):
@@ -792,17 +889,44 @@ def supervise(
     monotonic,
     sleep,
     output_error_event=None,
+    input_integrity_checker=None,
+    protected_output_event=None,
+    starting_token_accounts=None,
     test_mode_dispatch_event=None,
+    token_account_reader=None,
     killpg=os.killpg,
     group_exists=None,
     signal_grace=DEFAULT_SIGNAL_GRACE,
     timeout_seconds=DEFAULT_TIMEOUT_SECONDS,
     cleanup_child=True,
     operator_signal_event=None,
+    diagnostic=False,
 ):
     end_balance = start_balance
     reason = None
     exit_code = None
+    dispatch_watcher_stop = threading.Event()
+    dispatch_watcher = None
+    if test_mode_dispatch_event is not None and not cleanup_child:
+        def stop_on_dispatch():
+            while not dispatch_watcher_stop.is_set():
+                if not test_mode_dispatch_event.wait(0.01):
+                    continue
+                if dispatch_watcher_stop.is_set():
+                    return
+                try:
+                    killpg(child.pid, signal.SIGINT)
+                except ProcessLookupError:
+                    pass
+                except OSError:
+                    pass
+                return
+
+        dispatch_watcher = threading.Thread(
+            target=stop_on_dispatch,
+            daemon=True,
+        )
+        dispatch_watcher.start()
     try:
         started_at = monotonic()
         while reason is None:
@@ -813,10 +937,24 @@ def supervise(
                 reason = "operator_signal"
                 break
             if (
+                diagnostic
+                and input_integrity_checker is not None
+                and not input_integrity_checker()
+            ):
+                reason = "input_integrity_violation"
+                break
+            if (
                 test_mode_dispatch_event is not None
                 and test_mode_dispatch_event.is_set()
             ):
                 reason = "test_mode_dispatch_violation"
+                break
+            if (
+                diagnostic
+                and protected_output_event is not None
+                and protected_output_event.is_set()
+            ):
+                reason = "protected_output_violation"
                 break
             if output_error_event is not None and output_error_event.is_set():
                 reason = "output_error"
@@ -834,13 +972,49 @@ def supervise(
             except GuardError:
                 reason = "rpc_error"
                 break
-            if should_stop_for_loss(start_balance, end_balance):
+            if diagnostic and start_balance - end_balance > 0:
+                reason = "diagnostic_loss_violation"
+                break
+            if not diagnostic and should_stop_for_loss(
+                start_balance,
+                end_balance,
+            ):
                 reason = "loss_threshold"
                 break
+            if (
+                diagnostic
+                and token_account_reader is not None
+                and starting_token_accounts is not None
+            ):
+                try:
+                    current_token_accounts = token_account_reader()
+                    if (
+                        not isinstance(
+                            current_token_accounts,
+                            (set, frozenset),
+                        )
+                        or any(
+                            not isinstance(account, str) or not account
+                            for account in current_token_accounts
+                        )
+                    ):
+                        raise GuardError("invalid token-account snapshot")
+                except Exception:
+                    reason = "rpc_error"
+                    break
+                if (
+                    set(current_token_accounts)
+                    - set(starting_token_accounts)
+                ):
+                    reason = "token_account_growth_violation"
+                    break
             sleep(1)
     except KeyboardInterrupt:
         reason = "operator_signal"
     finally:
+        dispatch_watcher_stop.set()
+        if dispatch_watcher is not None:
+            dispatch_watcher.join(1)
         if cleanup_child:
             cleanup = _verified_shutdown(
                 child,
@@ -852,9 +1026,10 @@ def supervise(
                 exit_code = cleanup["exit_code"]
             if not cleanup["group_absent"]:
                 reason = "cleanup_failed"
-            elif cleanup["interrupted"] and reason not in (
-                "output_error",
-                "test_mode_dispatch_violation",
+            elif (
+                cleanup["interrupted"]
+                and reason not in DIAGNOSTIC_VIOLATION_REASONS
+                and reason != "output_error"
             ):
                 reason = "operator_signal"
     return {
@@ -885,6 +1060,53 @@ def _cli_version(binary):
 
 def _selector_diagnostic_error(message="private path is invalid"):
     return GuardError(f"selector-diagnostic {message}")
+
+
+def _selector_input_integrity_error():
+    return GuardError("selector-diagnostic input integrity violation")
+
+
+def _validate_selector_launch_contract(
+    profile,
+    test_mode,
+    diagnostic_mode,
+    diagnostic_target,
+    diagnostic_config_sha256,
+    diagnostic_tokens_sha256,
+):
+    contract_values = (
+        diagnostic_mode,
+        diagnostic_target,
+        diagnostic_config_sha256,
+        diagnostic_tokens_sha256,
+    )
+    if profile != "selector-diagnostic" or not test_mode:
+        if any(value is not None for value in contract_values):
+            raise GuardError("selector-diagnostic launch contract is invalid")
+        return
+    try:
+        if (
+            diagnostic_mode != "d0"
+            or not isinstance(diagnostic_target, str)
+            or len(base58_decode(diagnostic_target)) != 32
+            or not isinstance(diagnostic_config_sha256, str)
+            or re.fullmatch(
+                r"[0-9a-f]{64}",
+                diagnostic_config_sha256,
+            )
+            is None
+            or not isinstance(diagnostic_tokens_sha256, str)
+            or re.fullmatch(
+                r"[0-9a-f]{64}",
+                diagnostic_tokens_sha256,
+            )
+            is None
+        ):
+            raise ValueError("invalid launch contract")
+    except (GuardError, TypeError, ValueError) as exc:
+        raise GuardError(
+            "selector-diagnostic launch contract is invalid"
+        ) from exc
 
 
 def _validate_owned_descriptor(descriptor, kind, mode=None):
@@ -939,6 +1161,132 @@ def _read_descriptor_bytes(descriptor):
         return b"".join(chunks)
     except OSError as exc:
         raise _selector_diagnostic_error("config is unreadable") from exc
+
+
+def _require_descriptor_bytes(
+    descriptor,
+    expected_sha256,
+    expected_bytes=None,
+):
+    try:
+        data = _read_descriptor_bytes(descriptor)
+    except GuardError as exc:
+        raise _selector_input_integrity_error() from exc
+    if (
+        hashlib.sha256(data).hexdigest() != expected_sha256
+        or (expected_bytes is not None and data != expected_bytes)
+    ):
+        raise _selector_input_integrity_error()
+    return data
+
+
+def _open_selector_diagnostic_tokens(
+    workspace_root,
+    target,
+    expected_sha256,
+):
+    root = Path(workspace_root).absolute()
+    root_descriptor = None
+    tokens_descriptor = None
+    try:
+        directory_flags = (
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        root_descriptor = os.open(root, directory_flags)
+        root_identity = _validate_owned_descriptor(
+            root_descriptor,
+            "directory",
+        )
+        tokens_descriptor = _open_owned_relative(
+            root_descriptor,
+            "tokens.toml",
+            "file",
+            mode=0o600,
+        )
+        expected_bytes = f'tokens = ["{target}"]\n'.encode()
+        _require_descriptor_bytes(
+            tokens_descriptor,
+            expected_sha256,
+            expected_bytes=expected_bytes,
+        )
+        tokens_identity = _validate_owned_descriptor(
+            tokens_descriptor,
+            "file",
+            mode=0o600,
+        )
+        held_descriptor = tokens_descriptor
+        tokens_descriptor = None
+        return (
+            held_descriptor,
+            expected_bytes,
+            (root_identity.st_dev, root_identity.st_ino),
+            (tokens_identity.st_dev, tokens_identity.st_ino),
+        )
+    except (GuardError, OSError) as exc:
+        raise _selector_input_integrity_error() from exc
+    finally:
+        if tokens_descriptor is not None:
+            os.close(tokens_descriptor)
+        if root_descriptor is not None:
+            os.close(root_descriptor)
+
+
+def _selector_tokens_path_matches(
+    workspace_root,
+    expected_root_identity,
+    expected_tokens_identity,
+    expected_sha256,
+    expected_bytes,
+):
+    root_descriptor = None
+    tokens_descriptor = None
+    try:
+        root_descriptor = os.open(
+            workspace_root,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        root_identity = _validate_owned_descriptor(
+            root_descriptor,
+            "directory",
+        )
+        if (
+            root_identity.st_dev,
+            root_identity.st_ino,
+        ) != expected_root_identity:
+            return False
+        tokens_descriptor = _open_owned_relative(
+            root_descriptor,
+            "tokens.toml",
+            "file",
+            mode=0o600,
+        )
+        tokens_identity = _validate_owned_descriptor(
+            tokens_descriptor,
+            "file",
+            mode=0o600,
+        )
+        if (
+            tokens_identity.st_dev,
+            tokens_identity.st_ino,
+        ) != expected_tokens_identity:
+            return False
+        _require_descriptor_bytes(
+            tokens_descriptor,
+            expected_sha256,
+            expected_bytes=expected_bytes,
+        )
+        return True
+    except (GuardError, OSError):
+        return False
+    finally:
+        if tokens_descriptor is not None:
+            os.close(tokens_descriptor)
+        if root_descriptor is not None:
+            os.close(root_descriptor)
 
 
 def _open_selector_diagnostic_config(workspace_root, requested_path):
@@ -1092,6 +1440,12 @@ def run_guarded(
     profile="default",
     test_mode=False,
     workspace_root=None,
+    diagnostic_mode=None,
+    diagnostic_target=None,
+    diagnostic_config_sha256=None,
+    diagnostic_tokens_sha256=None,
+    token_account_snapshot_reader=None,
+    mint_account_validator=None,
 ):
     if (
         isinstance(timeout_seconds, bool)
@@ -1103,7 +1457,21 @@ def run_guarded(
         raise GuardError(
             "selector-diagnostic profile and test mode must be provided together"
         )
+    _validate_selector_launch_contract(
+        profile,
+        test_mode,
+        diagnostic_mode,
+        diagnostic_target,
+        diagnostic_config_sha256,
+        diagnostic_tokens_sha256,
+    )
     diagnostic_config_descriptor = None
+    diagnostic_tokens_descriptor = None
+    diagnostic_tokens_bytes = None
+    diagnostic_root_identity = None
+    diagnostic_tokens_identity = None
+    input_integrity_checker = None
+    starting_token_accounts = None
     try:
         if profile == "selector-diagnostic":
             root, diagnostic_config_descriptor = (
@@ -1112,12 +1480,24 @@ def run_guarded(
                     config_path,
                 )
             )
+            config_bytes = _require_descriptor_bytes(
+                diagnostic_config_descriptor,
+                diagnostic_config_sha256,
+            )
+            (
+                diagnostic_tokens_descriptor,
+                diagnostic_tokens_bytes,
+                diagnostic_root_identity,
+                diagnostic_tokens_identity,
+            ) = _open_selector_diagnostic_tokens(
+                root,
+                diagnostic_target,
+                diagnostic_tokens_sha256,
+            )
             config_path = Path(
                 f"/proc/self/fd/{diagnostic_config_descriptor}"
             )
-            config = load_config_bytes(
-                _read_descriptor_bytes(diagnostic_config_descriptor)
-            )
+            config = load_config_bytes(config_bytes)
         else:
             config_path = Path(config_path).resolve()
             root = Path(workspace_root or config_path.parent).resolve()
@@ -1155,6 +1535,8 @@ def run_guarded(
     except BaseException:
         if diagnostic_config_descriptor is not None:
             os.close(diagnostic_config_descriptor)
+        if diagnostic_tokens_descriptor is not None:
+            os.close(diagnostic_tokens_descriptor)
         raise
 
     def interrupt_handler(signum, frame):
@@ -1167,6 +1549,63 @@ def run_guarded(
         signal.signal(signal.SIGTERM, interrupt_handler)
         command = [str(root / "zavod-mev-bot-rust-version-cli"), "run"]
         if test_mode:
+            config_bytes = _require_descriptor_bytes(
+                diagnostic_config_descriptor,
+                diagnostic_config_sha256,
+            )
+            launch_config = load_config_bytes(config_bytes)
+            if validate_selector_diagnostic(launch_config):
+                raise _selector_input_integrity_error()
+            _require_descriptor_bytes(
+                diagnostic_tokens_descriptor,
+                diagnostic_tokens_sha256,
+                expected_bytes=diagnostic_tokens_bytes,
+            )
+            input_integrity_checker = lambda: _selector_tokens_path_matches(
+                root,
+                diagnostic_root_identity,
+                diagnostic_tokens_identity,
+                diagnostic_tokens_sha256,
+                diagnostic_tokens_bytes,
+            )
+            if not input_integrity_checker():
+                raise _selector_input_integrity_error()
+            try:
+                account_snapshot_reader = (
+                    token_account_snapshot_reader
+                    or get_token_account_pubkeys
+                )
+                (mint_account_validator or validate_token_mint_account)(
+                    rpc_url,
+                    diagnostic_target,
+                )
+                starting_token_accounts = account_snapshot_reader(
+                    rpc_url,
+                    public_key,
+                )
+            except Exception:
+                result = {
+                    "reason": "rpc_error",
+                    "start_balance": start_balance,
+                    "end_balance": start_balance,
+                    "observed_loss": 0,
+                    "child_exit_code": None,
+                }
+                raise _DiagnosticLaunchSkipped()
+            config_bytes = _require_descriptor_bytes(
+                diagnostic_config_descriptor,
+                diagnostic_config_sha256,
+            )
+            launch_config = load_config_bytes(config_bytes)
+            if validate_selector_diagnostic(launch_config):
+                raise _selector_input_integrity_error()
+            _require_descriptor_bytes(
+                diagnostic_tokens_descriptor,
+                diagnostic_tokens_sha256,
+                expected_bytes=diagnostic_tokens_bytes,
+            )
+            if not input_integrity_checker():
+                raise _selector_input_integrity_error()
             command.extend(["--config", str(config_path), "--test-mode"])
         popen_arguments = {
             "cwd": root,
@@ -1175,7 +1614,10 @@ def run_guarded(
             "start_new_session": True,
         }
         if diagnostic_config_descriptor is not None:
-            popen_arguments["pass_fds"] = (diagnostic_config_descriptor,)
+            popen_arguments["pass_fds"] = (
+                diagnostic_config_descriptor,
+                diagnostic_tokens_descriptor,
+            )
         child = subprocess.Popen(command, **popen_arguments)
         if operator_signal_event.is_set():
             result = {
@@ -1210,11 +1652,21 @@ def run_guarded(
                     monotonic=time.monotonic,
                     sleep=time.sleep,
                     output_error_event=pump.output_error_event,
+                    input_integrity_checker=input_integrity_checker,
+                    protected_output_event=pump.protected_output_event,
+                    starting_token_accounts=starting_token_accounts,
                     test_mode_dispatch_event=pump.test_mode_dispatch_event,
+                    token_account_reader=lambda: account_snapshot_reader(
+                        rpc_url,
+                        public_key,
+                    ),
                     timeout_seconds=timeout_seconds,
                     cleanup_child=False,
                     operator_signal_event=operator_signal_event,
+                    diagnostic=test_mode,
                 )
+    except _DiagnosticLaunchSkipped:
+        pass
     except KeyboardInterrupt:
         result = {
             "reason": "operator_signal",
@@ -1227,6 +1679,9 @@ def run_guarded(
         if diagnostic_config_descriptor is not None:
             os.close(diagnostic_config_descriptor)
             diagnostic_config_descriptor = None
+        if diagnostic_tokens_descriptor is not None:
+            os.close(diagnostic_tokens_descriptor)
+            diagnostic_tokens_descriptor = None
         cleanup = (
             _verified_shutdown(child)
             if child is not None
@@ -1302,15 +1757,24 @@ def run_guarded(
         and pump.test_mode_dispatch_event.is_set()
     ):
         result["reason"] = "test_mode_dispatch_violation"
+    elif (
+        test_mode
+        and pump is not None
+        and pump.protected_output_event.is_set()
+    ):
+        result["reason"] = "protected_output_violation"
     elif pump is not None and (
         pump.output_error_event.is_set()
         or (pump_started and pump.is_alive())
     ):
         result["reason"] = "output_error"
     elif (
-        operator_signal_event.is_set()
-        or cleanup["interrupted"]
-        or finalization_interrupted
+        result.get("reason") not in DIAGNOSTIC_VIOLATION_REASONS
+        and (
+            operator_signal_event.is_set()
+            or cleanup["interrupted"]
+            or finalization_interrupted
+        )
     ):
         result["reason"] = "operator_signal"
     result["duration_seconds"] = round(time.monotonic() - started, 3)
@@ -1350,8 +1814,14 @@ def _print_run_result(result):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Secret-safe Zavod operations guard")
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    parser = _GuardArgumentParser(
+        description="Secret-safe Zavod operations guard"
+    )
+    subparsers = parser.add_subparsers(
+        dest="command",
+        required=True,
+        parser_class=_GuardArgumentParser,
+    )
     preflight_parser = subparsers.add_parser("preflight")
     preflight_parser.add_argument("--config", default="config.toml")
     preflight_parser.add_argument("--profile", default="default")
@@ -1361,27 +1831,70 @@ def main(argv=None):
     run_parser.add_argument("--profile", default="default")
     run_parser.add_argument("--test-mode", action="store_true")
     run_parser.add_argument("--live-confirmed", action="store_true")
-    args = parser.parse_args(argv)
+    run_parser.add_argument("--diagnostic-mode", action="append")
+    run_parser.add_argument("--diagnostic-target", action="append")
+    run_parser.add_argument("--config-sha256", action="append")
+    run_parser.add_argument("--tokens-sha256", action="append")
     try:
+        args = parser.parse_args(argv)
         if args.command == "preflight":
             _print_summary(preflight(args.config, profile=args.profile))
             return 0
         if args.command == "run":
             if not args.live_confirmed:
                 raise GuardError("live confirmation is required")
-            _print_run_result(
-                run_guarded(
-                    args.config,
-                    args.timeout_seconds,
-                    args.profile,
-                    test_mode=args.test_mode,
-                    workspace_root=(
-                        Path(__file__).resolve().parents[1]
-                        if args.test_mode
-                        else None
-                    ),
-                )
+            diagnostic_contract = (
+                args.diagnostic_mode,
+                args.diagnostic_target,
+                args.config_sha256,
+                args.tokens_sha256,
             )
+            if args.profile == "selector-diagnostic" and args.test_mode:
+                if any(
+                    values is None or len(values) != 1
+                    for values in diagnostic_contract
+                ):
+                    raise GuardError(
+                        "selector-diagnostic launch contract is invalid"
+                    )
+                (
+                    diagnostic_mode,
+                    diagnostic_target,
+                    diagnostic_config_sha256,
+                    diagnostic_tokens_sha256,
+                ) = tuple(values[0] for values in diagnostic_contract)
+            else:
+                if any(values is not None for values in diagnostic_contract):
+                    raise GuardError(
+                        "selector-diagnostic launch contract is invalid"
+                    )
+                (
+                    diagnostic_mode,
+                    diagnostic_target,
+                    diagnostic_config_sha256,
+                    diagnostic_tokens_sha256,
+                ) = (None, None, None, None)
+            result = run_guarded(
+                args.config,
+                args.timeout_seconds,
+                args.profile,
+                test_mode=args.test_mode,
+                workspace_root=(
+                    Path(__file__).resolve().parents[1]
+                    if args.test_mode
+                    else None
+                ),
+                diagnostic_mode=diagnostic_mode,
+                diagnostic_target=diagnostic_target,
+                diagnostic_config_sha256=diagnostic_config_sha256,
+                diagnostic_tokens_sha256=diagnostic_tokens_sha256,
+            )
+            _print_run_result(result)
+            if (
+                args.test_mode
+                and result.get("reason") in DIAGNOSTIC_VIOLATION_REASONS
+            ):
+                return 1
             return 0
     except GuardError as exc:
         print(f"status=failed\nerror={exc}", file=os.sys.stderr)

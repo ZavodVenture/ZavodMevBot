@@ -1,5 +1,6 @@
 import copy
 import fcntl
+import hashlib
 import io
 import json
 import os
@@ -10,10 +11,11 @@ import tempfile
 import threading
 import time
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from scripts import zavod_guard
+from scripts import mint_runner, zavod_guard
 from scripts.zavod_guard import (
     EARLY_STOP_LAMPORTS,
     GuardError,
@@ -30,6 +32,8 @@ from scripts.zavod_guard import (
 
 
 MANUAL_MINT = "FB44zC6s2jkysjaB2NC8u6XqwhPJwir1DYFzEhXbpump"
+DIAGNOSTIC_TARGET = "So11111111111111111111111111111111111111112"
+CONTROL_MINT = "11111111111111111111111111111111"
 MANUAL_POOLS = (
     "8dxAgMTRUmCMVProMisWFS26EgiJwbMoiwfMZNeopSQZ",
     "7CTjvXcZhm2R5CvUXn3SyAKWvZtz2ZgNtv4f8BoBv57K",
@@ -390,6 +394,152 @@ class RpcTests(unittest.TestCase):
             get_balance_lamports(f"https://rpc.invalid/{sentinel}", "pubkey", transport)
         self.assertNotIn(sentinel, str(caught.exception))
 
+    def test_token_account_snapshot_returns_exact_public_key_union(self):
+        observed_programs = []
+
+        def transport(url, payload, timeout):
+            del url
+            self.assertEqual(payload["method"], "getTokenAccountsByOwner")
+            self.assertEqual(timeout, 5)
+            program = payload["params"][1]["programId"]
+            observed_programs.append(program)
+            suffix = "legacy" if program == zavod_guard.TOKEN_PROGRAM_ID else "2022"
+            return {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "value": [
+                        {"pubkey": "shared-account"},
+                        {"pubkey": f"{suffix}-account"},
+                    ]
+                },
+            }
+
+        try:
+            accounts = zavod_guard.get_token_account_pubkeys(
+                "https://rpc.invalid",
+                "wallet-public-key",
+                transport,
+            )
+        except AttributeError as exc:
+            self.fail(f"token-account snapshot is unavailable: {exc}")
+
+        self.assertEqual(
+            accounts,
+            frozenset(
+                {
+                    "shared-account",
+                    "legacy-account",
+                    "2022-account",
+                }
+            ),
+        )
+        self.assertEqual(
+            observed_programs,
+            [
+                zavod_guard.TOKEN_PROGRAM_ID,
+                zavod_guard.TOKEN_2022_PROGRAM_ID,
+            ],
+        )
+
+    def test_token_mint_validation_uses_read_only_fake_rpc(self):
+        observed = []
+
+        def transport(url, payload, timeout):
+            observed.append((url, payload, timeout))
+            return {
+                "result": {
+                    "value": {
+                        "executable": False,
+                        "owner": zavod_guard.TOKEN_2022_PROGRAM_ID,
+                        "data": {
+                            "parsed": {
+                                "type": "mint",
+                                "info": {"isInitialized": True},
+                            }
+                        },
+                    }
+                }
+            }
+
+        try:
+            zavod_guard.validate_token_mint_account(
+                "https://fixture.invalid",
+                DIAGNOSTIC_TARGET,
+                transport=transport,
+            )
+        except AttributeError as exc:
+            self.fail(f"guarded mint validation is missing: {exc}")
+
+        self.assertEqual(len(observed), 1)
+        _url, payload, timeout = observed[0]
+        self.assertEqual(payload["method"], "getAccountInfo")
+        self.assertEqual(
+            payload["params"],
+            [
+                DIAGNOSTIC_TARGET,
+                {"encoding": "jsonParsed", "commitment": "confirmed"},
+            ],
+        )
+        self.assertEqual(timeout, 5)
+
+        invalid_values = (
+            None,
+            {
+                "executable": True,
+                "owner": zavod_guard.TOKEN_PROGRAM_ID,
+                "data": {
+                    "parsed": {
+                        "type": "mint",
+                        "info": {"isInitialized": True},
+                    }
+                },
+            },
+            {
+                "executable": False,
+                "owner": "invalid-owner",
+                "data": {
+                    "parsed": {
+                        "type": "mint",
+                        "info": {"isInitialized": True},
+                    }
+                },
+            },
+            {
+                "executable": False,
+                "owner": zavod_guard.TOKEN_PROGRAM_ID,
+                "data": {
+                    "parsed": {
+                        "type": "account",
+                        "info": {"isInitialized": True},
+                    }
+                },
+            },
+            {
+                "executable": False,
+                "owner": zavod_guard.TOKEN_PROGRAM_ID,
+                "data": {
+                    "parsed": {
+                        "type": "mint",
+                        "info": {"isInitialized": False},
+                    }
+                },
+            },
+        )
+        for value in invalid_values:
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(
+                    GuardError,
+                    "^RPC mint-account check failed$",
+                ):
+                    zavod_guard.validate_token_mint_account(
+                        "https://fixture.invalid",
+                        DIAGNOSTIC_TARGET,
+                        transport=lambda *_args, value=value: {
+                            "result": {"value": value}
+                        },
+                    )
+
 
 class PreflightTests(unittest.TestCase):
     def test_load_config_rejects_invalid_toml_without_echoing_content(self):
@@ -486,6 +636,194 @@ class SupervisorTests(unittest.TestCase):
         self.assertEqual(result["reason"], "loss_threshold")
         self.assertEqual(result["end_balance"], 75_000_000)
         self.assertEqual(signals[0], (4321, signal.SIGINT))
+
+    def test_diagnostic_stops_on_any_positive_loss_without_changing_live_limit(self):
+        diagnostic = supervise(
+            child=FakeChild(poll_values=[None, 0]),
+            start_balance=100_000_000,
+            balance_reader=lambda: 99_999_999,
+            monotonic=iter([0, 1]).__next__,
+            sleep=lambda seconds: None,
+            killpg=lambda pid, sig: None,
+            group_exists=Mock(side_effect=[True, False]),
+            signal_grace=((signal.SIGINT, 0),),
+            timeout_seconds=300,
+            diagnostic=True,
+        )
+        live = supervise(
+            child=FakeChild(poll_values=[None, 0]),
+            start_balance=100_000_000,
+            balance_reader=lambda: 99_999_999,
+            monotonic=iter([0, 1]).__next__,
+            sleep=lambda seconds: None,
+            killpg=lambda pid, sig: None,
+            group_exists=lambda pid: False,
+            timeout_seconds=300,
+        )
+
+        self.assertEqual(
+            diagnostic["reason"],
+            "diagnostic_loss_violation",
+        )
+        self.assertEqual(diagnostic["observed_loss"], 1)
+        self.assertEqual(live["reason"], "child_exit")
+
+    def test_diagnostic_stops_on_token_account_growth(self):
+        try:
+            result = supervise(
+                child=FakeChild(),
+                start_balance=100_000_000,
+                balance_reader=lambda: 100_000_000,
+                token_account_reader=lambda: frozenset(
+                    {"existing-account", "new-account"}
+                ),
+                starting_token_accounts=frozenset({"existing-account"}),
+                monotonic=iter([0, 1]).__next__,
+                sleep=lambda seconds: None,
+                killpg=lambda pid, sig: None,
+                group_exists=Mock(side_effect=[True, False]),
+                signal_grace=((signal.SIGINT, 0),),
+                timeout_seconds=300,
+                diagnostic=True,
+            )
+        except TypeError as exc:
+            self.fail(f"token-account growth is not supervised: {exc}")
+        self.assertEqual(
+            result["reason"],
+            "token_account_growth_violation",
+        )
+
+    def test_diagnostic_token_account_rpc_failure_is_generic_rpc_error(self):
+        def failed_snapshot():
+            raise GuardError("fixture detail must not survive")
+
+        try:
+            result = supervise(
+                child=FakeChild(),
+                start_balance=100_000_000,
+                balance_reader=lambda: 100_000_000,
+                token_account_reader=failed_snapshot,
+                starting_token_accounts=frozenset({"existing-account"}),
+                monotonic=iter([0, 1]).__next__,
+                sleep=lambda seconds: None,
+                killpg=lambda pid, sig: None,
+                group_exists=Mock(side_effect=[True, False]),
+                signal_grace=((signal.SIGINT, 0),),
+                timeout_seconds=300,
+                diagnostic=True,
+            )
+        except TypeError as exc:
+            self.fail(f"token-account RPC failure is not supervised: {exc}")
+        self.assertEqual(result["reason"], "rpc_error")
+        self.assertNotIn("fixture detail", str(result))
+
+    def test_diagnostic_allows_zero_loss_and_account_removal(self):
+        result = supervise(
+            child=FakeChild(poll_values=[None, 0]),
+            start_balance=100_000_000,
+            balance_reader=lambda: 100_000_000,
+            token_account_reader=lambda: frozenset({"remaining-account"}),
+            starting_token_accounts=frozenset(
+                {"remaining-account", "removed-account"}
+            ),
+            monotonic=iter([0, 1]).__next__,
+            sleep=lambda seconds: None,
+            killpg=lambda pid, sig: None,
+            group_exists=lambda pid: False,
+            timeout_seconds=300,
+            diagnostic=True,
+        )
+
+        self.assertEqual(result["reason"], "child_exit")
+        self.assertEqual(result["observed_loss"], 0)
+
+    def test_diagnostic_violation_survives_interrupted_successful_cleanup(self):
+        cases = (
+            (
+                "diagnostic_loss_violation",
+                {"balance_reader": lambda: 99_999_999},
+            ),
+            (
+                "token_account_growth_violation",
+                {
+                    "balance_reader": lambda: 100_000_000,
+                    "token_account_reader": lambda: frozenset(
+                        {"existing-account", "new-account"}
+                    ),
+                    "starting_token_accounts": frozenset(
+                        {"existing-account"}
+                    ),
+                },
+            ),
+        )
+        for expected, overrides in cases:
+            with self.subTest(reason=expected):
+                with patch.object(
+                    zavod_guard,
+                    "_verified_shutdown",
+                    return_value={
+                        "exit_code": 0,
+                        "group_absent": True,
+                        "interrupted": True,
+                    },
+                ):
+                    result = supervise(
+                        child=FakeChild(),
+                        start_balance=100_000_000,
+                        monotonic=iter([0, 1]).__next__,
+                        sleep=lambda seconds: None,
+                        timeout_seconds=300,
+                        diagnostic=True,
+                        **overrides,
+                    )
+
+                self.assertEqual(result["reason"], expected)
+
+    def test_dispatch_signals_process_group_while_balance_rpc_is_blocked(self):
+        dispatch_event = threading.Event()
+        balance_entered = threading.Event()
+        release_balance = threading.Event()
+        signal_sent = threading.Event()
+        result_holder = {}
+
+        def blocked_balance():
+            balance_entered.set()
+            release_balance.wait(2)
+            return 100_000_000
+
+        def record_signal(pid, selected_signal):
+            self.assertEqual(pid, 4321)
+            self.assertEqual(selected_signal, signal.SIGINT)
+            signal_sent.set()
+
+        def run_supervisor():
+            result_holder["result"] = supervise(
+                child=FakeChild(poll_values=[None, 0]),
+                start_balance=100_000_000,
+                balance_reader=blocked_balance,
+                monotonic=iter([0, 1]).__next__,
+                sleep=lambda seconds: None,
+                test_mode_dispatch_event=dispatch_event,
+                killpg=record_signal,
+                timeout_seconds=300,
+                cleanup_child=False,
+                diagnostic=True,
+            )
+
+        worker = threading.Thread(target=run_supervisor)
+        worker.start()
+        self.assertTrue(balance_entered.wait(1))
+        dispatch_event.set()
+        prompt_signal = signal_sent.wait(0.25)
+        release_balance.set()
+        worker.join(2)
+
+        self.assertFalse(worker.is_alive())
+        self.assertTrue(prompt_signal)
+        self.assertEqual(
+            result_holder["result"]["reason"],
+            "test_mode_dispatch_violation",
+        )
 
     def test_stops_at_timeout(self):
         times = iter([0, 300])
@@ -633,6 +971,92 @@ class StreamingRedactorTests(unittest.TestCase):
         self.assertFalse(pump.output_error_event.is_set())
         self.assertEqual(sink.getvalue(), "before <redacted> after")
 
+    def test_protected_output_sets_violation_event_across_chunks(self):
+        source = Mock()
+        source.read.side_effect = [
+            b"before secret-",
+            b"wallet after",
+            b"",
+        ]
+        sink = io.StringIO()
+        pump = zavod_guard.OutputPump(
+            source,
+            sink,
+            valid_config(),
+            test_mode=True,
+        )
+
+        pump.start()
+        pump.join(1)
+
+        self.assertFalse(pump.is_alive())
+        self.assertEqual(sink.getvalue(), "before <redacted> after")
+        event = getattr(pump, "protected_output_event", None)
+        self.assertIsNotNone(event)
+        self.assertTrue(event.is_set())
+
+    def test_test_mode_recognizes_canonical_transaction_sent_marker(self):
+        pump = zavod_guard.OutputPump(
+            io.BytesIO(b"Transaction sent successfully"),
+            io.StringIO(),
+            valid_config(),
+            test_mode=True,
+        )
+
+        pump.start()
+        pump.join(1)
+
+        self.assertFalse(pump.is_alive())
+        self.assertTrue(pump.test_mode_dispatch_event.is_set())
+
+    def test_test_mode_recognizes_dispatch_marker_split_across_chunks(self):
+        class ChunkedSource:
+            def __init__(self):
+                self.chunks = iter(
+                    (
+                        b"Transaction sent suc",
+                        b"cessfully\n",
+                        b"",
+                    )
+                )
+
+            def read(self, size):
+                del size
+                return next(self.chunks)
+
+            def fileno(self):
+                raise OSError("fixture has no descriptor")
+
+        pump = zavod_guard.OutputPump(
+            ChunkedSource(),
+            io.StringIO(),
+            {},
+            test_mode=True,
+        )
+        pump.start()
+        pump.join(1)
+
+        self.assertFalse(pump.is_alive())
+        self.assertTrue(pump.test_mode_dispatch_event.is_set())
+
+    def test_test_mode_scans_marker_at_start_of_complete_chunk(self):
+        marker = b"dispatching transaction\n"
+        first_chunk = marker + b"x" * (4096 - len(marker))
+        source = Mock()
+        source.read.side_effect = [first_chunk, b""]
+        pump = zavod_guard.OutputPump(
+            source,
+            io.StringIO(),
+            valid_config(),
+            test_mode=True,
+        )
+
+        pump.start()
+        pump.join(1)
+
+        self.assertFalse(pump.is_alive())
+        self.assertTrue(pump.test_mode_dispatch_event.is_set())
+
     def test_protected_identifiers_are_redacted_across_chunk_boundaries(self):
         protected_uuid = "12345678-1234-4234-9234-123456789abc"
         protected_signature = base58_encode(b"\x01" * 64)
@@ -724,6 +1148,48 @@ class HardenedCleanupTests(unittest.TestCase):
             signal_grace=((signal.SIGINT, 0),),
         )
         self.assertEqual(result["reason"], "output_error")
+
+    def test_protected_output_stops_diagnostic_with_fixed_reason(self):
+        event = threading.Event()
+        event.set()
+        child = Mock(pid=123, returncode=-2)
+        child.poll.return_value = None
+        try:
+            result = zavod_guard.supervise(
+                child=child,
+                start_balance=100,
+                balance_reader=lambda: 100,
+                monotonic=Mock(side_effect=[0, 0]),
+                sleep=lambda _: None,
+                protected_output_event=event,
+                diagnostic=True,
+                killpg=lambda pgid, sig: None,
+                group_exists=Mock(side_effect=[True, False]),
+                signal_grace=((signal.SIGINT, 0),),
+            )
+        except TypeError as exc:
+            self.fail(f"diagnostic protected-output event is not supervised: {exc}")
+        self.assertEqual(result["reason"], "protected_output_violation")
+
+    def test_input_integrity_failure_stops_diagnostic_with_fixed_reason(self):
+        child = Mock(pid=123, returncode=-2)
+        child.poll.return_value = None
+        try:
+            result = zavod_guard.supervise(
+                child=child,
+                start_balance=100,
+                balance_reader=lambda: 100,
+                monotonic=Mock(side_effect=[0, 0]),
+                sleep=lambda _: None,
+                input_integrity_checker=lambda: False,
+                diagnostic=True,
+                killpg=lambda pgid, sig: None,
+                group_exists=Mock(side_effect=[True, False]),
+                signal_grace=((signal.SIGINT, 0),),
+            )
+        except TypeError as exc:
+            self.fail(f"diagnostic input integrity is not supervised: {exc}")
+        self.assertEqual(result["reason"], "input_integrity_violation")
 
     def test_repeated_interrupts_during_cleanup_fail_closed(self):
         child = Mock(pid=123, returncode=None)
@@ -876,6 +1342,11 @@ class RunGuardedHardeningTests(unittest.TestCase):
             else self.ORIGINAL_DIAGNOSTIC_BYTES
         )
         config_path.chmod(0o600)
+        tokens_path = root / "tokens.toml"
+        tokens_path.write_bytes(
+            f'tokens = ["{DIAGNOSTIC_TARGET}"]\n'.encode()
+        )
+        tokens_path.chmod(0o600)
         return {
             "binary": binary,
             "state": state,
@@ -883,6 +1354,31 @@ class RunGuardedHardeningTests(unittest.TestCase):
             "run_dir": run_dir,
             "marker": marker,
             "config": config_path,
+            "tokens": tokens_path,
+        }
+
+    def diagnostic_contract(self, paths):
+        return {
+            "diagnostic_mode": "d0",
+            "diagnostic_target": DIAGNOSTIC_TARGET,
+            "diagnostic_config_sha256": hashlib.sha256(
+                paths["config"].read_bytes()
+            ).hexdigest(),
+            "diagnostic_tokens_sha256": hashlib.sha256(
+                paths["tokens"].read_bytes()
+            ).hexdigest(),
+        }
+
+    def original_diagnostic_contract(self):
+        return {
+            "diagnostic_mode": "d0",
+            "diagnostic_target": DIAGNOSTIC_TARGET,
+            "diagnostic_config_sha256": hashlib.sha256(
+                self.ORIGINAL_DIAGNOSTIC_BYTES
+            ).hexdigest(),
+            "diagnostic_tokens_sha256": hashlib.sha256(
+                f'tokens = ["{DIAGNOSTIC_TARGET}"]\n'.encode()
+            ).hexdigest(),
         }
 
     def assert_diagnostic_identity_rejected(
@@ -920,6 +1416,7 @@ class RunGuardedHardeningTests(unittest.TestCase):
                 profile="selector-diagnostic",
                 test_mode=True,
                 workspace_root=root,
+                **self.original_diagnostic_contract(),
             )
         launch.assert_not_called()
 
@@ -1136,6 +1633,9 @@ class RunGuardedHardeningTests(unittest.TestCase):
                     profile="selector-diagnostic",
                     test_mode=True,
                     workspace_root=root,
+                    token_account_snapshot_reader=lambda *_: frozenset(),
+                    mint_account_validator=lambda *_: None,
+                    **self.diagnostic_contract(paths),
                 )
             config_path.chmod(0o600)
 
@@ -1149,6 +1649,7 @@ class RunGuardedHardeningTests(unittest.TestCase):
                         profile="selector-diagnostic",
                         test_mode=True,
                         workspace_root=root,
+                        **self.diagnostic_contract(paths),
                     )
             finally:
                 outside_path.unlink()
@@ -1156,8 +1657,11 @@ class RunGuardedHardeningTests(unittest.TestCase):
             def popen(argv, **kwargs):
                 passed = kwargs.get("pass_fds")
                 self.assertIsNotNone(passed)
-                self.assertEqual(len(passed), 1)
-                descriptor = passed[0]
+                self.assertEqual(len(passed), 2)
+                descriptor = int(Path(argv[3]).name)
+                tokens_descriptor = next(
+                    value for value in passed if value != descriptor
+                )
                 self.assertEqual(
                     argv,
                     [
@@ -1172,6 +1676,10 @@ class RunGuardedHardeningTests(unittest.TestCase):
                 self.assertEqual(
                     Path(argv[3]).read_bytes(),
                     self.ORIGINAL_DIAGNOSTIC_BYTES,
+                )
+                self.assertEqual(
+                    Path(f"/proc/self/fd/{tokens_descriptor}").read_bytes(),
+                    f'tokens = ["{DIAGNOSTIC_TARGET}"]\n'.encode(),
                 )
                 return child
 
@@ -1192,6 +1700,9 @@ class RunGuardedHardeningTests(unittest.TestCase):
                     profile="selector-diagnostic",
                     test_mode=True,
                     workspace_root=root,
+                    token_account_snapshot_reader=lambda *_: frozenset(),
+                    mint_account_validator=lambda *_: None,
+                    **self.diagnostic_contract(paths),
                 )
 
             shutil.rmtree(root / "logs")
@@ -1222,8 +1733,196 @@ class RunGuardedHardeningTests(unittest.TestCase):
                 [str(binary), "run"],
             )
 
+    def test_selector_diagnostic_requires_exact_d0_launch_contract(self):
+        config = valid_config()
+        child = Mock(pid=123, returncode=0, stdout=io.BytesIO())
+        summary = {"wallet": "public-address", "balance_lamports": 100_000_000}
+        supervised = {
+            "reason": "child_exit",
+            "start_balance": 100_000_000,
+            "end_balance": 100_000_000,
+            "observed_loss": 0,
+            "child_exit_code": 0,
+        }
+        cleanup = {"exit_code": 0, "group_absent": True, "interrupted": False}
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = self.prepare_diagnostic_workspace(root)
+            patches = (
+                patch.object(
+                    zavod_guard,
+                    "load_config_bytes",
+                    return_value=config,
+                ),
+                patch.object(zavod_guard, "preflight", return_value=summary),
+                patch.object(
+                    zavod_guard.subprocess,
+                    "Popen",
+                    return_value=child,
+                ),
+                patch.object(
+                    zavod_guard,
+                    "supervise",
+                    return_value=supervised,
+                ),
+                patch.object(
+                    zavod_guard,
+                    "_verified_shutdown",
+                    return_value=cleanup,
+                ),
+            )
+            with (
+                patches[0],
+                patches[1],
+                patches[2] as launch,
+                patches[3],
+                patches[4],
+                self.assertRaisesRegex(GuardError, "launch contract"),
+            ):
+                zavod_guard.run_guarded(
+                    paths["config"],
+                    profile="selector-diagnostic",
+                    test_mode=True,
+                    workspace_root=root,
+                )
+            launch.assert_not_called()
+
+            valid_contract = self.diagnostic_contract(paths)
+            invalid_contracts = (
+                (
+                    {**valid_contract, "diagnostic_mode": "d1"},
+                    "launch contract",
+                ),
+                (
+                    {**valid_contract, "diagnostic_target": CONTROL_MINT},
+                    "input integrity",
+                ),
+                (
+                    {
+                        **valid_contract,
+                        "diagnostic_config_sha256": "0" * 64,
+                    },
+                    "input integrity",
+                ),
+                (
+                    {
+                        **valid_contract,
+                        "diagnostic_tokens_sha256": "not-a-digest",
+                    },
+                    "launch contract",
+                ),
+            )
+            for contract, pattern in invalid_contracts:
+                with self.subTest(contract=contract):
+                    with self.assertRaisesRegex(GuardError, pattern):
+                        zavod_guard.run_guarded(
+                            paths["config"],
+                            profile="selector-diagnostic",
+                            test_mode=True,
+                            workspace_root=root,
+                            **contract,
+                        )
+
+    def test_produced_contract_rejects_config_or_tokens_swap_before_open(self):
+        source = (
+            b"[auto]\n"
+            b"enabled = true\n"
+            b"force_two_mints = true\n"
+            b"[auto.filters]\n"
+            b"limit = 2\n"
+            b"[bot]\n"
+            b"merge_mints = true\n"
+        )
+        for swapped_name in ("config", "tokens"):
+            with self.subTest(swapped=swapped_name):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    root = Path(temp_dir)
+                    (root / "state" / "backups").mkdir(parents=True)
+                    (root / "state" / "mint-runs").mkdir(parents=True)
+                    for private_dir in (
+                        root / "state",
+                        root / "state" / "backups",
+                        root / "state" / "mint-runs",
+                    ):
+                        private_dir.chmod(0o700)
+                    (root / "config.toml").write_bytes(source)
+                    (root / "config.toml").chmod(0o600)
+                    (root / "tokens.toml").write_text('tokens = ["old"]\n')
+                    (root / "tokens.toml").chmod(0o600)
+                    (root / "zavod-mev-bot-rust-version-cli").touch()
+                    prepared = mint_runner.prepare_run(
+                        root,
+                        DIAGNOSTIC_TARGET,
+                        60,
+                        diagnostic="d0",
+                        now=lambda: datetime(
+                            2026,
+                            7,
+                            24,
+                            19,
+                            0,
+                            tzinfo=timezone.utc,
+                        ),
+                        process_checker=lambda: False,
+                    )
+                    contract = {
+                        key: value
+                        for key, value in prepared.safe_summary().items()
+                        if key.startswith("diagnostic_")
+                    }
+                    if swapped_name == "config":
+                        swapped_path = root / prepared.diagnostic_config
+                        swapped_path.write_bytes(b"swapped config fixture\n")
+                    else:
+                        swapped_path = root / "tokens.toml"
+                        swapped_path.write_bytes(b"tokens = []\n")
+                    swapped_path.chmod(0o600)
+
+                    with (
+                        patch.object(
+                            zavod_guard,
+                            "load_config_bytes",
+                            return_value=valid_config(),
+                        ),
+                        patch.object(
+                            zavod_guard,
+                            "preflight",
+                            return_value={
+                                "wallet": "public-address",
+                                "balance_lamports": 100_000_000,
+                            },
+                        ),
+                        patch.object(
+                            zavod_guard.subprocess,
+                            "Popen",
+                        ) as launch,
+                        self.assertRaisesRegex(
+                            GuardError,
+                            "input integrity",
+                        ),
+                    ):
+                        try:
+                            zavod_guard.run_guarded(
+                                root / prepared.diagnostic_config,
+                                profile="selector-diagnostic",
+                                test_mode=True,
+                                workspace_root=root,
+                                **contract,
+                            )
+                        except TypeError as exc:
+                            self.fail(
+                                "guard does not accept the prepared launch "
+                                f"contract: {exc}"
+                            )
+                    launch.assert_not_called()
+
     def test_selector_diagnostic_holds_config_across_run_directory_swap(self):
         config = valid_config()
+        config["markets_file"] = [{"enabled": False, "path": "disabled.toml"}]
+        config["auto"]["force_two_mints"] = False
+        config["auto"]["filters"] = {"limit": 1}
+        config["bot"] = {"merge_mints": False}
         child = Mock(pid=123, returncode=0, stdout=io.BytesIO())
         summary = {"wallet": "public-address", "balance_lamports": 100_000_000}
         supervised = {
@@ -1254,10 +1953,10 @@ class RunGuardedHardeningTests(unittest.TestCase):
             def popen(argv, **kwargs):
                 passed = kwargs.get("pass_fds")
                 self.assertIsNotNone(passed)
-                self.assertEqual(len(passed), 1)
+                self.assertEqual(len(passed), 2)
                 self.assertEqual(
                     argv[3],
-                    f"/proc/self/fd/{passed[0]}",
+                    f"/proc/self/fd/{int(Path(argv[3]).name)}",
                 )
                 self.assertEqual(
                     Path(argv[3]).read_bytes(),
@@ -1291,7 +1990,412 @@ class RunGuardedHardeningTests(unittest.TestCase):
                     profile="selector-diagnostic",
                     test_mode=True,
                     workspace_root=root,
+                    token_account_snapshot_reader=lambda *_: frozenset(),
+                    mint_account_validator=lambda *_: None,
+                    **self.diagnostic_contract(paths),
                 )
+
+    def test_selector_diagnostic_monitors_tokens_path_identity_after_popen(self):
+        config = valid_config()
+        config["markets_file"] = [{"enabled": False, "path": "disabled.toml"}]
+        config["auto"]["force_two_mints"] = False
+        config["auto"]["filters"] = {"limit": 1}
+        config["bot"] = {"merge_mints": False}
+        child = Mock(pid=123, returncode=0, stdout=io.BytesIO())
+        summary = {"wallet": "public-address", "balance_lamports": 100_000_000}
+        cleanup = {"exit_code": 0, "group_absent": True, "interrupted": False}
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = self.prepare_diagnostic_workspace(root)
+            contract = self.diagnostic_contract(paths)
+            original_tokens = paths["tokens"].read_bytes()
+
+            def popen(argv, **kwargs):
+                del argv, kwargs
+                held_path = paths["tokens"].with_name("held-original-tokens")
+                paths["tokens"].rename(held_path)
+                paths["tokens"].write_bytes(original_tokens)
+                paths["tokens"].chmod(0o600)
+                return child
+
+            def supervised(**kwargs):
+                checker = kwargs.get("input_integrity_checker")
+                if checker is None:
+                    reason = "child_exit"
+                else:
+                    reason = (
+                        "child_exit"
+                        if checker()
+                        else "input_integrity_violation"
+                    )
+                return {
+                    "reason": reason,
+                    "start_balance": 100_000_000,
+                    "end_balance": 100_000_000,
+                    "observed_loss": 0,
+                    "child_exit_code": 0,
+                }
+
+            with (
+                patch.object(
+                    zavod_guard,
+                    "load_config_bytes",
+                    return_value=config,
+                ),
+                patch.object(zavod_guard, "preflight", return_value=summary),
+                patch.object(
+                    zavod_guard.subprocess,
+                    "Popen",
+                    side_effect=popen,
+                ),
+                patch.object(
+                    zavod_guard,
+                    "supervise",
+                    side_effect=supervised,
+                ),
+                patch.object(
+                    zavod_guard,
+                    "_verified_shutdown",
+                    return_value=cleanup,
+                ),
+            ):
+                result = zavod_guard.run_guarded(
+                    paths["config"],
+                    profile="selector-diagnostic",
+                    test_mode=True,
+                    workspace_root=root,
+                    token_account_snapshot_reader=lambda *_: frozenset(),
+                    mint_account_validator=lambda *_: None,
+                    **contract,
+                )
+
+        self.assertEqual(result["reason"], "input_integrity_violation")
+
+    def test_selector_diagnostic_snapshots_token_accounts_before_launch(self):
+        config = valid_config()
+        config["markets_file"] = [{"enabled": False, "path": "disabled.toml"}]
+        config["auto"]["force_two_mints"] = False
+        config["auto"]["filters"] = {"limit": 1}
+        config["bot"] = {"merge_mints": False}
+        child = Mock(pid=123, returncode=0, stdout=io.BytesIO())
+        summary = {"wallet": "public-address", "balance_lamports": 100_000_000}
+        cleanup = {"exit_code": 0, "group_absent": True, "interrupted": False}
+        events = []
+        observed_supervision = {}
+
+        def token_accounts(rpc_url, public_key):
+            self.assertEqual(rpc_url, config["rpc"]["url"])
+            self.assertEqual(public_key, "public-address")
+            events.append("token_accounts")
+            return frozenset({"existing-account"})
+
+        def popen(argv, **kwargs):
+            del argv, kwargs
+            events.append("popen")
+            return child
+
+        def supervised(**kwargs):
+            observed_supervision.update(kwargs)
+            return {
+                "reason": "child_exit",
+                "start_balance": 100_000_000,
+                "end_balance": 100_000_000,
+                "observed_loss": 0,
+                "child_exit_code": 0,
+            }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = self.prepare_diagnostic_workspace(root)
+            with (
+                patch.object(
+                    zavod_guard,
+                    "load_config_bytes",
+                    return_value=config,
+                ),
+                patch.object(zavod_guard, "preflight", return_value=summary),
+                patch.object(
+                    zavod_guard,
+                    "get_token_account_pubkeys",
+                    side_effect=token_accounts,
+                ),
+                patch.object(
+                    zavod_guard.subprocess,
+                    "Popen",
+                    side_effect=popen,
+                ),
+                patch.object(
+                    zavod_guard,
+                    "supervise",
+                    side_effect=supervised,
+                ),
+                patch.object(
+                    zavod_guard,
+                    "_verified_shutdown",
+                    return_value=cleanup,
+                ),
+            ):
+                zavod_guard.run_guarded(
+                    paths["config"],
+                    profile="selector-diagnostic",
+                    test_mode=True,
+                    workspace_root=root,
+                    mint_account_validator=lambda *_: None,
+                    **self.diagnostic_contract(paths),
+                )
+
+        self.assertEqual(events[:2], ["token_accounts", "popen"])
+        self.assertEqual(
+            observed_supervision.get("starting_token_accounts"),
+            frozenset({"existing-account"}),
+        )
+        self.assertTrue(
+            callable(observed_supervision.get("token_account_reader"))
+        )
+
+    def test_selector_diagnostic_validates_target_mint_before_snapshot_and_launch(self):
+        config = valid_config()
+        config["markets_file"] = [{"enabled": False, "path": "disabled.toml"}]
+        config["auto"]["force_two_mints"] = False
+        config["auto"]["filters"] = {"limit": 1}
+        config["bot"] = {"merge_mints": False}
+        child = Mock(pid=123, returncode=0, stdout=io.BytesIO())
+        summary = {"wallet": "public-address", "balance_lamports": 100_000_000}
+        cleanup = {"exit_code": 0, "group_absent": True, "interrupted": False}
+        events = []
+
+        def validate_target(rpc_url, target):
+            self.assertEqual(rpc_url, config["rpc"]["url"])
+            self.assertEqual(target, DIAGNOSTIC_TARGET)
+            events.append("mint_validation")
+
+        def snapshot(rpc_url, public_key):
+            del rpc_url, public_key
+            events.append("token_snapshot")
+            return frozenset()
+
+        def popen(argv, **kwargs):
+            del argv, kwargs
+            events.append("popen")
+            return child
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = self.prepare_diagnostic_workspace(root)
+            with (
+                patch.object(
+                    zavod_guard,
+                    "load_config_bytes",
+                    return_value=config,
+                ),
+                patch.object(zavod_guard, "preflight", return_value=summary),
+                patch.object(
+                    zavod_guard.subprocess,
+                    "Popen",
+                    side_effect=popen,
+                ),
+                patch.object(
+                    zavod_guard,
+                    "supervise",
+                    return_value={
+                        "reason": "child_exit",
+                        "start_balance": 100_000_000,
+                        "end_balance": 100_000_000,
+                        "observed_loss": 0,
+                        "child_exit_code": 0,
+                    },
+                ),
+                patch.object(
+                    zavod_guard,
+                    "_verified_shutdown",
+                    return_value=cleanup,
+                ),
+            ):
+                try:
+                    zavod_guard.run_guarded(
+                        paths["config"],
+                        profile="selector-diagnostic",
+                        test_mode=True,
+                        workspace_root=root,
+                        token_account_snapshot_reader=snapshot,
+                        mint_account_validator=validate_target,
+                        **self.diagnostic_contract(paths),
+                    )
+                except TypeError as exc:
+                    self.fail(f"guarded mint validator is not wired: {exc}")
+
+        self.assertEqual(
+            events[:3],
+            ["mint_validation", "token_snapshot", "popen"],
+        )
+
+    def test_selector_diagnostic_invalid_target_mint_never_launches(self):
+        config = valid_config()
+        config["markets_file"] = [{"enabled": False, "path": "disabled.toml"}]
+        config["auto"]["force_two_mints"] = False
+        config["auto"]["filters"] = {"limit": 1}
+        config["bot"] = {"merge_mints": False}
+        summary = {"wallet": "public-address", "balance_lamports": 100_000_000}
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = self.prepare_diagnostic_workspace(root)
+            with (
+                patch.object(
+                    zavod_guard,
+                    "load_config_bytes",
+                    return_value=config,
+                ),
+                patch.object(zavod_guard, "preflight", return_value=summary),
+                patch.object(zavod_guard.subprocess, "Popen") as launch,
+            ):
+                result = zavod_guard.run_guarded(
+                    paths["config"],
+                    profile="selector-diagnostic",
+                    test_mode=True,
+                    workspace_root=root,
+                    token_account_snapshot_reader=lambda *_: frozenset(),
+                    mint_account_validator=Mock(
+                        side_effect=GuardError(
+                            "fixture invalid mint detail"
+                        )
+                    ),
+                    **self.diagnostic_contract(paths),
+                )
+
+        launch.assert_not_called()
+        self.assertEqual(result["reason"], "rpc_error")
+        self.assertNotIn("fixture invalid mint detail", str(result))
+
+    def test_selector_diagnostic_rechecks_inputs_after_snapshot_before_popen(self):
+        config = valid_config()
+        config["markets_file"] = [{"enabled": False, "path": "disabled.toml"}]
+        config["auto"]["force_two_mints"] = False
+        config["auto"]["filters"] = {"limit": 1}
+        config["bot"] = {"merge_mints": False}
+        child = Mock(pid=123, returncode=0, stdout=io.BytesIO())
+        summary = {"wallet": "public-address", "balance_lamports": 100_000_000}
+        cleanup = {"exit_code": 0, "group_absent": True, "interrupted": False}
+
+        for swapped_name in ("config_contents", "tokens_path"):
+            with self.subTest(swapped=swapped_name):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    root = Path(temp_dir)
+                    paths = self.prepare_diagnostic_workspace(root)
+                    contract = self.diagnostic_contract(paths)
+                    original_tokens = paths["tokens"].read_bytes()
+
+                    def swap_during_snapshot(rpc_url, public_key):
+                        del rpc_url, public_key
+                        if swapped_name == "config_contents":
+                            paths["config"].write_bytes(
+                                b"mutated config during snapshot\n"
+                            )
+                            paths["config"].chmod(0o600)
+                        else:
+                            held = paths["tokens"].with_name(
+                                "tokens-held-before-snapshot-swap"
+                            )
+                            paths["tokens"].rename(held)
+                            paths["tokens"].write_bytes(original_tokens)
+                            paths["tokens"].chmod(0o600)
+                        return frozenset()
+
+                    with (
+                        patch.object(
+                            zavod_guard,
+                            "load_config_bytes",
+                            return_value=config,
+                        ),
+                        patch.object(
+                            zavod_guard,
+                            "preflight",
+                            return_value=summary,
+                        ),
+                        patch.object(
+                            zavod_guard.subprocess,
+                            "Popen",
+                            return_value=child,
+                        ) as launch,
+                        patch.object(
+                            zavod_guard,
+                            "supervise",
+                            return_value={
+                                "reason": "child_exit",
+                                "start_balance": 100_000_000,
+                                "end_balance": 100_000_000,
+                                "observed_loss": 0,
+                                "child_exit_code": 0,
+                            },
+                        ),
+                        patch.object(
+                            zavod_guard,
+                            "_verified_shutdown",
+                            return_value=cleanup,
+                        ),
+                        self.assertRaisesRegex(
+                            GuardError,
+                            "input integrity",
+                        ),
+                    ):
+                        zavod_guard.run_guarded(
+                            paths["config"],
+                            profile="selector-diagnostic",
+                            test_mode=True,
+                            workspace_root=root,
+                            token_account_snapshot_reader=(
+                                swap_during_snapshot
+                            ),
+                            mint_account_validator=lambda *_: None,
+                            **contract,
+                        )
+
+                    launch.assert_not_called()
+
+    def test_selector_diagnostic_initial_token_snapshot_failure_never_launches(self):
+        config = valid_config()
+        config["markets_file"] = [{"enabled": False, "path": "disabled.toml"}]
+        config["auto"]["force_two_mints"] = False
+        config["auto"]["filters"] = {"limit": 1}
+        config["bot"] = {"merge_mints": False}
+        summary = {"wallet": "public-address", "balance_lamports": 100_000_000}
+        cleanup = {"exit_code": None, "group_absent": True, "interrupted": False}
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = self.prepare_diagnostic_workspace(root)
+            with (
+                patch.object(
+                    zavod_guard,
+                    "load_config_bytes",
+                    return_value=config,
+                ),
+                patch.object(zavod_guard, "preflight", return_value=summary),
+                patch.object(
+                    zavod_guard,
+                    "get_token_account_pubkeys",
+                    side_effect=GuardError("fixture RPC detail"),
+                ),
+                patch.object(zavod_guard.subprocess, "Popen") as launch,
+                patch.object(
+                    zavod_guard,
+                    "_verified_shutdown",
+                    return_value=cleanup,
+                ),
+            ):
+                result = zavod_guard.run_guarded(
+                    paths["config"],
+                    profile="selector-diagnostic",
+                    test_mode=True,
+                    workspace_root=root,
+                    mint_account_validator=lambda *_: None,
+                    **self.diagnostic_contract(paths),
+                )
+
+        launch.assert_not_called()
+        self.assertEqual(result["reason"], "rpc_error")
+        self.assertNotIn("fixture RPC detail", str(result))
 
     def test_selector_diagnostic_descriptor_walk_rejects_symlinked_components(self):
         components = ("state", "mint_runs", "run_dir", "config")
@@ -1499,6 +2603,134 @@ class RunGuardedHardeningTests(unittest.TestCase):
         killpg.assert_called_once_with(123, signal.SIGINT)
         self.assertNotIn(marker, str(result))
 
+    def test_main_returns_nonzero_for_persisted_diagnostic_violations(self):
+        result = {
+            "reason": "unused",
+            "start_balance": 100,
+            "end_balance": 100,
+            "observed_loss": 0,
+            "duration_seconds": 1,
+            "child_exit_code": -signal.SIGINT,
+            "loss_limit_lamports": zavod_guard.LOSS_LIMIT_LAMPORTS,
+            "early_stop_lamports": zavod_guard.EARLY_STOP_LAMPORTS,
+            "log_path": "logs/fake.log",
+        }
+        for reason in (
+            "test_mode_dispatch_violation",
+            "cleanup_failed",
+            "diagnostic_loss_violation",
+            "input_integrity_violation",
+            "token_account_growth_violation",
+            "protected_output_violation",
+            "rpc_error",
+        ):
+            with self.subTest(reason=reason):
+                stdout = io.StringIO()
+                with (
+                    patch.object(
+                        zavod_guard,
+                        "run_guarded",
+                        return_value={**result, "reason": reason},
+                    ),
+                    patch("sys.stdout", new=stdout),
+                ):
+                    status = zavod_guard.main(
+                        [
+                            "run",
+                            "--live-confirmed",
+                            "--profile",
+                            "selector-diagnostic",
+                            "--test-mode",
+                            "--diagnostic-mode",
+                            "d0",
+                            "--diagnostic-target",
+                            DIAGNOSTIC_TARGET,
+                            "--config-sha256",
+                            "1" * 64,
+                            "--tokens-sha256",
+                            "2" * 64,
+                        ]
+                    )
+                self.assertEqual(status, 1)
+                self.assertIn(f"reason={reason}", stdout.getvalue())
+
+    def test_main_requires_exactly_one_of_each_diagnostic_contract_argument(self):
+        base_args = [
+            "run",
+            "--live-confirmed",
+            "--profile",
+            "selector-diagnostic",
+            "--test-mode",
+            "--diagnostic-mode",
+            "d0",
+            "--diagnostic-target",
+            DIAGNOSTIC_TARGET,
+            "--config-sha256",
+            "1" * 64,
+            "--tokens-sha256",
+            "2" * 64,
+        ]
+        invalid = (
+            base_args[:-2],
+            [*base_args, "--diagnostic-mode", "d0"],
+            [
+                *base_args,
+                "--diagnostic-target",
+                DIAGNOSTIC_TARGET,
+            ],
+            [*base_args, "--config-sha256", "1" * 64],
+            [*base_args, "--tokens-sha256", "3" * 64],
+        )
+        result = {
+            "reason": "child_exit",
+            "start_balance": 100,
+            "end_balance": 100,
+            "observed_loss": 0,
+            "duration_seconds": 1,
+            "child_exit_code": 0,
+            "loss_limit_lamports": zavod_guard.LOSS_LIMIT_LAMPORTS,
+            "early_stop_lamports": zavod_guard.EARLY_STOP_LAMPORTS,
+            "log_path": "logs/fake.log",
+        }
+        for argv in invalid:
+            with self.subTest(argv=argv):
+                with (
+                    patch.object(zavod_guard, "run_guarded") as launch,
+                    patch("sys.stderr", new=io.StringIO()),
+                ):
+                    try:
+                        status = zavod_guard.main(argv)
+                    except SystemExit as exc:
+                        self.fail(
+                            "diagnostic argument rejection escaped main: "
+                            f"{exc}"
+                        )
+                self.assertNotEqual(status, 0)
+                launch.assert_not_called()
+
+        with (
+            patch.object(
+                zavod_guard,
+                "run_guarded",
+                return_value=result,
+            ) as launch,
+            patch("sys.stdout", new=io.StringIO()),
+        ):
+            status = zavod_guard.main(base_args)
+
+        self.assertEqual(status, 0)
+        self.assertEqual(
+            launch.call_args.kwargs,
+            {
+                "test_mode": True,
+                "workspace_root": Path(zavod_guard.__file__).resolve().parents[1],
+                "diagnostic_mode": "d0",
+                "diagnostic_target": DIAGNOSTIC_TARGET,
+                "diagnostic_config_sha256": "1" * 64,
+                "diagnostic_tokens_sha256": "2" * 64,
+            },
+        )
+
 
 class RunGuardedWrapperTests(unittest.TestCase):
     DIAGNOSTIC_RUN_ID = "20260724T190000Z"
@@ -1576,6 +2808,12 @@ class RunGuardedWrapperTests(unittest.TestCase):
         return relative_path, config_path
 
     def diagnostic_args(self, relative_path):
+        config_sha256 = hashlib.sha256(
+            (self.root / relative_path).read_bytes()
+        ).hexdigest()
+        tokens_sha256 = hashlib.sha256(
+            f'tokens = ["{DIAGNOSTIC_TARGET}"]\n'.encode()
+        ).hexdigest()
         return (
             "--live-confirmed",
             "--timeout",
@@ -1585,6 +2823,14 @@ class RunGuardedWrapperTests(unittest.TestCase):
             "--config",
             relative_path,
             "--test-mode",
+            "--diagnostic-mode",
+            "d0",
+            "--diagnostic-target",
+            DIAGNOSTIC_TARGET,
+            "--config-sha256",
+            config_sha256,
+            "--tokens-sha256",
+            tokens_sha256,
         )
 
     def test_defaults_to_300_seconds(self):
@@ -1611,11 +2857,17 @@ class RunGuardedWrapperTests(unittest.TestCase):
     def test_diagnostic_requires_test_mode_and_fixed_config(self):
         relative_path, _config_path = self.prepare_diagnostic_config()
         diagnostic_args = self.diagnostic_args(relative_path)
+        without_test_mode = tuple(
+            value
+            for value in diagnostic_args
+            if value != "--test-mode"
+        )
 
         rejected = [
             self.invoke(*diagnostic_args),
-            self.invoke_with_inherited_lock(*diagnostic_args[:-1]),
+            self.invoke_with_inherited_lock(*without_test_mode),
             self.invoke_with_inherited_lock(*diagnostic_args, "--test-mode"),
+            self.invoke_with_inherited_lock(*diagnostic_args[:-2]),
             self.invoke_with_inherited_lock(
                 "--live-confirmed",
                 "--timeout",
@@ -1625,6 +2877,33 @@ class RunGuardedWrapperTests(unittest.TestCase):
                 "--test-mode",
             ),
         ]
+        singleton_options = (
+            ("--timeout", "60"),
+            ("--profile", "selector-diagnostic"),
+            ("--config", relative_path),
+            ("--diagnostic-mode", "d0"),
+            ("--diagnostic-target", DIAGNOSTIC_TARGET),
+            (
+                "--config-sha256",
+                diagnostic_args[
+                    diagnostic_args.index("--config-sha256") + 1
+                ],
+            ),
+            (
+                "--tokens-sha256",
+                diagnostic_args[
+                    diagnostic_args.index("--tokens-sha256") + 1
+                ],
+            ),
+        )
+        rejected.extend(
+            self.invoke_with_inherited_lock(
+                *diagnostic_args,
+                option,
+                value,
+            )
+            for option, value in singleton_options
+        )
 
         arbitrary = self.root / "state" / "arbitrary.toml"
         arbitrary.write_text("# unrelated config\n")
@@ -1638,6 +2917,12 @@ class RunGuardedWrapperTests(unittest.TestCase):
         self.assertFalse((self.root / "guard-launches").exists())
 
         accepted = self.invoke_with_inherited_lock(*diagnostic_args)
+        config_sha256 = diagnostic_args[
+            diagnostic_args.index("--config-sha256") + 1
+        ]
+        tokens_sha256 = diagnostic_args[
+            diagnostic_args.index("--tokens-sha256") + 1
+        ]
 
         self.assertEqual(accepted.returncode, 0, accepted.stderr)
         self.assertEqual(
@@ -1652,6 +2937,14 @@ class RunGuardedWrapperTests(unittest.TestCase):
                 "--profile",
                 "selector-diagnostic",
                 "--test-mode",
+                "--diagnostic-mode",
+                "d0",
+                "--diagnostic-target",
+                DIAGNOSTIC_TARGET,
+                "--config-sha256",
+                config_sha256,
+                "--tokens-sha256",
+                tokens_sha256,
             ],
         )
         self.assertEqual(
