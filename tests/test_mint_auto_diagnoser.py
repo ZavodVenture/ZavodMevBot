@@ -619,6 +619,29 @@ class StageEvidenceTests(unittest.TestCase):
                 self.assertEqual(result["stage_status"], "artifact_error")
                 self.assertEqual(result["next_decision"], "stop")
 
+    def test_artifact_freshness_uses_inclusive_integer_second_buckets(self):
+        """Nanoseconds within either run boundary second must not change freshness."""
+        cases = (
+            ("start-second", 100_000_000_001, "no_target"),
+            ("before-start", 99_999_999_999, "artifact_error"),
+            ("end-second", 200_999_999_999, "no_target"),
+            ("after-end", 201_000_000_000, "artifact_error"),
+        )
+        for index, (case, mtime_ns, expected_status) in enumerate(cases):
+            with self.subTest(case=case):
+                if index:
+                    self.tearDown()
+                    self.setUp()
+                self.write_guard_result()
+                artifact = self.write_artifact(
+                    "routing.json", {"routes": []}
+                )
+                os.utime(artifact, ns=(mtime_ns, mtime_ns))
+
+                result = self.record()
+
+                self.assertEqual(result["stage_status"], expected_status)
+
     def test_terminal_and_repeated_stage_transitions_are_rejected(self):
         """Re-entry after a published result would replace evidence or retry automatically."""
         self.write_guard_result()
@@ -801,6 +824,44 @@ class StageEvidenceTests(unittest.TestCase):
             ),
             "offchain",
         )
+        with self.assertRaises(mint_auto_diagnoser.DiagnoserError):
+            self.record()
+
+    def test_rename_then_interrupt_preserves_published_result(self):
+        """A rename wrapper that raises after moving must not erase final evidence."""
+        self.write_guard_result()
+        real_rename = mint_auto_diagnoser.os.rename
+
+        def rename_then_interrupt(*args, **kwargs):
+            real_rename(*args, **kwargs)
+            raise KeyboardInterrupt
+
+        with patch.object(
+            mint_auto_diagnoser.os,
+            "rename",
+            side_effect=rename_then_interrupt,
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                self.record()
+
+        manifest_path = (
+            self.stage_root.parent.parent
+            / "results"
+            / "0-baseline"
+            / "stage-manifest.json"
+        )
+        manifest = json.loads(manifest_path.read_text())
+        self.assertEqual(manifest["stage_name"], "baseline")
+        self.assertEqual(
+            mint_auto_diagnoser.next_stage(
+                self.root, self.batch.batch_id
+            ),
+            "offchain",
+        )
+        with self.assertRaises(mint_auto_diagnoser.DiagnoserError):
+            mint_auto_diagnoser.finalize_batch(
+                self.root, self.batch.batch_id
+            )
         with self.assertRaises(mint_auto_diagnoser.DiagnoserError):
             self.record()
 

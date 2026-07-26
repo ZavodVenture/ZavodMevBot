@@ -1118,11 +1118,12 @@ def _read_stage_artifact(stage_fd, name, started_at, ended_at, policy):
         return "artifact_error", None, None
     try:
         info = os.fstat(descriptor)
+        artifact_second = info.st_mtime_ns // 1_000_000_000
         if (
             not stat.S_ISREG(info.st_mode)
             or info.st_uid != os.geteuid()
             or stat.S_IMODE(info.st_mode) != 0o600
-            or not started_at <= info.st_mtime <= ended_at
+            or not started_at <= artifact_second <= ended_at
         ):
             return "artifact_error", None, None
         chunks = []
@@ -1222,6 +1223,26 @@ def _artifact_evidence(
     }
 
 
+def _owned_directory_identity_at(parent_fd, name):
+    try:
+        info = os.stat(
+            name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise DiagnoserError("stage result publication failed") from exc
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != os.geteuid()
+        or stat.S_IMODE(info.st_mode) != 0o700
+    ):
+        raise DiagnoserError("stage result publication failed")
+    return info.st_dev, info.st_ino
+
+
 def _publish_stage_result(results_fd, stage_directory, artifacts, manifest):
     try:
         os.stat(
@@ -1239,6 +1260,10 @@ def _publish_stage_result(results_fd, stage_directory, artifacts, manifest):
     temporary_fd = _create_directory(
         results_fd, temporary, mode=0o700
     )
+    temporary_info = _validate_owned(
+        temporary_fd, "directory", mode=0o700
+    )
+    temporary_identity = temporary_info.st_dev, temporary_info.st_ino
     created = []
     published = False
     try:
@@ -1264,15 +1289,34 @@ def _publish_stage_result(results_fd, stage_directory, artifacts, manifest):
             pass
     except BaseException:
         if not published:
-            for name in reversed(created):
+            try:
+                final_identity = _owned_directory_identity_at(
+                    results_fd, stage_directory
+                )
+                named_temporary_identity = _owned_directory_identity_at(
+                    results_fd, temporary
+                )
+            except DiagnoserError:
+                final_identity = None
+                named_temporary_identity = None
+            if (
+                final_identity == temporary_identity
+                and named_temporary_identity is None
+            ):
+                published = True
+            elif (
+                named_temporary_identity == temporary_identity
+                and final_identity is None
+            ):
+                for name in reversed(created):
+                    try:
+                        os.unlink(name, dir_fd=temporary_fd)
+                    except OSError:
+                        pass
                 try:
-                    os.unlink(name, dir_fd=temporary_fd)
+                    os.rmdir(temporary, dir_fd=results_fd)
                 except OSError:
                     pass
-            try:
-                os.rmdir(temporary, dir_fd=results_fd)
-            except OSError:
-                pass
         raise
     finally:
         os.close(temporary_fd)
