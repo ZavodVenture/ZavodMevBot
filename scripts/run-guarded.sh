@@ -303,6 +303,7 @@ if [[ "$profile" == "auto-filter-live" ]]; then
     --timeout-seconds "$timeout_seconds" \
     --profile auto-filter-live \
     --workspace-root "$workspace_path" \
+    --live-lock-fd "$live_lock_fd" \
     --batch-contract-fd "$batch_contract_fd"
 fi
 unset ZAVOD_BATCH_CONTRACT_FD

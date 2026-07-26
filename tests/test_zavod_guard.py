@@ -2845,12 +2845,23 @@ min_pool_liquidity_lamports = 11
         stage = batch.stages[stage_index]
         contract_path = root / stage.contract_relative_path
         contract_descriptor = os.open(contract_path, os.O_RDONLY)
+        live_lock_path = root / "state" / ".zavod-live.lock"
+        live_lock_path.touch(mode=0o600)
+        live_lock_path.chmod(0o600)
+        live_lock_descriptor = os.open(live_lock_path, os.O_RDWR)
+        fcntl.flock(
+            live_lock_descriptor,
+            fcntl.LOCK_EX | fcntl.LOCK_NB,
+        )
+        self.addCleanup(os.close, live_lock_descriptor)
         return {
             "root": root,
             "stage": stage,
             "stage_path": root / stage.relative_root,
             "contract_path": contract_path,
             "contract_fd": contract_descriptor,
+            "live_lock_path": live_lock_path,
+            "live_lock_fd": live_lock_descriptor,
             "binary_path": binary_path,
         }
 
@@ -2860,6 +2871,7 @@ min_pool_liquidity_lamports = 11
         current_balance=100_000_000,
         supervise_side_effect=None,
         popen_side_effect=None,
+        shutdown_observer=None,
     ):
         child = Mock(pid=123, returncode=0, stdout=io.BytesIO())
         launched = {}
@@ -2922,11 +2934,21 @@ min_pool_liquidity_lamports = 11
             patch.object(
                 zavod_guard,
                 "_verified_shutdown",
-                return_value={
-                    "exit_code": 0,
-                    "group_absent": True,
-                    "interrupted": False,
-                },
+                side_effect=lambda created_child: (
+                    launched.setdefault("shutdown_children", []).append(
+                        created_child
+                    )
+                    or (
+                        shutdown_observer(created_child)
+                        if shutdown_observer is not None
+                        else None
+                    )
+                    or {
+                        "exit_code": 0,
+                        "group_absent": True,
+                        "interrupted": False,
+                    }
+                ),
             ),
         ):
             result = zavod_guard.run_guarded(
@@ -2934,6 +2956,7 @@ min_pool_liquidity_lamports = 11
                 profile="auto-filter-live",
                 workspace_root=paths["stage"].relative_root,
                 batch_contract_fd=paths["contract_fd"],
+                live_lock_fd=paths["live_lock_fd"],
             )
         return result, launched
 
@@ -2967,6 +2990,18 @@ min_pool_liquidity_lamports = 11
             r"^/proc/self/fd/[0-9]+$",
         )
         self.assertGreaterEqual(len(launched["kwargs"]["pass_fds"]), 4)
+        self.assertNotIn(
+            paths["live_lock_fd"],
+            launched["kwargs"]["pass_fds"],
+        )
+        self.assertNotIn(
+            "ZAVOD_LIVE_LOCK_FD",
+            launched["kwargs"]["env"],
+        )
+        self.assertNotIn(
+            "ZAVOD_BATCH_CONTRACT_FD",
+            launched["kwargs"]["env"],
+        )
         self.assertEqual(result["batch_start_balance"], 100_000_000)
         self.assertEqual(result["stage_start_balance"], 80_000_001)
         self.assertEqual(result["loss_limit_lamports"], 30_000_000)
@@ -2992,6 +3027,7 @@ min_pool_liquidity_lamports = 11
                     f"{self.BATCH_ID}/stages/0-baseline"
                 ),
                 batch_contract_fd=9,
+                live_lock_fd=8,
             )
         with tempfile.TemporaryDirectory() as temp_dir:
             paths = self.prepare_workspace(Path(temp_dir))
@@ -3017,6 +3053,7 @@ min_pool_liquidity_lamports = 11
                         profile="auto-filter-live",
                         workspace_root=paths["stage"].relative_root,
                         batch_contract_fd=paths["contract_fd"],
+                        live_lock_fd=paths["live_lock_fd"],
                     )
             finally:
                 os.close(paths["contract_fd"])
@@ -3286,14 +3323,26 @@ min_pool_liquidity_lamports = 11
                         with self.assertRaisesRegex(GuardError, "auto-filter-live"):
                             self.run_auto(paths)
                     elif timing == "popen-return":
+                        observed = {}
+                        shutdown_children = []
+
+                        def swap_after_launch():
+                            swap()
+                            observed["launched"] = True
+
                         with self.assertRaisesRegex(
                             GuardError,
                             "auto-filter-live",
                         ):
                             self.run_auto(
                                 paths,
-                                popen_side_effect=swap,
+                                popen_side_effect=swap_after_launch,
+                                shutdown_observer=(
+                                    shutdown_children.append
+                                ),
                             )
+                        self.assertTrue(observed["launched"])
+                        self.assertEqual(len(shutdown_children), 1)
                     else:
                         result, _ = self.run_auto(
                             paths,
@@ -3305,6 +3354,65 @@ min_pool_liquidity_lamports = 11
                         )
                 finally:
                     os.close(paths["contract_fd"])
+
+    def test_live_lock_path_swap_is_rejected_while_original_lock_is_held(self):
+        for timing in ("after-shell-validation", "popen-return"):
+            with (
+                self.subTest(timing=timing),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                paths = self.prepare_workspace(Path(temp_dir))
+                held_path = paths["live_lock_path"].with_name(
+                    ".zavod-live.lock-held"
+                )
+
+                def swap_lock():
+                    paths["live_lock_path"].rename(held_path)
+                    paths["live_lock_path"].touch(mode=0o600)
+                    paths["live_lock_path"].chmod(0o600)
+
+                try:
+                    if timing == "after-shell-validation":
+                        swap_lock()
+                        with self.assertRaisesRegex(
+                            GuardError,
+                            "auto-filter-live",
+                        ):
+                            self.run_auto(paths)
+                    else:
+                        with self.assertRaisesRegex(
+                            GuardError,
+                            "auto-filter-live",
+                        ):
+                            self.run_auto(
+                                paths,
+                                popen_side_effect=swap_lock,
+                            )
+
+                    probe = os.open(held_path, os.O_RDWR)
+                    try:
+                        with self.assertRaises(BlockingIOError):
+                            fcntl.flock(
+                                probe,
+                                fcntl.LOCK_EX | fcntl.LOCK_NB,
+                            )
+                    finally:
+                        os.close(probe)
+                finally:
+                    os.close(paths["contract_fd"])
+
+    def test_live_lock_descriptor_must_retain_contention(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            paths = self.prepare_workspace(Path(temp_dir))
+            try:
+                fcntl.flock(paths["live_lock_fd"], fcntl.LOCK_UN)
+                with self.assertRaisesRegex(
+                    GuardError,
+                    "auto-filter-live",
+                ):
+                    self.run_auto(paths)
+            finally:
+                os.close(paths["contract_fd"])
 
     def test_auto_filter_logs_are_descriptor_bound_and_private(self):
         for variant in ("symlink", "wrong-mode", "wrong-owner"):
@@ -3439,6 +3547,7 @@ min_pool_liquidity_lamports = 11
                         profile="auto-filter-live",
                         workspace_root=paths["stage"].relative_root,
                         batch_contract_fd=paths["contract_fd"],
+                        live_lock_fd=paths["live_lock_fd"],
                     )
                 launch.assert_not_called()
             finally:
@@ -3476,6 +3585,8 @@ min_pool_liquidity_lamports = 11
                     ),
                     "--batch-contract-fd",
                     "9",
+                    "--live-lock-fd",
+                    "8",
                 ]
             )
         self.assertEqual(status, 0)
@@ -3695,8 +3806,10 @@ class RunGuardedWrapperTests(unittest.TestCase):
                 workspace,
             ],
         )
-        self.assertEqual(launched[8], "--batch-contract-fd")
+        self.assertEqual(launched[8], "--live-lock-fd")
         self.assertRegex(launched[9], r"^[0-9]+$")
+        self.assertEqual(launched[10], "--batch-contract-fd")
+        self.assertRegex(launched[11], r"^[0-9]+$")
 
         forbidden = (
             ("--test-mode",),

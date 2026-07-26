@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import argparse
 import codecs
+import errno
+import fcntl
 import hashlib
 import json
 import os
@@ -1576,14 +1578,80 @@ def _auto_filter_require_digest(data, expected):
         raise _auto_filter_error("input integrity violation")
 
 
+def _auto_filter_validate_live_lock(
+    live_lock_descriptor,
+    state_descriptor,
+    expected_identity=None,
+):
+    lock_identity = _auto_filter_validate_descriptor(
+        live_lock_descriptor,
+        "file",
+        mode=0o600,
+    )
+    try:
+        current_descriptor = os.open(
+            ".zavod-live.lock",
+            os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=state_descriptor,
+        )
+    except OSError as exc:
+        raise _auto_filter_error("live lock is invalid") from exc
+    try:
+        current_identity = _auto_filter_validate_descriptor(
+            current_descriptor,
+            "file",
+            mode=0o600,
+        )
+        expected = expected_identity or lock_identity
+        if (
+            lock_identity.st_dev,
+            lock_identity.st_ino,
+        ) != (
+            current_identity.st_dev,
+            current_identity.st_ino,
+        ) or (
+            lock_identity.st_dev,
+            lock_identity.st_ino,
+        ) != (
+            expected.st_dev,
+            expected.st_ino,
+        ):
+            raise _auto_filter_error("live lock is invalid")
+
+        try:
+            fcntl.flock(
+                current_descriptor,
+                fcntl.LOCK_EX | fcntl.LOCK_NB,
+            )
+        except OSError as exc:
+            if exc.errno not in (errno.EACCES, errno.EAGAIN):
+                raise _auto_filter_error("live lock is invalid") from exc
+        else:
+            fcntl.flock(current_descriptor, fcntl.LOCK_UN)
+            raise _auto_filter_error("live lock is not held")
+
+        try:
+            fcntl.flock(
+                live_lock_descriptor,
+                fcntl.LOCK_EX | fcntl.LOCK_NB,
+            )
+        except OSError as exc:
+            raise _auto_filter_error("live lock is invalid") from exc
+        return lock_identity
+    finally:
+        os.close(current_descriptor)
+
+
 def _open_auto_filter_live_contract(
     workspace_root,
     batch_contract_fd,
+    live_lock_fd,
 ):
-    if (
-        isinstance(batch_contract_fd, bool)
-        or not isinstance(batch_contract_fd, int)
-        or batch_contract_fd < 0
+    if any(
+        isinstance(descriptor, bool)
+        or not isinstance(descriptor, int)
+        or descriptor < 0
+        for descriptor in (batch_contract_fd, live_lock_fd)
     ):
         raise _auto_filter_error("batch contract descriptor is required")
     inherited_identity = _auto_filter_validate_descriptor(
@@ -1634,11 +1702,21 @@ def _open_auto_filter_live_contract(
             descriptors.append(descriptor)
             identities[label] = identity
             parent = descriptor
+        state_descriptor = descriptors[1]
         stage_descriptor = parent
         batch_descriptor = descriptors[3]
+        try:
+            held_live_lock_descriptor = os.dup(live_lock_fd)
+        except OSError as exc:
+            raise _auto_filter_error("live lock is invalid") from exc
+        descriptors.append(held_live_lock_descriptor)
+        identities["live_lock"] = _auto_filter_validate_live_lock(
+            held_live_lock_descriptor,
+            state_descriptor,
+        )
         active_descriptor, active_identity = (
             _auto_filter_open_relative(
-                descriptors[1],
+                state_descriptor,
                 ".mint-auto-diagnose-active",
                 "file",
                 mode=0o600,
@@ -1773,6 +1851,7 @@ def _open_auto_filter_live_contract(
             "files": files,
             "file_data": file_data,
             "stage_fd": stage_descriptor,
+            "live_lock_fd": held_live_lock_descriptor,
             "config": config,
         }
     except BaseException:
@@ -1833,6 +1912,11 @@ def _auto_filter_integrity_matches(
             ):
                 return False
             parent = descriptor
+        _auto_filter_validate_live_lock(
+            opened["live_lock_fd"],
+            fresh[1],
+            expected_identity=opened["identities"]["live_lock"],
+        )
         active_descriptor, active_identity = (
             _auto_filter_open_relative(
                 fresh[1],
@@ -2015,6 +2099,7 @@ def run_guarded(
     token_account_snapshot_reader=None,
     mint_account_validator=None,
     batch_contract_fd=None,
+    live_lock_fd=None,
 ):
     if (
         isinstance(timeout_seconds, bool)
@@ -2024,15 +2109,19 @@ def run_guarded(
         raise GuardError("timeout must be from 30 through 300 seconds")
     if profile == "auto-filter-live" and test_mode:
         raise GuardError("auto-filter-live does not permit test mode")
-    if profile != "auto-filter-live" and batch_contract_fd is not None:
+    if profile != "auto-filter-live" and (
+        batch_contract_fd is not None or live_lock_fd is not None
+    ):
         raise GuardError("auto-filter-live launch contract is invalid")
     if (profile == "selector-diagnostic") != test_mode:
         raise GuardError(
             "selector-diagnostic profile and test mode must be provided together"
         )
-    if profile == "auto-filter-live" and batch_contract_fd is None:
+    if profile == "auto-filter-live" and (
+        batch_contract_fd is None or live_lock_fd is None
+    ):
         raise GuardError(
-            "auto-filter-live batch contract descriptor is required"
+            "auto-filter-live descriptors are required"
         )
     _validate_selector_launch_contract(
         profile,
@@ -2057,6 +2146,7 @@ def run_guarded(
             auto_filter_contract = _open_auto_filter_live_contract(
                 workspace_root,
                 batch_contract_fd,
+                live_lock_fd,
             )
             if (
                 timeout_seconds
@@ -2292,6 +2382,14 @@ def run_guarded(
             "stdout": subprocess.PIPE,
             "stderr": subprocess.STDOUT,
             "start_new_session": True,
+            "env": {
+                key: value
+                for key, value in os.environ.items()
+                if key not in (
+                    "ZAVOD_LIVE_LOCK_FD",
+                    "ZAVOD_BATCH_CONTRACT_FD",
+                )
+            },
         }
         if diagnostic_config_descriptor is not None:
             popen_arguments["pass_fds"] = (
@@ -2567,6 +2665,11 @@ def main(argv=None):
         action="append",
         type=int,
     )
+    run_parser.add_argument(
+        "--live-lock-fd",
+        action="append",
+        type=int,
+    )
     try:
         args = parser.parse_args(argv)
         if args.command == "preflight":
@@ -2621,16 +2724,20 @@ def main(argv=None):
                     or len(args.workspace_root) != 1
                     or args.batch_contract_fd is None
                     or len(args.batch_contract_fd) != 1
+                    or args.live_lock_fd is None
+                    or len(args.live_lock_fd) != 1
                 ):
                     raise GuardError(
                         "auto-filter-live launch contract is invalid"
                     )
                 selected_workspace_root = args.workspace_root[0]
                 selected_batch_contract_fd = args.batch_contract_fd[0]
+                selected_live_lock_fd = args.live_lock_fd[0]
             else:
                 if (
                     args.workspace_root is not None
                     or args.batch_contract_fd is not None
+                    or args.live_lock_fd is not None
                 ):
                     raise GuardError(
                         "auto-filter-live launch contract is invalid"
@@ -2641,6 +2748,7 @@ def main(argv=None):
                     else None
                 )
                 selected_batch_contract_fd = None
+                selected_live_lock_fd = None
             run_options = {
                 "test_mode": args.test_mode,
                 "workspace_root": selected_workspace_root,
@@ -2657,6 +2765,7 @@ def main(argv=None):
                 run_options["batch_contract_fd"] = (
                     selected_batch_contract_fd
                 )
+                run_options["live_lock_fd"] = selected_live_lock_fd
             result = run_guarded(
                 config_path,
                 args.timeout_seconds,
