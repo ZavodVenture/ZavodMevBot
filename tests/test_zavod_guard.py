@@ -2875,6 +2875,20 @@ min_pool_liquidity_lamports = 11
     ):
         child = Mock(pid=123, returncode=0, stdout=io.BytesIO())
         launched = {}
+        open_auto_contract = (
+            zavod_guard._open_auto_filter_live_contract
+        )
+
+        def capture_auto_contract(*args, **kwargs):
+            opened = open_auto_contract(*args, **kwargs)
+            launched["required_child_fds"] = (
+                opened["stage_fd"],
+                opened["files"]["config"],
+                opened["files"]["tokens"],
+                opened["files"]["binary"],
+            )
+            launched["held_live_lock_fd"] = opened["live_lock_fd"]
+            return opened
 
         def launch(argv, **kwargs):
             launched["argv"] = argv
@@ -2920,6 +2934,11 @@ min_pool_liquidity_lamports = 11
                 zavod_guard,
                 "preflight",
                 side_effect=preflighted,
+            ),
+            patch.object(
+                zavod_guard,
+                "_open_auto_filter_live_contract",
+                side_effect=capture_auto_contract,
             ),
             patch.object(
                 zavod_guard.subprocess,
@@ -2989,19 +3008,23 @@ min_pool_liquidity_lamports = 11
             str(launched["kwargs"]["cwd"]),
             r"^/proc/self/fd/[0-9]+$",
         )
-        self.assertGreaterEqual(len(launched["kwargs"]["pass_fds"]), 4)
+        self.assertEqual(
+            launched["kwargs"]["pass_fds"],
+            launched["required_child_fds"],
+        )
         self.assertNotIn(
-            paths["live_lock_fd"],
+            paths["contract_fd"],
             launched["kwargs"]["pass_fds"],
         )
         self.assertNotIn(
+            launched["held_live_lock_fd"],
+            launched["kwargs"]["pass_fds"],
+        )
+        for variable in (
             "ZAVOD_LIVE_LOCK_FD",
-            launched["kwargs"]["env"],
-        )
-        self.assertNotIn(
             "ZAVOD_BATCH_CONTRACT_FD",
-            launched["kwargs"]["env"],
-        )
+        ):
+            self.assertNotIn(variable, launched["kwargs"]["env"])
         self.assertEqual(result["batch_start_balance"], 100_000_000)
         self.assertEqual(result["stage_start_balance"], 80_000_001)
         self.assertEqual(result["loss_limit_lamports"], 30_000_000)
@@ -3380,6 +3403,7 @@ min_pool_liquidity_lamports = 11
                         ):
                             self.run_auto(paths)
                     else:
+                        shutdown_children = []
                         with self.assertRaisesRegex(
                             GuardError,
                             "auto-filter-live",
@@ -3387,7 +3411,15 @@ min_pool_liquidity_lamports = 11
                             self.run_auto(
                                 paths,
                                 popen_side_effect=swap_lock,
+                                shutdown_observer=(
+                                    shutdown_children.append
+                                ),
                             )
+                        self.assertEqual(len(shutdown_children), 1)
+                        self.assertEqual(
+                            shutdown_children[0].pid,
+                            123,
+                        )
 
                     probe = os.open(held_path, os.O_RDWR)
                     try:
