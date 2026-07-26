@@ -9,9 +9,12 @@ import math
 import os
 import re
 import secrets
+import signal
 import stat
 import sys
+import threading
 import tomllib
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -33,6 +36,12 @@ RUNS_DIRECTORY = "auto-diagnose-runs"
 
 class DiagnoserError(RuntimeError):
     pass
+
+
+class _PreparationInterrupted(DiagnoserError):
+    def __init__(self, signum):
+        self.signum = signum
+        super().__init__("batch preparation interrupted")
 
 
 @dataclass(frozen=True)
@@ -326,12 +335,7 @@ def _write_private_at(parent_fd, name, data):
     try:
         descriptor = os.open(temporary, flags, 0o600, dir_fd=parent_fd)
         os.fchmod(descriptor, 0o600)
-        view = memoryview(data)
-        while view:
-            written = os.write(descriptor, view)
-            if written <= 0:
-                raise OSError("short write")
-            view = view[written:]
+        _write_all(descriptor, data)
         os.fsync(descriptor)
         os.close(descriptor)
         descriptor = None
@@ -350,6 +354,15 @@ def _write_private_at(parent_fd, name, data):
             pass
 
 
+def _write_all(descriptor, data):
+    view = memoryview(data)
+    while view:
+        written = os.write(descriptor, view)
+        if written <= 0:
+            raise OSError("short write")
+        view = view[written:]
+
+
 def _link_or_copy_binary(root_fd, stage_fd, binary):
     try:
         os.link(binary, binary, src_dir_fd=root_fd, dst_dir_fd=stage_fd, follow_symlinks=False)
@@ -365,7 +378,7 @@ def _link_or_copy_binary(root_fd, stage_fd, binary):
                 dir_fd=stage_fd,
             )
             os.fchmod(descriptor, 0o700)
-            os.write(descriptor, source)
+            _write_all(descriptor, source)
             os.fsync(descriptor)
             os.close(descriptor)
             descriptor = None
@@ -397,6 +410,40 @@ def _remove_active_marker(state_fd, batch_id):
             pass
         except OSError as exc:
             raise DiagnoserError("active batch marker is invalid") from exc
+
+
+@contextmanager
+def _restore_marker_on_termination(state_fd, batch_id):
+    """Handle preparation-only termination without retaining ownership afterward."""
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    watched = (signal.SIGINT, signal.SIGTERM)
+    previous = {}
+    masked = hasattr(signal, "pthread_sigmask")
+    previous_mask = None
+    if masked:
+        previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, watched)
+
+    def interrupted(signum, frame):
+        del frame
+        _remove_active_marker(state_fd, batch_id)
+        raise _PreparationInterrupted(signum)
+
+    try:
+        for signum in watched:
+            previous[signum] = signal.getsignal(signum)
+            signal.signal(signum, interrupted)
+        if masked:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+        yield
+    finally:
+        if masked:
+            signal.pthread_sigmask(signal.SIG_BLOCK, watched)
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
+        if masked:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
 
 
 def _stage_relative_root(batch_id, index, name):
@@ -468,22 +515,23 @@ def prepare_batch(root: Path, mint: str, now=None, transport=None, balance_reade
         _write_private_at(batch_fd, "production-tokens.toml", tokens_bytes)
         _write_private_at(batch_fd, "production-binary", binary_bytes)
         stages_fd = _create_directory(batch_fd, "stages")
-        _write_private_at(state_fd, ACTIVE_MARKER, f"{batch_id}\n".encode())
-        active_created = True
-        generated_by_name = {name: config for name, config, _ in generated}
-        prepared = []
-        for index, name in enumerate(("baseline",) + tuple(item.name for item in STAGE_MUTATIONS)):
-            relative_root = _stage_relative_root(batch_id, index, name)
-            contract_relative_path = relative_root + "/stage-contract.json"
-            if name not in generated_by_name:
-                prepared.append(PreparedStage(index, name, relative_root, contract_relative_path, True, skips[name]))
-                continue
-            stage_fd = _create_directory(stages_fd, f"{index}-{name}")
-            try:
-                _prepare_stage(stage_fd, root_fd, batch_id, index, name, generated_by_name[name], mint, balance)
-            finally:
-                os.close(stage_fd)
-            prepared.append(PreparedStage(index, name, relative_root, contract_relative_path, False, None))
+        with _restore_marker_on_termination(state_fd, batch_id):
+            _write_private_at(state_fd, ACTIVE_MARKER, f"{batch_id}\n".encode())
+            active_created = True
+            generated_by_name = {name: config for name, config, _ in generated}
+            prepared = []
+            for index, name in enumerate(("baseline",) + tuple(item.name for item in STAGE_MUTATIONS)):
+                relative_root = _stage_relative_root(batch_id, index, name)
+                contract_relative_path = relative_root + "/stage-contract.json"
+                if name not in generated_by_name:
+                    prepared.append(PreparedStage(index, name, relative_root, contract_relative_path, True, skips[name]))
+                    continue
+                stage_fd = _create_directory(stages_fd, f"{index}-{name}")
+                try:
+                    _prepare_stage(stage_fd, root_fd, batch_id, index, name, generated_by_name[name], mint, balance)
+                finally:
+                    os.close(stage_fd)
+                prepared.append(PreparedStage(index, name, relative_root, contract_relative_path, False, None))
         return PreparedBatch(
             batch_id=batch_id,
             mint=mint,
@@ -609,6 +657,8 @@ def main(argv=None):
 if __name__ == "__main__":
     try:
         main()
+    except _PreparationInterrupted as exc:
+        raise SystemExit(128 + exc.signum) from exc
     except DiagnoserError as exc:
         print(str(exc), file=sys.stderr)
         raise SystemExit(2) from exc

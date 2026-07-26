@@ -3,6 +3,8 @@ import json
 import os
 import shutil
 import stat
+import subprocess
+import sys
 import tempfile
 import tomllib
 import unittest
@@ -223,6 +225,63 @@ class PrivateWorkspaceTests(unittest.TestCase):
             with self.assertRaises(mint_auto_diagnoser.DiagnoserError):
                 self.prepare()
         self.assertFalse((self.root / "state" / ".mint-auto-diagnose-active").exists())
+
+    def test_sigterm_after_active_marker_restores_before_exit(self):
+        """A standard termination signal after activation must release only this batch marker."""
+        program = """
+import os
+import signal
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from unittest.mock import patch
+from scripts import mint_auto_diagnoser as diagnoser
+
+def transport(url, payload, timeout):
+    return {"result": {"value": {"executable": False, "owner": diagnoser.zavod_guard.TOKEN_PROGRAM_ID, "data": {"parsed": {"type": "mint", "info": {"isInitialized": True}}}}}}
+
+def interrupt(*args):
+    os.kill(os.getpid(), getattr(signal, sys.argv[3]))
+
+try:
+    with patch.object(diagnoser.zavod_guard, "wallet_pubkey", return_value="wallet"), patch.object(diagnoser, "_prepare_stage", side_effect=interrupt):
+        diagnoser.prepare_batch(Path(sys.argv[1]), sys.argv[2], now=lambda: datetime(2026, 7, 26, 12, 30, tzinfo=timezone.utc), transport=transport, balance_reader=lambda url, wallet: 1)
+except BaseException as exc:
+    raise SystemExit(128 + getattr(exc, "signum", 15))
+"""
+        for signal_name, expected_status in (("SIGTERM", 143), ("SIGINT", 130)):
+            with self.subTest(signal_name=signal_name):
+                result = subprocess.run(
+                    [sys.executable, "-c", program, str(self.root), TARGET_MINT, signal_name],
+                    cwd=Path(__file__).resolve().parents[1],
+                    check=False,
+                )
+                self.assertEqual(result.returncode, expected_status)
+                self.assertFalse((self.root / "state" / ".mint-auto-diagnose-active").exists())
+                shutil.rmtree(self.root / "state" / "auto-diagnose-runs")
+
+    def test_binary_copy_fallback_completes_short_writes(self):
+        """A partial write during fallback must not truncate the private executable."""
+        real_link = mint_auto_diagnoser.os.link
+        real_write = mint_auto_diagnoser.os.write
+
+        def no_cross_directory_link(source, destination, *args, **kwargs):
+            if kwargs.get("src_dir_fd") != kwargs.get("dst_dir_fd"):
+                raise OSError("cross-directory links unavailable")
+            return real_link(source, destination, *args, **kwargs)
+
+        def short_write(descriptor, data):
+            return real_write(descriptor, data[:1])
+
+        with patch.object(mint_auto_diagnoser.os, "link", side_effect=no_cross_directory_link), patch.object(
+            mint_auto_diagnoser.os, "write", side_effect=short_write
+        ):
+            batch = self.prepare()
+        stage = next(stage for stage in batch.stages if not stage.skipped)
+        self.assertEqual(
+            (self.root / stage.relative_root / "zavod-mev-bot-rust-version-cli").read_bytes(),
+            self.production["zavod-mev-bot-rust-version-cli"],
+        )
 
 
 if __name__ == "__main__":
