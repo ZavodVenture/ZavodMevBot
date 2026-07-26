@@ -481,6 +481,8 @@ def _prepare_stage(stage_fd, root_fd, batch_id, index, name, config, mint, balan
 
 def prepare_batch(root: Path, mint: str, now=None, transport=None, balance_reader=None) -> PreparedBatch:
     """Validate one mint and create private stage workspaces without editing production."""
+    if threading.current_thread() is not threading.main_thread():
+        raise DiagnoserError("batch preparation must run on the main thread")
     root_fd = state_fd = runs_fd = batch_fd = stages_fd = None
     batch_id = None
     active_created = False
@@ -489,9 +491,12 @@ def prepare_batch(root: Path, mint: str, now=None, transport=None, balance_reade
         config_bytes = _read_owned_file(root_fd, "config.toml", mode=0o600)
         tokens_bytes = _read_owned_file(root_fd, "tokens.toml", mode=0o600)
         binary_bytes = _read_owned_file(root_fd, BINARY_NAME, executable=True)
-        config = _parse_toml(config_bytes)
-        rpc_url = _nested_value(config, ("rpc",), "url")
-        private_key = _nested_value(config, ("wallet",), "private_key")
+        try:
+            runtime_config = zavod_guard.load_config_bytes(config_bytes)
+        except zavod_guard.GuardError as exc:
+            raise DiagnoserError("production configuration is invalid") from exc
+        rpc_url = _nested_value(runtime_config, ("rpc",), "url")
+        private_key = _nested_value(runtime_config, ("wallet",), "private_key")
         if not isinstance(rpc_url, str) or not isinstance(private_key, str):
             raise DiagnoserError("production configuration is invalid")
         try:

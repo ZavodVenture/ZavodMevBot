@@ -6,6 +6,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import tomllib
 import unittest
 from datetime import datetime, timezone
@@ -282,6 +283,67 @@ except BaseException as exc:
             (self.root / stage.relative_root / "zavod-mev-bot-rust-version-cli").read_bytes(),
             self.production["zavod-mev-bot-rust-version-cli"],
         )
+
+    def test_environment_backed_runtime_values_are_expanded_for_validation(self):
+        """Runtime RPC and wallet consumers must receive exact expanded TOML values."""
+        source = SOURCE.replace(
+            b'url = "https://fixture.invalid"', b'url = "${AUTODIAG_TEST_RPC}"'
+        ).replace(
+            b'private_key = "test-wallet"', b'private_key = "$AUTODIAG_TEST_KEY"'
+        )
+        (self.root / "config.toml").write_bytes(source)
+        runtime_rpc = "runtime-rpc"
+        runtime_key = "runtime-key"
+        observed = {"transport": [], "wallet": [], "balance": []}
+
+        def transport(url, payload, timeout):
+            del payload, timeout
+            observed["transport"].append(url)
+            return self.transport(url, {"method": "getAccountInfo"}, 5)
+
+        def wallet_pubkey(value):
+            observed["wallet"].append(value)
+            return "wallet"
+
+        def balance_reader(url, wallet):
+            observed["balance"].append((url, wallet))
+            return 1
+
+        with patch.dict(os.environ, {"AUTODIAG_TEST_RPC": runtime_rpc, "AUTODIAG_TEST_KEY": runtime_key}), patch.object(
+            mint_auto_diagnoser.zavod_guard, "wallet_pubkey", side_effect=wallet_pubkey
+        ):
+            mint_auto_diagnoser.prepare_batch(
+                self.root,
+                TARGET_MINT,
+                now=lambda: datetime(2026, 7, 26, 12, 30, tzinfo=timezone.utc),
+                transport=transport,
+                balance_reader=balance_reader,
+            )
+
+        self.assertEqual(observed["transport"], [runtime_rpc])
+        self.assertEqual(observed["wallet"], [runtime_key])
+        self.assertEqual(observed["balance"], [(runtime_rpc, "wallet")])
+        batch_config = next((self.root / "state" / "auto-diagnose-runs").glob("*/production-config.toml"))
+        self.assertEqual(batch_config.read_bytes(), source)
+
+    def test_worker_thread_rejects_preparation_before_private_state_changes(self):
+        """A thread without signal-handler authority must not create an active batch."""
+        failures = []
+
+        def worker():
+            try:
+                self.prepare()
+            except BaseException as exc:
+                failures.append(exc)
+
+        thread = threading.Thread(target=worker)
+        thread.start()
+        thread.join()
+
+        self.assertEqual(len(failures), 1)
+        self.assertIsInstance(failures[0], mint_auto_diagnoser.DiagnoserError)
+        self.assertFalse((self.root / "state" / ".mint-auto-diagnose-active").exists())
+        self.assertFalse((self.root / "state" / "auto-diagnose-runs").exists())
 
 
 if __name__ == "__main__":
