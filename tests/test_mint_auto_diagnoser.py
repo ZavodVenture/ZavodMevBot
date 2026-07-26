@@ -505,6 +505,65 @@ class StageEvidenceTests(unittest.TestCase):
                 transport=transport or self.empty_transport,
             )
 
+    def assert_result_substitution_keeps_active_marker(self, result_path):
+        replacement = (
+            b'{"completed_stages":["baseline"],'
+            b'"cumulative_observed_loss_lamports":1,'
+            b'"status":"target_positive"}\n'
+        )
+        active_path = (
+            self.root / "state" / mint_auto_diagnoser.ACTIVE_MARKER
+        )
+        batch_identity = (
+            result_path.parent.stat().st_dev,
+            result_path.parent.stat().st_ino,
+        )
+        real_fsync = mint_auto_diagnoser.os.fsync
+        substituted = False
+
+        def substitute_after_batch_fsync(descriptor):
+            nonlocal substituted
+            result = real_fsync(descriptor)
+            info = os.fstat(descriptor)
+            if (
+                not substituted
+                and (info.st_dev, info.st_ino) == batch_identity
+                and result_path.exists()
+            ):
+                os.unlink(result_path)
+                replacement_fd = os.open(
+                    result_path,
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | getattr(os, "O_NOFOLLOW", 0),
+                    0o600,
+                )
+                try:
+                    os.fchmod(replacement_fd, 0o600)
+                    os.write(replacement_fd, replacement)
+                    real_fsync(replacement_fd)
+                finally:
+                    os.close(replacement_fd)
+                substituted = True
+            return result
+
+        with patch.object(
+            mint_auto_diagnoser.os,
+            "fsync",
+            side_effect=substitute_after_batch_fsync,
+        ):
+            with self.assertRaises(mint_auto_diagnoser.DiagnoserError):
+                mint_auto_diagnoser.finalize_batch(
+                    self.root, self.batch.batch_id
+                )
+
+        self.assertTrue(substituted)
+        self.assertEqual(result_path.read_bytes(), replacement)
+        self.assertEqual(
+            active_path.read_text(), self.batch.batch_id + "\n"
+        )
+
     def test_exact_structural_target_artifact_is_target_positive(self):
         """Dropping exact hot-token identity evidence must stop satisfying the stage."""
         self.write_guard_result()
@@ -1051,6 +1110,41 @@ class StageEvidenceTests(unittest.TestCase):
         self.assertEqual(result_path.stat().st_ino, published_inode)
         self.assertFalse(active_path.exists())
 
+    def test_newly_published_result_substitution_keeps_active_marker(self):
+        """Replacing a new result after fsync must stop before marker release."""
+        self.write_guard_result()
+        self.write_artifact("hot_tokens.json", self.hot_tokens(TARGET_MINT))
+        self.record()
+        result_path = (
+            self.root
+            / mint_auto_diagnoser.batch_result_path(self.batch.batch_id)
+        )
+
+        self.assertFalse(result_path.exists())
+        self.assert_result_substitution_keeps_active_marker(result_path)
+
+    def test_existing_result_substitution_keeps_active_marker(self):
+        """Replacing a validated result after fsync must stop marker recovery."""
+        self.write_guard_result()
+        self.write_artifact("hot_tokens.json", self.hot_tokens(TARGET_MINT))
+        self.record()
+        result_path = (
+            self.root
+            / mint_auto_diagnoser.batch_result_path(self.batch.batch_id)
+        )
+        with patch.object(
+            mint_auto_diagnoser,
+            "_remove_active_marker",
+            side_effect=KeyboardInterrupt,
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                mint_auto_diagnoser.finalize_batch(
+                    self.root, self.batch.batch_id
+                )
+
+        self.assertTrue(result_path.exists())
+        self.assert_result_substitution_keeps_active_marker(result_path)
+
     def test_finalize_fsyncs_result_directory_before_marker_release(self):
         """Marker release before the result directory fsync could lose both states."""
         self.write_guard_result()
@@ -1213,6 +1307,97 @@ class StageEvidenceTests(unittest.TestCase):
 
         self.assertTrue(swapped)
         self.assertEqual(active_path.read_bytes(), replacement)
+
+    def test_quarantine_rollback_never_replaces_new_active_marker(self):
+        """Rollback must preserve a marker created after the absent-name check."""
+        self.write_guard_result()
+        self.write_artifact("hot_tokens.json", self.hot_tokens(TARGET_MINT))
+        self.record()
+        state_path = self.root / "state"
+        active_path = state_path / mint_auto_diagnoser.ACTIVE_MARKER
+        quarantined_marker = b"20260726T123001Z\n"
+        new_active_marker = b"20260726T123002Z\n"
+        real_stat = mint_auto_diagnoser.os.stat
+        real_link = mint_auto_diagnoser.os.link
+        substituted = False
+        injected_at_rollback = False
+
+        def write_marker(parent_fd, data):
+            descriptor = os.open(
+                mint_auto_diagnoser.ACTIVE_MARKER,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+                dir_fd=parent_fd,
+            )
+            try:
+                os.write(descriptor, data)
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+
+        def inject_marker_at_rollback(path, *args, **kwargs):
+            nonlocal substituted, injected_at_rollback
+            if (
+                path != mint_auto_diagnoser.ACTIVE_MARKER
+                or kwargs.get("dir_fd") is None
+            ):
+                return real_stat(path, *args, **kwargs)
+            try:
+                info = real_stat(path, *args, **kwargs)
+            except FileNotFoundError:
+                if substituted and not injected_at_rollback:
+                    write_marker(kwargs["dir_fd"], new_active_marker)
+                    injected_at_rollback = True
+                raise
+            if not substituted:
+                substituted = True
+                os.unlink(path, dir_fd=kwargs["dir_fd"])
+                write_marker(kwargs["dir_fd"], quarantined_marker)
+            return info
+
+        def inject_before_restore_link(
+            source, destination, *args, **kwargs
+        ):
+            nonlocal injected_at_rollback
+            if (
+                not injected_at_rollback
+                and str(source).startswith(
+                    mint_auto_diagnoser.ACTIVE_MARKER
+                    + ".releasing-"
+                )
+                and destination == mint_auto_diagnoser.ACTIVE_MARKER
+            ):
+                write_marker(kwargs["dst_dir_fd"], new_active_marker)
+                injected_at_rollback = True
+            return real_link(source, destination, *args, **kwargs)
+
+        with patch.object(
+            mint_auto_diagnoser.os,
+            "stat",
+            side_effect=inject_marker_at_rollback,
+        ), patch.object(
+            mint_auto_diagnoser.os,
+            "link",
+            side_effect=inject_before_restore_link,
+        ):
+            with self.assertRaises(mint_auto_diagnoser.DiagnoserError):
+                mint_auto_diagnoser.finalize_batch(
+                    self.root, self.batch.batch_id
+                )
+
+        quarantines = tuple(
+            state_path.glob(
+                mint_auto_diagnoser.ACTIVE_MARKER + ".releasing-*"
+            )
+        )
+        self.assertTrue(substituted)
+        self.assertTrue(injected_at_rollback)
+        self.assertEqual(active_path.read_bytes(), new_active_marker)
+        self.assertEqual(len(quarantines), 1)
+        self.assertEqual(quarantines[0].read_bytes(), quarantined_marker)
 
     def test_finalize_rejects_mismatched_existing_result(self):
         """An existing result that disagrees with state must remain untouched and active."""

@@ -1801,33 +1801,55 @@ def _existing_batch_result(batch_fd, expected):
                 break
             chunks.append(chunk)
         data = b"".join(chunks)
+        result = _decode_json_object(
+            data,
+            "batch result is invalid",
+            reject_duplicate_keys=True,
+        )
+        if (
+            set(result) != BATCH_RESULT_KEYS
+            or not isinstance(result.get("status"), str)
+            or result["status"] not in TERMINAL_BATCH_STATES
+            or not isinstance(result.get("completed_stages"), list)
+            or any(
+                not isinstance(name, str) or name not in STAGE_NAMES
+                for name in result["completed_stages"]
+            )
+            or type(
+                result.get("cumulative_observed_loss_lamports")
+            )
+            is not int
+            or result["cumulative_observed_loss_lamports"] < 0
+            or result != expected
+        ):
+            raise DiagnoserError("batch result is invalid")
+        return result, descriptor
+    except (OSError, DiagnoserError) as exc:
+        os.close(descriptor)
+        raise DiagnoserError("batch result is invalid") from exc
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _revalidate_batch_result_path(batch_fd, descriptor):
+    try:
+        identity = _validate_owned(descriptor, "file", mode=0o600)
+        named = os.stat(
+            "batch-result.json",
+            dir_fd=batch_fd,
+            follow_symlinks=False,
+        )
     except (OSError, DiagnoserError) as exc:
         raise DiagnoserError("batch result is invalid") from exc
-    finally:
-        os.close(descriptor)
-    result = _decode_json_object(
-        data,
-        "batch result is invalid",
-        reject_duplicate_keys=True,
-    )
     if (
-        set(result) != BATCH_RESULT_KEYS
-        or not isinstance(result.get("status"), str)
-        or result["status"] not in TERMINAL_BATCH_STATES
-        or not isinstance(result.get("completed_stages"), list)
-        or any(
-            not isinstance(name, str) or name not in STAGE_NAMES
-            for name in result["completed_stages"]
-        )
-        or type(
-            result.get("cumulative_observed_loss_lamports")
-        )
-        is not int
-        or result["cumulative_observed_loss_lamports"] < 0
-        or result != expected
+        not stat.S_ISREG(named.st_mode)
+        or named.st_uid != os.geteuid()
+        or stat.S_IMODE(named.st_mode) != 0o600
+        or (named.st_dev, named.st_ino)
+        != (identity.st_dev, identity.st_ino)
     ):
         raise DiagnoserError("batch result is invalid")
-    return result
 
 
 def _remove_finalized_active_marker(state_fd, batch_id):
@@ -1895,6 +1917,7 @@ def _remove_finalized_active_marker(state_fd, batch_id):
     except OSError as exc:
         raise DiagnoserError("active batch marker is invalid") from exc
     quarantine_fd = None
+    quarantine_identity = None
     quarantine_valid = False
     try:
         quarantine_fd = os.open(
@@ -1927,24 +1950,67 @@ def _remove_finalized_active_marker(state_fd, batch_id):
             os.close(quarantine_fd)
     if not quarantine_valid:
         try:
-            os.stat(
+            named_quarantine = os.stat(
+                quarantine,
+                dir_fd=state_fd,
+                follow_symlinks=False,
+            )
+            if (
+                quarantine_identity is None
+                or not stat.S_ISREG(named_quarantine.st_mode)
+                or named_quarantine.st_uid != os.geteuid()
+                or stat.S_IMODE(named_quarantine.st_mode) != 0o600
+                or (
+                    named_quarantine.st_dev,
+                    named_quarantine.st_ino,
+                )
+                != (
+                    quarantine_identity.st_dev,
+                    quarantine_identity.st_ino,
+                )
+            ):
+                raise DiagnoserError(
+                    "active batch marker is invalid"
+                )
+            os.link(
+                quarantine,
+                ACTIVE_MARKER,
+                src_dir_fd=state_fd,
+                dst_dir_fd=state_fd,
+                follow_symlinks=False,
+            )
+            restored = os.stat(
                 ACTIVE_MARKER,
                 dir_fd=state_fd,
                 follow_symlinks=False,
             )
-        except FileNotFoundError:
-            try:
-                os.rename(
-                    quarantine,
-                    ACTIVE_MARKER,
-                    src_dir_fd=state_fd,
-                    dst_dir_fd=state_fd,
-                )
-                os.fsync(state_fd)
-            except OSError as exc:
+            remaining = os.stat(
+                quarantine,
+                dir_fd=state_fd,
+                follow_symlinks=False,
+            )
+            expected_identity = (
+                quarantine_identity.st_dev,
+                quarantine_identity.st_ino,
+            )
+            if (
+                (restored.st_dev, restored.st_ino)
+                != expected_identity
+                or (remaining.st_dev, remaining.st_ino)
+                != expected_identity
+            ):
                 raise DiagnoserError(
                     "active batch marker is invalid"
-                ) from exc
+                )
+            os.fsync(state_fd)
+            os.unlink(quarantine, dir_fd=state_fd)
+            os.fsync(state_fd)
+        except DiagnoserError:
+            raise
+        except OSError as exc:
+            raise DiagnoserError(
+                "active batch marker is invalid"
+            ) from exc
         raise DiagnoserError("active batch marker is invalid")
     try:
         os.unlink(quarantine, dir_fd=state_fd)
@@ -1966,6 +2032,7 @@ def finalize_batch(root: Path, batch_id: str) -> dict:
     """Publish one fixed batch result and release its active marker."""
     batch_id = _validate_batch_id(batch_id)
     descriptors = _batch_descriptors(root, batch_id)
+    result_fd = None
     try:
         _lock_batch(descriptors, exclusive=True)
         descriptors["state_lock"] = _acquire_state_marker_lock(
@@ -2003,10 +2070,10 @@ def finalize_batch(root: Path, batch_id: str) -> dict:
                 "cumulative_observed_loss_lamports"
             ],
         }
-        existing = _existing_batch_result(
+        existing_result = _existing_batch_result(
             descriptors["batch"], result
         )
-        if existing is None:
+        if existing_result is None:
             _write_private_at(
                 descriptors["batch"],
                 "batch-result.json",
@@ -2019,14 +2086,26 @@ def finalize_batch(root: Path, batch_id: str) -> dict:
                     + "\n"
                 ).encode(),
             )
-        else:
-            result = existing
+            existing_result = _existing_batch_result(
+                descriptors["batch"], result
+            )
+            if existing_result is None:
+                raise DiagnoserError("batch result is invalid")
+        result, result_fd = existing_result
         os.fsync(descriptors["batch"])
+        _revalidate_batch_result_path(
+            descriptors["batch"], result_fd
+        )
         _remove_active_marker(
             descriptors["state"], batch_id, strict=True
         )
         return result
     finally:
+        if result_fd is not None:
+            try:
+                os.close(result_fd)
+            except OSError:
+                pass
         _close_descriptors(descriptors)
 
 
