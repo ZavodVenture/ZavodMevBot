@@ -968,8 +968,8 @@ class StageEvidenceTests(unittest.TestCase):
             "stop",
         )
 
-    def test_finalize_publishes_once_and_decline_is_one_way(self):
-        """Replacing a batch result or returning from declined to prepared must fail."""
+    def test_finalize_reuses_result_and_decline_is_one_way(self):
+        """Repeated finalization must reuse one result and keep decline terminal."""
         self.write_guard_result()
         self.write_artifact("hot_tokens.json", self.hot_tokens(TARGET_MINT))
         self.record()
@@ -986,10 +986,14 @@ class StageEvidenceTests(unittest.TestCase):
         self.assertFalse(
             (self.root / "state" / ".mint-auto-diagnose-active").exists()
         )
-        with self.assertRaises(mint_auto_diagnoser.DiagnoserError):
-            mint_auto_diagnoser.finalize_batch(
-                self.root, self.batch.batch_id
-            )
+        published = result_path.read_bytes()
+        published_inode = result_path.stat().st_ino
+        repeated = mint_auto_diagnoser.finalize_batch(
+            self.root, self.batch.batch_id
+        )
+        self.assertEqual(repeated, result)
+        self.assertEqual(result_path.read_bytes(), published)
+        self.assertEqual(result_path.stat().st_ino, published_inode)
 
         self.tearDown()
         self.setUp()
@@ -1002,6 +1006,112 @@ class StageEvidenceTests(unittest.TestCase):
                 self.root, self.batch.batch_id
             ),
             "stop",
+        )
+
+    def test_finalize_recovers_after_post_publication_interrupt(self):
+        """Losing marker removal after durable publication must not strand finalization."""
+        self.write_guard_result()
+        self.write_artifact("hot_tokens.json", self.hot_tokens(TARGET_MINT))
+        self.record()
+        result_path = (
+            self.root
+            / mint_auto_diagnoser.batch_result_path(self.batch.batch_id)
+        )
+        active_path = (
+            self.root / "state" / mint_auto_diagnoser.ACTIVE_MARKER
+        )
+
+        with patch.object(
+            mint_auto_diagnoser,
+            "_remove_active_marker",
+            side_effect=KeyboardInterrupt,
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                mint_auto_diagnoser.finalize_batch(
+                    self.root, self.batch.batch_id
+                )
+
+        published = result_path.read_bytes()
+        published_inode = result_path.stat().st_ino
+        self.assertTrue(active_path.exists())
+
+        recovered = mint_auto_diagnoser.finalize_batch(
+            self.root, self.batch.batch_id
+        )
+
+        self.assertEqual(
+            recovered,
+            {
+                "status": "target_positive",
+                "completed_stages": ["baseline"],
+                "cumulative_observed_loss_lamports": 0,
+            },
+        )
+        self.assertEqual(result_path.read_bytes(), published)
+        self.assertEqual(result_path.stat().st_ino, published_inode)
+        self.assertFalse(active_path.exists())
+
+    def test_finalize_rejects_mismatched_existing_result(self):
+        """An existing result that disagrees with state must remain untouched and active."""
+        self.write_guard_result()
+        self.write_artifact("hot_tokens.json", self.hot_tokens(TARGET_MINT))
+        self.record()
+        result_path = (
+            self.root
+            / mint_auto_diagnoser.batch_result_path(self.batch.batch_id)
+        )
+        mismatch = (
+            b'{"completed_stages":["baseline"],'
+            b'"cumulative_observed_loss_lamports":1,'
+            b'"status":"target_positive"}\n'
+        )
+        result_path.write_bytes(mismatch)
+        result_path.chmod(0o600)
+        published_inode = result_path.stat().st_ino
+        active_path = (
+            self.root / "state" / mint_auto_diagnoser.ACTIVE_MARKER
+        )
+
+        with self.assertRaises(mint_auto_diagnoser.DiagnoserError):
+            mint_auto_diagnoser.finalize_batch(
+                self.root, self.batch.batch_id
+            )
+
+        self.assertEqual(result_path.read_bytes(), mismatch)
+        self.assertEqual(result_path.stat().st_ino, published_inode)
+        self.assertEqual(
+            active_path.read_text(), self.batch.batch_id + "\n"
+        )
+
+    def test_finalize_rejects_duplicate_key_existing_result(self):
+        """Duplicate JSON keys must not satisfy the fixed batch-result schema."""
+        self.write_guard_result()
+        self.write_artifact("hot_tokens.json", self.hot_tokens(TARGET_MINT))
+        self.record()
+        result_path = (
+            self.root
+            / mint_auto_diagnoser.batch_result_path(self.batch.batch_id)
+        )
+        malformed = (
+            b'{"completed_stages":["baseline"],'
+            b'"cumulative_observed_loss_lamports":0,'
+            b'"status":"target_positive",'
+            b'"status":"target_positive"}\n'
+        )
+        result_path.write_bytes(malformed)
+        result_path.chmod(0o600)
+        active_path = (
+            self.root / "state" / mint_auto_diagnoser.ACTIVE_MARKER
+        )
+
+        with self.assertRaises(mint_auto_diagnoser.DiagnoserError):
+            mint_auto_diagnoser.finalize_batch(
+                self.root, self.batch.batch_id
+            )
+
+        self.assertEqual(result_path.read_bytes(), malformed)
+        self.assertEqual(
+            active_path.read_text(), self.batch.batch_id + "\n"
         )
 
     def test_manifest_is_fixed_private_and_contains_no_protected_values(self):

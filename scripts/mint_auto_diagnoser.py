@@ -131,6 +131,13 @@ STAGE_MANIFEST_KEYS = frozenset(
         "next_decision",
     }
 )
+BATCH_RESULT_KEYS = frozenset(
+    {
+        "status",
+        "completed_stages",
+        "cumulative_observed_loss_lamports",
+    }
+)
 
 
 def _configuration_error():
@@ -443,7 +450,10 @@ def _link_or_copy_binary(root_fd, stage_fd, binary):
         raise DiagnoserError("private binary preparation failed")
 
 
-def _remove_active_marker(state_fd, batch_id):
+def _remove_active_marker(state_fd, batch_id, *, strict=False):
+    if strict:
+        _remove_finalized_active_marker(state_fd, batch_id)
+        return
     try:
         marker = _read_owned_file(state_fd, ACTIVE_MARKER, mode=0o600)
     except DiagnoserError:
@@ -694,12 +704,25 @@ def _lock_batch(descriptors, exclusive):
     descriptors["lock"] = descriptor
 
 
-def _decode_json_object(data, error):
+def _decode_json_object(
+    data, error, *, reject_duplicate_keys=False
+):
+    def object_from_pairs(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError("duplicate object key")
+            value[key] = item
+        return value
+
     try:
         value = json.loads(
             data.decode(),
             parse_constant=lambda item: (_ for _ in ()).throw(
                 ValueError(item)
+            ),
+            object_pairs_hook=(
+                object_from_pairs if reject_duplicate_keys else None
             ),
         )
     except (UnicodeError, ValueError, TypeError, json.JSONDecodeError) as exc:
@@ -1718,6 +1741,105 @@ def next_stage(root: Path, batch_id: str) -> str:
         _close_descriptors(descriptors)
 
 
+def _existing_batch_result(batch_fd, expected):
+    descriptor = None
+    try:
+        descriptor = os.open(
+            "batch-result.json",
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=batch_fd,
+        )
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise DiagnoserError("batch result is invalid") from exc
+    try:
+        _validate_owned(descriptor, "file", mode=0o600)
+        chunks = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        data = b"".join(chunks)
+    except (OSError, DiagnoserError) as exc:
+        raise DiagnoserError("batch result is invalid") from exc
+    finally:
+        os.close(descriptor)
+    result = _decode_json_object(
+        data,
+        "batch result is invalid",
+        reject_duplicate_keys=True,
+    )
+    if (
+        set(result) != BATCH_RESULT_KEYS
+        or not isinstance(result.get("status"), str)
+        or result["status"] not in TERMINAL_BATCH_STATES
+        or not isinstance(result.get("completed_stages"), list)
+        or any(
+            not isinstance(name, str) or name not in STAGE_NAMES
+            for name in result["completed_stages"]
+        )
+        or type(
+            result.get("cumulative_observed_loss_lamports")
+        )
+        is not int
+        or result["cumulative_observed_loss_lamports"] < 0
+        or result != expected
+    ):
+        raise DiagnoserError("batch result is invalid")
+    return result
+
+
+def _remove_finalized_active_marker(state_fd, batch_id):
+    descriptor = None
+    try:
+        descriptor = os.open(
+            ACTIVE_MARKER,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=state_fd,
+        )
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise DiagnoserError("active batch marker is invalid") from exc
+    try:
+        identity = _validate_owned(descriptor, "file", mode=0o600)
+        chunks = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        marker = b"".join(chunks)
+    except (OSError, DiagnoserError) as exc:
+        raise DiagnoserError("active batch marker is invalid") from exc
+    finally:
+        os.close(descriptor)
+    if marker != f"{batch_id}\n".encode():
+        raise DiagnoserError("active batch marker is invalid")
+    try:
+        named = os.stat(
+            ACTIVE_MARKER,
+            dir_fd=state_fd,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(named.st_mode)
+            or named.st_uid != os.geteuid()
+            or stat.S_IMODE(named.st_mode) != 0o600
+            or (named.st_dev, named.st_ino)
+            != (identity.st_dev, identity.st_ino)
+        ):
+            raise DiagnoserError("active batch marker is invalid")
+        os.unlink(ACTIVE_MARKER, dir_fd=state_fd)
+        os.fsync(state_fd)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise DiagnoserError("active batch marker is invalid") from exc
+
+
 def finalize_batch(root: Path, batch_id: str) -> dict:
     """Publish one fixed batch result and release its active marker."""
     batch_id = _validate_batch_id(batch_id)
@@ -1756,15 +1878,27 @@ def finalize_batch(root: Path, batch_id: str) -> dict:
                 "cumulative_observed_loss_lamports"
             ],
         }
-        _write_private_at(
-            descriptors["batch"],
-            "batch-result.json",
-            (
-                json.dumps(result, sort_keys=True, separators=(",", ":"))
-                + "\n"
-            ).encode(),
+        existing = _existing_batch_result(
+            descriptors["batch"], result
         )
-        _remove_active_marker(descriptors["state"], batch_id)
+        if existing is None:
+            _write_private_at(
+                descriptors["batch"],
+                "batch-result.json",
+                (
+                    json.dumps(
+                        result,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    + "\n"
+                ).encode(),
+            )
+        else:
+            result = existing
+        _remove_active_marker(
+            descriptors["state"], batch_id, strict=True
+        )
         return result
     finally:
         _close_descriptors(descriptors)
