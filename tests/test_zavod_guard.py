@@ -1269,7 +1269,12 @@ class RunGuardedHardeningTests(unittest.TestCase):
     DIAGNOSTIC_RUN_ID = "20260724T190000Z"
     ORIGINAL_DIAGNOSTIC_BYTES = b"original diagnostic descriptor fixture\n"
 
-    def run_with_mocks(self, pump=None, cleanup=None):
+    def run_with_mocks(
+        self,
+        pump=None,
+        cleanup=None,
+        timeout_seconds=zavod_guard.DEFAULT_TIMEOUT_SECONDS,
+    ):
         config = valid_config()
         child = Mock(pid=123, returncode=0, stdout=io.BytesIO())
         cleanup = cleanup or {
@@ -1313,11 +1318,13 @@ class RunGuardedHardeningTests(unittest.TestCase):
             with patches[0], patches[1], patches[2], patches[3], patches[4]:
                 if pump is None:
                     return zavod_guard.run_guarded(
-                        Path(temp_dir) / "config.toml"
+                        Path(temp_dir) / "config.toml",
+                        timeout_seconds=timeout_seconds,
                     )
                 with patches[5]:
                     return zavod_guard.run_guarded(
-                        Path(temp_dir) / "config.toml"
+                        Path(temp_dir) / "config.toml",
+                        timeout_seconds=timeout_seconds,
                     )
 
     def prepare_diagnostic_workspace(self, root, config_bytes=None):
@@ -1582,13 +1589,30 @@ class RunGuardedHardeningTests(unittest.TestCase):
         output_pump.assert_not_called()
 
     def test_run_guarded_defensively_rejects_timeout_outside_bounds(self):
-        for value in (29, 301):
+        for value in (29, 1201):
             with self.subTest(value=value):
+                with self.assertRaisesRegex(
+                    GuardError,
+                    "timeout must be from 30 through 1200 seconds",
+                ):
+                    zavod_guard.run_guarded("unused-config.toml", value)
+
+    def test_run_guarded_accepts_1200_seconds_for_default_profile(self):
+        result = self.run_with_mocks(timeout_seconds=1200)
+        self.assertEqual(result["reason"], "child_exit")
+
+    def test_run_guarded_keeps_non_default_profiles_at_300_seconds(self):
+        for profile in ("single-mint-auto", "selector-diagnostic"):
+            with self.subTest(profile=profile):
                 with self.assertRaisesRegex(
                     GuardError,
                     "timeout must be from 30 through 300 seconds",
                 ):
-                    zavod_guard.run_guarded("unused-config.toml", value)
+                    zavod_guard.run_guarded(
+                        "unused-config.toml",
+                        1200,
+                        profile=profile,
+                    )
 
     def test_selector_diagnostic_uses_exact_test_mode_argv(self):
         config = valid_config()
@@ -2843,6 +2867,11 @@ class RunGuardedWrapperTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertIn('"--timeout-seconds", "60"', result.stdout)
 
+    def test_accepts_maximum_default_timeout(self):
+        result = self.invoke("--live-confirmed", "--timeout", "1200")
+        self.assertEqual(result.returncode, 0)
+        self.assertIn('"--timeout-seconds", "1200"', result.stdout)
+
     def test_accepts_single_mint_profile(self):
         result = self.invoke(
             "--live-confirmed",
@@ -2953,9 +2982,21 @@ class RunGuardedWrapperTests(unittest.TestCase):
         )
 
     def test_rejects_timeout_outside_bounds(self):
-        for value in ("29", "301", "invalid"):
+        for value in ("29", "1201", "invalid"):
             with self.subTest(value=value):
                 result = self.invoke("--live-confirmed", "--timeout", value)
+                self.assertEqual(result.returncode, 64)
+
+    def test_non_default_profiles_reject_extended_timeout(self):
+        for profile in ("single-mint-auto", "selector-diagnostic"):
+            with self.subTest(profile=profile):
+                result = self.invoke(
+                    "--live-confirmed",
+                    "--timeout",
+                    "1200",
+                    "--profile",
+                    profile,
+                )
                 self.assertEqual(result.returncode, 64)
 
     def test_rejects_missing_confirmation_and_extra_arguments(self):

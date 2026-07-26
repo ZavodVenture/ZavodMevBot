@@ -6,7 +6,7 @@ root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 cd -- "$root"
 
 usage() {
-  echo 'Usage: run-guarded.sh --live-confirmed [--timeout 30..300] [--profile default|single-mint-auto] | run-guarded.sh --live-confirmed --timeout 30..300 --profile selector-diagnostic --config state/mint-runs/RUN_ID/selector-diagnostic.toml --test-mode --diagnostic-mode d0 --diagnostic-target MINT --config-sha256 SHA256 --tokens-sha256 SHA256' >&2
+  echo 'Usage: run-guarded.sh --live-confirmed [--timeout 30..1200] [--profile default] | run-guarded.sh --live-confirmed [--timeout 30..300] --profile single-mint-auto | run-guarded.sh --live-confirmed --timeout 30..300 --profile selector-diagnostic --config state/mint-runs/RUN_ID/selector-diagnostic.toml --test-mode --diagnostic-mode d0 --diagnostic-target MINT --config-sha256 SHA256 --tokens-sha256 SHA256' >&2
   exit 64
 }
 
@@ -174,15 +174,20 @@ while (( $# > 0 )); do
   esac
 done
 
-[[ "$timeout_seconds" =~ ^[0-9]+$ ]] || {
-  echo 'Timeout must be an integer from 30 through 300.' >&2
-  exit 64
-}
-(( timeout_seconds >= 30 && timeout_seconds <= 300 )) || {
-  echo 'Timeout must be an integer from 30 through 300.' >&2
-  exit 64
-}
 [[ "$profile" == "default" || "$profile" == "single-mint-auto" || "$profile" == "selector-diagnostic" ]] || usage
+max_timeout_seconds=300
+if [[ "$profile" == "default" ]]; then
+  max_timeout_seconds=1200
+fi
+
+[[ "$timeout_seconds" =~ ^[0-9]+$ ]] || {
+  echo "Timeout must be an integer from 30 through $max_timeout_seconds." >&2
+  exit 64
+}
+(( timeout_seconds >= 30 && timeout_seconds <= max_timeout_seconds )) || {
+  echo "Timeout must be an integer from 30 through $max_timeout_seconds." >&2
+  exit 64
+}
 
 if [[ "$profile" == "selector-diagnostic" ]]; then
   ((

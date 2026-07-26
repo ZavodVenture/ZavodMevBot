@@ -37,6 +37,7 @@ PROFILE_SENDERS = {
 LOSS_LIMIT_LAMPORTS = 30_000_000
 EARLY_STOP_LAMPORTS = 25_000_000
 DEFAULT_TIMEOUT_SECONDS = 300
+MAX_DEFAULT_TIMEOUT_SECONDS = 1200
 TOKEN_PROGRAM_ID = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
 TOKEN_2022_PROGRAM_ID = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
 DISPATCH_SCAN_OVERLAP = 256
@@ -1447,12 +1448,19 @@ def run_guarded(
     token_account_snapshot_reader=None,
     mint_account_validator=None,
 ):
+    max_timeout_seconds = (
+        MAX_DEFAULT_TIMEOUT_SECONDS
+        if profile == "default"
+        else DEFAULT_TIMEOUT_SECONDS
+    )
     if (
         isinstance(timeout_seconds, bool)
         or not isinstance(timeout_seconds, int)
-        or not 30 <= timeout_seconds <= DEFAULT_TIMEOUT_SECONDS
+        or not 30 <= timeout_seconds <= max_timeout_seconds
     ):
-        raise GuardError("timeout must be from 30 through 300 seconds")
+        raise GuardError(
+            f"timeout must be from 30 through {max_timeout_seconds} seconds"
+        )
     if (profile == "selector-diagnostic") != test_mode:
         raise GuardError(
             "selector-diagnostic profile and test mode must be provided together"
