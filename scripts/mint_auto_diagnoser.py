@@ -1251,6 +1251,28 @@ def evaluate_stage(
         guard, guard_integers, _ = _parse_stage_guard(stage_fd, guard_exit)
         log_snapshot = _stage_log_snapshot(stage_fd, guard["log_path"])
         log_events = _aggregate_stage_log(log_snapshot)
+        if guard_exit != 0:
+            return _stage_evaluation(
+                stage_name,
+                "failed",
+                "guard_exit",
+                sender_accepted=log_events["sent_events"],
+                sender_rejected=log_events["error_events"],
+            )
+        if (
+            guard["reason"] not in {"timeout", "child_exit"}
+            or (
+                guard["reason"] == "child_exit"
+                and guard_integers["child_exit_code"] not in (None, 0)
+            )
+        ):
+            return _stage_evaluation(
+                stage_name,
+                "failed",
+                guard["reason"],
+                sender_accepted=log_events["sent_events"],
+                sender_rejected=log_events["error_events"],
+            )
         config_bytes = _read_owned_file(stage_fd, "config.toml", mode=0o600)
         try:
             config = zavod_guard.load_config_bytes(config_bytes)
@@ -1317,20 +1339,8 @@ def evaluate_stage(
             or evidence["routing_target_count"] > 0
             or chain["landed"] > 0
         )
-        if guard_exit != 0:
-            decision, stop_reason = "failed", "guard_exit"
-        elif guard["reason"] == "loss_threshold":
+        if cumulative_loss >= EARLY_STOP_LAMPORTS:
             decision, stop_reason = "failed", "loss_threshold"
-        elif cumulative_loss >= EARLY_STOP_LAMPORTS:
-            decision, stop_reason = "failed", "loss_threshold"
-        elif (
-            guard["reason"] not in {"timeout", "child_exit"}
-            or (
-                guard["reason"] == "child_exit"
-                and guard_integers["child_exit_code"] not in (None, 0)
-            )
-        ):
-            decision, stop_reason = "failed", guard["reason"]
         elif target_positive:
             decision, stop_reason = "target_positive", guard["reason"]
         else:
@@ -1356,6 +1366,69 @@ def evaluate_stage(
         if stage_fd is not None:
             os.close(stage_fd)
         _close_descriptors(descriptors)
+
+
+def write_batch_result(
+    root: Path,
+    batch_id: str,
+    target_mint: str,
+    terminal_status: str,
+    stop_reason: str,
+    executed_stage_names,
+    target_status: str,
+    three_hop_status: str,
+) -> dict:
+    """Write one terminal report that is never consumed for execution."""
+    batch_id = _validate_batch_id(batch_id)
+    if (
+        not isinstance(target_mint, str)
+        or re.fullmatch(
+            r"[1-9A-HJ-NP-Za-km-z]{32,44}", target_mint, re.ASCII
+        )
+        is None
+        or terminal_status
+        not in {"target_positive", "exhausted", "failed"}
+        or target_status not in {"positive", "absent", "unproven"}
+        or three_hop_status not in {"observed", "unproven"}
+    ):
+        raise DiagnoserError("batch result is invalid")
+    allowed_reasons = set(mint_runner.STOP_REASONS) | {
+        "guard_exit",
+        "artifact_error",
+        "evaluation_error",
+        "contract_error",
+        "stages_exhausted",
+    }
+    if stop_reason not in allowed_reasons:
+        raise DiagnoserError("batch result is invalid")
+    names = tuple(executed_stage_names)
+    if (
+        len(names) > len(STAGE_NAMES)
+        or len(set(names)) != len(names)
+        or any(name not in STAGE_NAMES for name in names)
+        or tuple(sorted(names, key=STAGE_NAMES.index)) != names
+    ):
+        raise DiagnoserError("batch result is invalid")
+    result = {
+        "batch_id": batch_id,
+        "target_mint": target_mint,
+        "terminal_status": terminal_status,
+        "stop_reason": stop_reason,
+        "executed_stage_names": list(names),
+        "target_status": target_status,
+        "three_hop_status": three_hop_status,
+        "cumulative_early_stop_lamports": EARLY_STOP_LAMPORTS,
+        "cumulative_loss_limit_lamports": LOSS_LIMIT_LAMPORTS,
+    }
+    rendered = (
+        json.dumps(result, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode()
+    descriptors = _batch_descriptors(root, batch_id)
+    try:
+        _write_private_at(descriptors["batch"], "batch-result.json", rendered)
+    finally:
+        _close_descriptors(descriptors)
+    return result
 
 
 
@@ -1458,6 +1531,27 @@ def main(argv=None):
     evaluate.add_argument("--guard-exit", required=True, type=int)
     evaluate.add_argument("--started-at", required=True, type=int)
     evaluate.add_argument("--ended-at", required=True, type=int)
+    write_result = commands.add_parser("write-batch-result")
+    write_result.add_argument("root", type=Path)
+    write_result.add_argument("batch_id")
+    write_result.add_argument("--target-mint", required=True)
+    write_result.add_argument(
+        "--terminal-status",
+        required=True,
+        choices=("target_positive", "exhausted", "failed"),
+    )
+    write_result.add_argument("--stop-reason", required=True)
+    write_result.add_argument(
+        "--target-status",
+        required=True,
+        choices=("positive", "absent", "unproven"),
+    )
+    write_result.add_argument(
+        "--three-hop-status",
+        required=True,
+        choices=("observed", "unproven"),
+    )
+    write_result.add_argument("--executed-stage", action="append", default=[])
     args = parser.parse_args(argv)
     if args.command == "prepare":
         print(json.dumps(_safe_batch_summary(prepare_batch(args.root, args.mint)), sort_keys=True))
@@ -1479,6 +1573,22 @@ def main(argv=None):
                     args.guard_exit,
                     args.started_at,
                     args.ended_at,
+                ),
+                sort_keys=True,
+            )
+        )
+    elif args.command == "write-batch-result":
+        print(
+            json.dumps(
+                write_batch_result(
+                    args.root,
+                    args.batch_id,
+                    args.target_mint,
+                    args.terminal_status,
+                    args.stop_reason,
+                    args.executed_stage,
+                    args.target_status,
+                    args.three_hop_status,
                 ),
                 sort_keys=True,
             )

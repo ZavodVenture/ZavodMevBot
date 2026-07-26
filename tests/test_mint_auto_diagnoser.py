@@ -521,6 +521,26 @@ class StageEvidenceTests(unittest.TestCase):
         self.assertFalse(hasattr(mint_auto_diagnoser, "next_stage"))
         self.assertFalse(hasattr(mint_auto_diagnoser, "finalize_batch"))
 
+    def test_batch_result_is_reporting_only(self):
+        result = mint_auto_diagnoser.write_batch_result(
+            self.root,
+            self.batch.batch_id,
+            TARGET_MINT,
+            "target_positive",
+            "timeout",
+            ("baseline",),
+            "positive",
+            "unproven",
+        )
+        path = self.root / self.batch.relative_root / "batch-result.json"
+
+        self.assertEqual(result, json.loads(path.read_bytes()))
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+        self.assertEqual(result["executed_stage_names"], ["baseline"])
+        self.assertEqual(result["cumulative_early_stop_lamports"], 25_000_000)
+        self.assertEqual(result["cumulative_loss_limit_lamports"], 30_000_000)
+        self.assertFalse((path.parent / "batch-state.json").exists())
+
 
 if __name__ == "__main__":
     unittest.main()
