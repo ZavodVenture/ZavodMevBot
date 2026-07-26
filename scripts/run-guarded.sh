@@ -6,7 +6,7 @@ root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 cd -- "$root"
 
 usage() {
-  echo 'Usage: run-guarded.sh --live-confirmed [--timeout 30..300] [--profile default|single-mint-auto] | run-guarded.sh --live-confirmed --timeout 30..300 --profile selector-diagnostic --config state/mint-runs/RUN_ID/selector-diagnostic.toml --test-mode --diagnostic-mode d0 --diagnostic-target MINT --config-sha256 SHA256 --tokens-sha256 SHA256' >&2
+  echo 'Usage: run-guarded.sh --live-confirmed [--timeout 30..300] [--profile default|single-mint-auto] | run-guarded.sh --live-confirmed --timeout 30..300 --profile selector-diagnostic --config state/mint-runs/RUN_ID/selector-diagnostic.toml --test-mode --diagnostic-mode d0 --diagnostic-target MINT --config-sha256 SHA256 --tokens-sha256 SHA256 | run-guarded.sh --live-confirmed --timeout 300 --profile auto-filter-live --workspace state/auto-diagnose-runs/BATCH/stages/INDEX-NAME' >&2
   exit 64
 }
 
@@ -99,6 +99,51 @@ validate_diagnostic_config_path() {
   ]] || usage
 }
 
+validate_auto_filter_workspace() {
+  [[
+    "$workspace_path" =~ ^state/auto-diagnose-runs/([0-9]{8}T[0-9]{6}Z)/stages/([0-7])-([a-z_]+)$
+  ]] || usage
+  local stage_index="${BASH_REMATCH[2]}"
+  local stage_name="${BASH_REMATCH[3]}"
+  local expected_names=(
+    baseline
+    offchain
+    activity
+    aggregate_profit
+    per_arb_profit
+    roi
+    volume
+    pool_liquidity
+  )
+  [[ "$stage_name" == "${expected_names[$stage_index]}" ]] || usage
+}
+
+validate_batch_contract_descriptor() {
+  local descriptor="$1"
+  [[ "$descriptor" =~ ^[0-9]+$ ]] || usage
+  [[ -f "/proc/$$/fd/$descriptor" ]] || usage
+  local contract_path="$root/$workspace_path/stage-contract.json"
+  [[ -f "$contract_path" && ! -L "$contract_path" ]] || usage
+
+  local descriptor_identity path_identity
+  descriptor_identity="$(
+    stat -Lc '%d:%i:%u:%a' "/proc/$$/fd/$descriptor" 2>/dev/null
+  )" || usage
+  path_identity="$(
+    stat -Lc '%d:%i:%u:%a' "$contract_path" 2>/dev/null
+  )" || usage
+  [[ "$descriptor_identity" == "$path_identity" ]] || usage
+
+  local device inode owner mode
+  IFS=: read -r device inode owner mode <<<"$descriptor_identity"
+  [[
+    -n "$device" &&
+    -n "$inode" &&
+    "$owner" == "$EUID" &&
+    "$mode" == "600"
+  ]] || usage
+}
+
 [[ "${1:-}" == "--live-confirmed" ]] || {
   echo 'Refusing live run: explicit confirmation is required.' >&2
   exit 64
@@ -112,6 +157,7 @@ diagnostic_mode=""
 diagnostic_target=""
 config_sha256=""
 tokens_sha256=""
+workspace_path=""
 timeout_option_count=0
 profile_option_count=0
 config_option_count=0
@@ -120,6 +166,7 @@ diagnostic_mode_count=0
 diagnostic_target_count=0
 config_sha256_count=0
 tokens_sha256_count=0
+workspace_option_count=0
 while (( $# > 0 )); do
   case "$1" in
     --timeout)
@@ -168,6 +215,12 @@ while (( $# > 0 )); do
       (( tokens_sha256_count += 1 ))
       shift 2
       ;;
+    --workspace)
+      (( $# >= 2 )) || usage
+      workspace_path="$2"
+      (( workspace_option_count += 1 ))
+      shift 2
+      ;;
     *)
       usage
       ;;
@@ -182,7 +235,7 @@ done
   echo 'Timeout must be an integer from 30 through 300.' >&2
   exit 64
 }
-[[ "$profile" == "default" || "$profile" == "single-mint-auto" || "$profile" == "selector-diagnostic" ]] || usage
+[[ "$profile" == "default" || "$profile" == "single-mint-auto" || "$profile" == "selector-diagnostic" || "$profile" == "auto-filter-live" ]] || usage
 
 if [[ "$profile" == "selector-diagnostic" ]]; then
   ((
@@ -193,7 +246,8 @@ if [[ "$profile" == "selector-diagnostic" ]]; then
     diagnostic_mode_count == 1 &&
     diagnostic_target_count == 1 &&
     config_sha256_count == 1 &&
-    tokens_sha256_count == 1
+    tokens_sha256_count == 1 &&
+    workspace_option_count == 0
   )) || usage
   [[ "$diagnostic_mode" == "d0" ]] || usage
   [[ "$diagnostic_target" =~ ^[1-9A-HJ-NP-Za-km-z]{32,44}$ ]] || usage
@@ -201,6 +255,22 @@ if [[ "$profile" == "selector-diagnostic" ]]; then
   [[ "$tokens_sha256" =~ ^[0-9a-f]{64}$ ]] || usage
   [[ "${ZAVOD_LIVE_LOCK_FD+x}" == "x" ]] || lock_failure
   validate_diagnostic_config_path
+elif [[ "$profile" == "auto-filter-live" ]]; then
+  ((
+    timeout_option_count == 1 &&
+    profile_option_count == 1 &&
+    workspace_option_count == 1 &&
+    config_option_count == 0 &&
+    test_mode_count == 0 &&
+    diagnostic_mode_count == 0 &&
+    diagnostic_target_count == 0 &&
+    config_sha256_count == 0 &&
+    tokens_sha256_count == 0
+  )) || usage
+  [[ "$timeout_seconds" == "300" ]] || usage
+  [[ "${ZAVOD_LIVE_LOCK_FD+x}" == "x" ]] || lock_failure
+  [[ "${ZAVOD_BATCH_CONTRACT_FD+x}" == "x" ]] || usage
+  validate_auto_filter_workspace
 else
   ((
     config_option_count == 0 &&
@@ -208,7 +278,8 @@ else
     diagnostic_mode_count == 0 &&
     diagnostic_target_count == 0 &&
     config_sha256_count == 0 &&
-    tokens_sha256_count == 0
+    tokens_sha256_count == 0 &&
+    workspace_option_count == 0
   )) || usage
 fi
 
@@ -222,6 +293,19 @@ else
   acquire_live_lock
 fi
 unset ZAVOD_LIVE_LOCK_FD
+
+if [[ "$profile" == "auto-filter-live" ]]; then
+  validate_batch_contract_descriptor "$ZAVOD_BATCH_CONTRACT_FD"
+  batch_contract_fd="$ZAVOD_BATCH_CONTRACT_FD"
+  unset ZAVOD_BATCH_CONTRACT_FD
+  exec python3 scripts/zavod_guard.py run \
+    --live-confirmed \
+    --timeout-seconds "$timeout_seconds" \
+    --profile auto-filter-live \
+    --workspace-root "$workspace_path" \
+    --batch-contract-fd "$batch_contract_fd"
+fi
+unset ZAVOD_BATCH_CONTRACT_FD
 
 if [[ "$profile" == "selector-diagnostic" ]]; then
   exec python3 scripts/zavod_guard.py run \

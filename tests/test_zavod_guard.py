@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from scripts import mint_runner, zavod_guard
+from scripts import mint_auto_diagnoser, mint_runner, zavod_guard
 from scripts.zavod_guard import (
     EARLY_STOP_LAMPORTS,
     GuardError,
@@ -577,6 +577,37 @@ class PreflightTests(unittest.TestCase):
             self.assertEqual(summary["balance_lamports"], 200_000_000)
             self.assertNotIn("test-secret", json.dumps(summary))
 
+    def test_preflight_executes_held_binary_descriptor_for_version(self):
+        config = valid_config()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            binary = root / "held-cli"
+            binary.write_text(
+                "#!/usr/bin/env bash\n"
+                "echo 'zavod-mev-bot-rust-version-cli 0.2.2'\n"
+            )
+            binary.chmod(0o700)
+            binary_descriptor = os.open(binary, os.O_RDONLY)
+            config_path = root / "config.toml"
+            config_path.write_text("# test fixture")
+            config_path.chmod(0o600)
+            try:
+                summary = preflight(
+                    config_path,
+                    root=root,
+                    config=config,
+                    pubkey_resolver=lambda secret: "public-address",
+                    balance_reader=lambda url, pubkey: 200_000_000,
+                    disk_free_reader=lambda path: 200 * 1024 * 1024,
+                    binary_path=Path(
+                        f"/proc/self/fd/{binary_descriptor}"
+                    ),
+                    binary_fd=binary_descriptor,
+                )
+            finally:
+                os.close(binary_descriptor)
+        self.assertEqual(summary["cli_version"], "0.2.2")
+
     def test_preflight_rejects_insufficient_balance(self):
         config = valid_config()
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -667,6 +698,23 @@ class SupervisorTests(unittest.TestCase):
         )
         self.assertEqual(diagnostic["observed_loss"], 1)
         self.assertEqual(live["reason"], "child_exit")
+
+    def test_live_integrity_profile_stops_on_protected_output(self):
+        protected_output = threading.Event()
+        protected_output.set()
+        result = supervise(
+            child=FakeChild(),
+            start_balance=100_000_000,
+            balance_reader=lambda: 100_000_000,
+            monotonic=iter([0, 1]).__next__,
+            sleep=lambda seconds: None,
+            protected_output_event=protected_output,
+            killpg=lambda pid, sig: None,
+            group_exists=Mock(side_effect=[True, False]),
+            signal_grace=((signal.SIGINT, 0),),
+            enforce_input_integrity=True,
+        )
+        self.assertEqual(result["reason"], "protected_output_violation")
 
     def test_diagnostic_stops_on_token_account_growth(self):
         try:
@@ -2732,6 +2780,709 @@ class RunGuardedHardeningTests(unittest.TestCase):
         )
 
 
+class AutoFilterLiveContractTests(unittest.TestCase):
+    BATCH_ID = "20260726T123000Z"
+    SOURCE = b"""[wallet]
+private_key = "fixture-wallet"
+[rpc]
+url = "https://fixture.invalid"
+[auto]
+enabled = true
+force_two_mints = true
+enable_three_hop = false
+[auto.filters]
+limit = 2
+ignore_offchain_bots = true
+min_tx_len = 3
+min_profit = 9
+min_profit_per_arb = 4
+min_roi = 0.2
+min_volume_lamports = 7
+[bot]
+merge_mints = true
+[auto.markets]
+min_pool_liquidity_lamports = 11
+"""
+
+    def prepare_workspace(self, root, stage_index=0, baseline=100_000_000):
+        root = Path(root)
+        (root / "scripts").mkdir()
+        (root / "scripts" / "zavod_guard.py").touch()
+        config_path = root / "config.toml"
+        config_path.write_bytes(self.SOURCE)
+        config_path.chmod(0o600)
+        tokens_path = root / "tokens.toml"
+        tokens_path.write_text('tokens = ["production-fixture"]\n')
+        tokens_path.chmod(0o600)
+        binary_path = root / "zavod-mev-bot-rust-version-cli"
+        binary_path.write_bytes(b"fixture executable\n")
+        binary_path.chmod(0o700)
+        with (
+            patch.object(
+                mint_auto_diagnoser.zavod_guard,
+                "validate_token_mint_account",
+                return_value=None,
+            ),
+            patch.object(
+                mint_auto_diagnoser.zavod_guard,
+                "wallet_pubkey",
+                return_value="fixture-public-key",
+            ),
+        ):
+            batch = mint_auto_diagnoser.prepare_batch(
+                root,
+                DIAGNOSTIC_TARGET,
+                now=lambda: datetime(
+                    2026,
+                    7,
+                    26,
+                    12,
+                    30,
+                    tzinfo=timezone.utc,
+                ),
+                balance_reader=lambda *_: baseline,
+            )
+        stage = batch.stages[stage_index]
+        contract_path = root / stage.contract_relative_path
+        contract_descriptor = os.open(contract_path, os.O_RDONLY)
+        return {
+            "root": root,
+            "stage": stage,
+            "stage_path": root / stage.relative_root,
+            "contract_path": contract_path,
+            "contract_fd": contract_descriptor,
+            "binary_path": binary_path,
+        }
+
+    def run_auto(
+        self,
+        paths,
+        current_balance=100_000_000,
+        supervise_side_effect=None,
+        popen_side_effect=None,
+    ):
+        child = Mock(pid=123, returncode=0, stdout=io.BytesIO())
+        launched = {}
+
+        def launch(argv, **kwargs):
+            launched["argv"] = argv
+            launched["kwargs"] = kwargs
+            if popen_side_effect is not None:
+                popen_side_effect()
+            return child
+
+        def supervised(**kwargs):
+            if supervise_side_effect is not None:
+                return supervise_side_effect(**kwargs)
+            self.assertTrue(kwargs["input_integrity_checker"]())
+            return {
+                "reason": "child_exit",
+                "start_balance": kwargs["start_balance"],
+                "end_balance": current_balance,
+                "observed_loss": max(
+                    0,
+                    kwargs["start_balance"] - current_balance,
+                ),
+                "child_exit_code": 0,
+            }
+
+        def preflighted(*args, **kwargs):
+            del args
+            self.assertEqual(kwargs["profile"], "auto-filter-live")
+            self.assertRegex(
+                str(kwargs["binary_path"]),
+                r"^/proc/self/fd/[0-9]+$",
+            )
+            return {
+                "wallet": "fixture-public-key",
+                "balance_lamports": current_balance,
+            }
+
+        with (
+            patch.object(
+                zavod_guard,
+                "__file__",
+                str(paths["root"] / "scripts" / "zavod_guard.py"),
+            ),
+            patch.object(
+                zavod_guard,
+                "preflight",
+                side_effect=preflighted,
+            ),
+            patch.object(
+                zavod_guard.subprocess,
+                "Popen",
+                side_effect=launch,
+            ),
+            patch.object(
+                zavod_guard,
+                "supervise",
+                side_effect=supervised,
+            ),
+            patch.object(
+                zavod_guard,
+                "_verified_shutdown",
+                return_value={
+                    "exit_code": 0,
+                    "group_absent": True,
+                    "interrupted": False,
+                },
+            ),
+        ):
+            result = zavod_guard.run_guarded(
+                "config.toml",
+                profile="auto-filter-live",
+                workspace_root=paths["stage"].relative_root,
+                batch_contract_fd=paths["contract_fd"],
+            )
+        return result, launched
+
+    def rewrite_contract(self, paths, **changes):
+        contract = json.loads(paths["contract_path"].read_bytes())
+        contract.update(changes)
+        paths["contract_path"].write_text(
+            json.dumps(contract, sort_keys=True, separators=(",", ":"))
+            + "\n"
+        )
+        paths["contract_path"].chmod(0o600)
+
+    def test_descriptor_bound_profile_launches_held_stage_inputs(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            paths = self.prepare_workspace(Path(temp_dir))
+            try:
+                result, launched = self.run_auto(
+                    paths,
+                    current_balance=80_000_001,
+                )
+            finally:
+                os.close(paths["contract_fd"])
+
+        argv = launched["argv"]
+        self.assertEqual(argv[1], "run")
+        self.assertRegex(argv[0], r"^/proc/self/fd/[0-9]+$")
+        self.assertEqual(argv[2], "--config")
+        self.assertRegex(argv[3], r"^/proc/self/fd/[0-9]+$")
+        self.assertRegex(
+            str(launched["kwargs"]["cwd"]),
+            r"^/proc/self/fd/[0-9]+$",
+        )
+        self.assertGreaterEqual(len(launched["kwargs"]["pass_fds"]), 4)
+        self.assertEqual(result["batch_start_balance"], 100_000_000)
+        self.assertEqual(result["stage_start_balance"], 80_000_001)
+        self.assertEqual(result["loss_limit_lamports"], 30_000_000)
+        self.assertEqual(result["early_stop_lamports"], 25_000_000)
+
+    def test_profile_rejects_missing_descriptor_and_test_mode(self):
+        with self.assertRaisesRegex(GuardError, "auto-filter-live"):
+            zavod_guard.run_guarded(
+                "config.toml",
+                profile="auto-filter-live",
+                workspace_root=(
+                    "state/auto-diagnose-runs/"
+                    f"{self.BATCH_ID}/stages/0-baseline"
+                ),
+            )
+        with self.assertRaisesRegex(GuardError, "test mode"):
+            zavod_guard.run_guarded(
+                "config.toml",
+                profile="auto-filter-live",
+                test_mode=True,
+                workspace_root=(
+                    "state/auto-diagnose-runs/"
+                    f"{self.BATCH_ID}/stages/0-baseline"
+                ),
+                batch_contract_fd=9,
+            )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            paths = self.prepare_workspace(Path(temp_dir))
+            try:
+                with (
+                    patch.object(
+                        zavod_guard,
+                        "__file__",
+                        str(
+                            paths["root"]
+                            / "scripts"
+                            / "zavod_guard.py"
+                        ),
+                    ),
+                    self.assertRaisesRegex(
+                        GuardError,
+                        "auto-filter-live",
+                    ),
+                ):
+                    zavod_guard.run_guarded(
+                        "config.toml",
+                        timeout_seconds=60,
+                        profile="auto-filter-live",
+                        workspace_root=paths["stage"].relative_root,
+                        batch_contract_fd=paths["contract_fd"],
+                    )
+            finally:
+                os.close(paths["contract_fd"])
+
+    def test_contract_public_fields_and_workspace_are_exact(self):
+        mutations = (
+            ("schema", 2),
+            ("batch_id", "20260726T123001Z"),
+            ("stage_index", 1),
+            ("stage_name", "offchain"),
+            ("target_mint", CONTROL_MINT),
+            ("timeout_seconds", 299),
+            ("batch_start_balance_lamports", -1),
+            ("early_stop_lamports", 24_999_999),
+            ("loss_limit_lamports", 29_999_999),
+            ("three_hop_required", False),
+        )
+        for field, value in mutations:
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as temp_dir:
+                paths = self.prepare_workspace(Path(temp_dir))
+                try:
+                    self.rewrite_contract(paths, **{field: value})
+                    with self.assertRaisesRegex(
+                        GuardError,
+                        "auto-filter-live",
+                    ):
+                        self.run_auto(paths)
+                finally:
+                    os.close(paths["contract_fd"])
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            paths = self.prepare_workspace(Path(temp_dir))
+            try:
+                paths["stage"] = paths["stage"].__class__(
+                    paths["stage"].index,
+                    paths["stage"].name,
+                    paths["stage"].relative_root.replace(
+                        self.BATCH_ID,
+                        "20260726T123001Z",
+                    ),
+                    paths["stage"].contract_relative_path,
+                    paths["stage"].skipped,
+                    paths["stage"].skip_reason,
+                )
+                with self.assertRaisesRegex(GuardError, "auto-filter-live"):
+                    self.run_auto(paths)
+            finally:
+                os.close(paths["contract_fd"])
+
+    def test_profile_requires_exact_active_batch_marker(self):
+        for variant in ("wrong-batch", "wrong-mode", "symlink"):
+            with self.subTest(variant=variant), tempfile.TemporaryDirectory() as temp_dir:
+                paths = self.prepare_workspace(Path(temp_dir))
+                marker = (
+                    paths["root"]
+                    / "state"
+                    / ".mint-auto-diagnose-active"
+                )
+                try:
+                    if variant == "wrong-batch":
+                        marker.write_text("20260726T123001Z\n")
+                        marker.chmod(0o600)
+                    elif variant == "wrong-mode":
+                        marker.chmod(0o644)
+                    else:
+                        held = marker.with_name(
+                            ".mint-auto-diagnose-active-held"
+                        )
+                        marker.rename(held)
+                        marker.symlink_to(held.name)
+                    with self.assertRaisesRegex(
+                        GuardError,
+                        "auto-filter-live",
+                    ):
+                        self.run_auto(paths)
+                finally:
+                    os.close(paths["contract_fd"])
+
+    def test_rejects_digest_content_and_declared_mutation_mismatches(self):
+        cases = (
+            ("config.toml", b"\n# changed\n", None),
+            ("tokens.toml", b'tokens = ["11111111111111111111111111111111"]\n', "tokens_sha256"),
+            (
+                "zavod-mev-bot-rust-version-cli",
+                b"different executable\n",
+                "binary_sha256",
+            ),
+        )
+        for name, replacement, updated_digest in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temp_dir:
+                paths = self.prepare_workspace(Path(temp_dir))
+                try:
+                    selected = paths["stage_path"] / name
+                    if name == "config.toml":
+                        selected.write_bytes(selected.read_bytes() + replacement)
+                    elif name == "zavod-mev-bot-rust-version-cli":
+                        selected.unlink()
+                        selected.write_bytes(replacement)
+                        selected.chmod(0o700)
+                    else:
+                        selected.write_bytes(replacement)
+                    if updated_digest is not None:
+                        self.rewrite_contract(
+                            paths,
+                            **{
+                                updated_digest: hashlib.sha256(
+                                    selected.read_bytes()
+                                ).hexdigest()
+                            },
+                        )
+                    with self.assertRaisesRegex(GuardError, "auto-filter-live"):
+                        self.run_auto(paths)
+                finally:
+                    os.close(paths["contract_fd"])
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            paths = self.prepare_workspace(Path(temp_dir), stage_index=1)
+            try:
+                config_path = paths["stage_path"] / "config.toml"
+                changed = config_path.read_bytes().replace(
+                    b"min_tx_len = 3",
+                    b"min_tx_len = 0",
+                )
+                config_path.write_bytes(changed)
+                self.rewrite_contract(
+                    paths,
+                    config_sha256=hashlib.sha256(changed).hexdigest(),
+                )
+                with self.assertRaisesRegex(GuardError, "auto-filter-live"):
+                    self.run_auto(paths)
+            finally:
+                os.close(paths["contract_fd"])
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            paths = self.prepare_workspace(Path(temp_dir))
+            try:
+                snapshot = (
+                    paths["root"]
+                    / "state"
+                    / "auto-diagnose-runs"
+                    / self.BATCH_ID
+                    / "production-binary"
+                )
+                snapshot.write_bytes(b"different prepared executable\n")
+                snapshot.chmod(0o600)
+                with self.assertRaisesRegex(GuardError, "auto-filter-live"):
+                    self.run_auto(paths)
+            finally:
+                os.close(paths["contract_fd"])
+
+    def test_rejects_mode_symlink_and_owner_violations_across_stage_walk(self):
+        relative_components = (
+            "state",
+            "state/auto-diagnose-runs",
+            f"state/auto-diagnose-runs/{self.BATCH_ID}",
+            f"state/auto-diagnose-runs/{self.BATCH_ID}/stages",
+            f"state/auto-diagnose-runs/{self.BATCH_ID}/stages/0-baseline",
+            (
+                f"state/auto-diagnose-runs/{self.BATCH_ID}/"
+                "production-config.toml"
+            ),
+            (
+                f"state/auto-diagnose-runs/{self.BATCH_ID}/"
+                "production-tokens.toml"
+            ),
+            (
+                f"state/auto-diagnose-runs/{self.BATCH_ID}/"
+                "production-binary"
+            ),
+            (
+                f"state/auto-diagnose-runs/{self.BATCH_ID}/stages/"
+                "0-baseline/stage-contract.json"
+            ),
+            (
+                f"state/auto-diagnose-runs/{self.BATCH_ID}/stages/"
+                "0-baseline/config.toml"
+            ),
+            (
+                f"state/auto-diagnose-runs/{self.BATCH_ID}/stages/"
+                "0-baseline/tokens.toml"
+            ),
+            (
+                f"state/auto-diagnose-runs/{self.BATCH_ID}/stages/"
+                "0-baseline/zavod-mev-bot-rust-version-cli"
+            ),
+        )
+        for relative in relative_components:
+            with self.subTest(kind="mode", path=relative), tempfile.TemporaryDirectory() as temp_dir:
+                paths = self.prepare_workspace(Path(temp_dir))
+                try:
+                    selected = paths["root"] / relative
+                    selected.chmod(
+                        0o755 if selected.is_dir() else 0o644
+                    )
+                    with self.assertRaisesRegex(GuardError, "auto-filter-live"):
+                        self.run_auto(paths)
+                finally:
+                    os.close(paths["contract_fd"])
+
+            with self.subTest(kind="symlink", path=relative), tempfile.TemporaryDirectory() as temp_dir:
+                paths = self.prepare_workspace(Path(temp_dir))
+                try:
+                    selected = paths["root"] / relative
+                    moved = selected.with_name(selected.name + "-held")
+                    selected.rename(moved)
+                    selected.symlink_to(moved.name, target_is_directory=moved.is_dir())
+                    with self.assertRaisesRegex(GuardError, "auto-filter-live"):
+                        self.run_auto(paths)
+                finally:
+                    os.close(paths["contract_fd"])
+
+            with self.subTest(kind="owner", path=relative), tempfile.TemporaryDirectory() as temp_dir:
+                paths = self.prepare_workspace(Path(temp_dir))
+                selected_identity = (paths["root"] / relative).stat()
+                real_fstat = os.fstat
+
+                def wrong_owner(descriptor):
+                    metadata = real_fstat(descriptor)
+                    if (
+                        metadata.st_dev,
+                        metadata.st_ino,
+                    ) == (
+                        selected_identity.st_dev,
+                        selected_identity.st_ino,
+                    ):
+                        fields = list(metadata)
+                        fields[4] = os.geteuid() + 1
+                        return os.stat_result(fields)
+                    return metadata
+
+                try:
+                    with (
+                        patch.object(os, "fstat", side_effect=wrong_owner),
+                        self.assertRaisesRegex(
+                            GuardError,
+                            "auto-filter-live",
+                        ),
+                    ):
+                        self.run_auto(paths)
+                finally:
+                    os.close(paths["contract_fd"])
+
+    def test_stage_path_swaps_fail_before_and_during_supervision(self):
+        for timing in ("before-child", "popen-return", "during-supervision"):
+            with self.subTest(timing=timing), tempfile.TemporaryDirectory() as temp_dir:
+                paths = self.prepare_workspace(Path(temp_dir))
+
+                def swap():
+                    held = paths["stage_path"].with_name("0-baseline-held")
+                    paths["stage_path"].rename(held)
+                    paths["stage_path"].mkdir(mode=0o700)
+
+                def supervise_after_swap(**kwargs):
+                    swap()
+                    self.assertFalse(kwargs["input_integrity_checker"]())
+                    return {
+                        "reason": "input_integrity_violation",
+                        "start_balance": kwargs["start_balance"],
+                        "end_balance": kwargs["start_balance"],
+                        "observed_loss": 0,
+                        "child_exit_code": None,
+                    }
+
+                try:
+                    if timing == "before-child":
+                        swap()
+                        with self.assertRaisesRegex(GuardError, "auto-filter-live"):
+                            self.run_auto(paths)
+                    elif timing == "popen-return":
+                        with self.assertRaisesRegex(
+                            GuardError,
+                            "auto-filter-live",
+                        ):
+                            self.run_auto(
+                                paths,
+                                popen_side_effect=swap,
+                            )
+                    else:
+                        result, _ = self.run_auto(
+                            paths,
+                            supervise_side_effect=supervise_after_swap,
+                        )
+                        self.assertEqual(
+                            result["reason"],
+                            "input_integrity_violation",
+                        )
+                finally:
+                    os.close(paths["contract_fd"])
+
+    def test_auto_filter_logs_are_descriptor_bound_and_private(self):
+        for variant in ("symlink", "wrong-mode", "wrong-owner"):
+            with self.subTest(variant=variant), tempfile.TemporaryDirectory() as temp_dir:
+                paths = self.prepare_workspace(Path(temp_dir))
+                logs_path = paths["stage_path"] / "logs"
+                outside = paths["root"] / "outside-logs"
+                outside.mkdir()
+                if variant == "symlink":
+                    logs_path.symlink_to(outside, target_is_directory=True)
+                else:
+                    logs_path.mkdir(mode=0o700)
+                    if variant == "wrong-mode":
+                        logs_path.chmod(0o755)
+                try:
+                    if variant == "wrong-owner":
+                        logs_identity = logs_path.stat()
+                        real_fstat = os.fstat
+
+                        def wrong_owner(descriptor):
+                            metadata = real_fstat(descriptor)
+                            if (
+                                metadata.st_dev,
+                                metadata.st_ino,
+                            ) == (
+                                logs_identity.st_dev,
+                                logs_identity.st_ino,
+                            ):
+                                fields = list(metadata)
+                                fields[4] = os.geteuid() + 1
+                                return os.stat_result(fields)
+                            return metadata
+
+                        owner_patch = patch.object(
+                            os,
+                            "fstat",
+                            side_effect=wrong_owner,
+                        )
+                    else:
+                        owner_patch = patch.object(
+                            os,
+                            "fstat",
+                            wraps=os.fstat,
+                        )
+                    with (
+                        owner_patch,
+                        self.assertRaisesRegex(
+                            GuardError,
+                            "auto-filter-live",
+                        ),
+                    ):
+                        self.run_auto(paths)
+                    self.assertEqual(tuple(outside.iterdir()), ())
+                finally:
+                    os.close(paths["contract_fd"])
+
+    def test_cumulative_baseline_is_used_and_threshold_refuses_launch(self):
+        for current in (75_000_000, 70_000_000):
+            with self.subTest(current=current), tempfile.TemporaryDirectory() as temp_dir:
+                paths = self.prepare_workspace(Path(temp_dir))
+                try:
+                    with self.assertRaisesRegex(
+                        GuardError,
+                        "cumulative loss",
+                    ):
+                        self.run_auto(paths, current_balance=current)
+                finally:
+                    os.close(paths["contract_fd"])
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            paths = self.prepare_workspace(
+                Path(temp_dir),
+                stage_index=2,
+            )
+            seen = {}
+
+            def supervised(**kwargs):
+                seen["start_balance"] = kwargs["start_balance"]
+                return {
+                    "reason": "child_exit",
+                    "start_balance": kwargs["start_balance"],
+                    "end_balance": 78_000_000,
+                    "observed_loss": 22_000_000,
+                    "child_exit_code": 0,
+                }
+
+            try:
+                result, _ = self.run_auto(
+                    paths,
+                    current_balance=80_000_001,
+                    supervise_side_effect=supervised,
+                )
+            finally:
+                os.close(paths["contract_fd"])
+            self.assertEqual(seen["start_balance"], 100_000_000)
+            self.assertEqual(
+                result["stage_start_balance"],
+                80_000_001,
+            )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            paths = self.prepare_workspace(Path(temp_dir))
+            try:
+                with (
+                    patch.object(
+                        zavod_guard,
+                        "__file__",
+                        str(
+                            paths["root"]
+                            / "scripts"
+                            / "zavod_guard.py"
+                        ),
+                    ),
+                    patch.object(
+                        zavod_guard,
+                        "preflight",
+                        side_effect=GuardError(
+                            "RPC balance check failed"
+                        ),
+                    ),
+                    patch.object(
+                        zavod_guard.subprocess,
+                        "Popen",
+                    ) as launch,
+                    self.assertRaisesRegex(
+                        GuardError,
+                        "RPC balance check failed",
+                    ),
+                ):
+                    zavod_guard.run_guarded(
+                        "config.toml",
+                        profile="auto-filter-live",
+                        workspace_root=paths["stage"].relative_root,
+                        batch_contract_fd=paths["contract_fd"],
+                    )
+                launch.assert_not_called()
+            finally:
+                os.close(paths["contract_fd"])
+
+    def test_auto_result_printer_omits_cumulative_balance_fields(self):
+        result = {
+            "reason": "child_exit",
+            "start_balance": 100,
+            "end_balance": 90,
+            "observed_loss": 10,
+            "batch_start_balance": 100,
+            "stage_start_balance": 95,
+            "duration_seconds": 1,
+            "child_exit_code": 0,
+            "loss_limit_lamports": 30_000_000,
+            "early_stop_lamports": 25_000_000,
+            "log_path": "logs/fixture.log",
+        }
+        output = io.StringIO()
+        with (
+            patch.object(zavod_guard, "run_guarded", return_value=result),
+            patch("sys.stdout", new=output),
+        ):
+            status = zavod_guard.main(
+                [
+                    "run",
+                    "--live-confirmed",
+                    "--profile",
+                    "auto-filter-live",
+                    "--workspace-root",
+                    (
+                        "state/auto-diagnose-runs/"
+                        f"{self.BATCH_ID}/stages/0-baseline"
+                    ),
+                    "--batch-contract-fd",
+                    "9",
+                ]
+            )
+        self.assertEqual(status, 0)
+        self.assertNotIn("balance", output.getvalue())
+        self.assertNotIn("observed_loss", output.getvalue())
+
+
 class RunGuardedWrapperTests(unittest.TestCase):
     DIAGNOSTIC_RUN_ID = "20260724T190000Z"
 
@@ -2744,7 +3495,10 @@ class RunGuardedWrapperTests(unittest.TestCase):
         fake = self.root / "scripts" / "zavod_guard.py"
         fake.write_text(
             "#!/usr/bin/env python3\n"
-            "import json, pathlib, sys, time\n"
+            "import json, os, pathlib, sys, time\n"
+            "if 'ZAVOD_LIVE_LOCK_FD' in os.environ or "
+            "'ZAVOD_BATCH_CONTRACT_FD' in os.environ:\n"
+            "    raise SystemExit(91)\n"
             "root = pathlib.Path.cwd()\n"
             "with (root / 'guard-launches').open('a') as handle:\n"
             "    handle.write('launch\\n')\n"
@@ -2833,6 +3587,60 @@ class RunGuardedWrapperTests(unittest.TestCase):
             tokens_sha256,
         )
 
+    def prepare_auto_filter_workspace(
+        self,
+        batch_id="20260726T123000Z",
+        stage_index=0,
+        stage_name="baseline",
+    ):
+        state_path = self.root / "state"
+        state_path.chmod(0o700)
+        relative_path = (
+            f"state/auto-diagnose-runs/{batch_id}/stages/"
+            f"{stage_index}-{stage_name}"
+        )
+        stage_path = self.root / relative_path
+        stage_path.mkdir(parents=True)
+        for directory in (
+            state_path / "auto-diagnose-runs",
+            state_path / "auto-diagnose-runs" / batch_id,
+            state_path / "auto-diagnose-runs" / batch_id / "stages",
+            stage_path,
+        ):
+            directory.chmod(0o700)
+        contract_path = stage_path / "stage-contract.json"
+        contract_path.write_text("{}\n")
+        contract_path.chmod(0o600)
+        return relative_path, contract_path
+
+    def invoke_with_auto_descriptors(self, workspace, contract_path, *extra):
+        lock_path = self.root / "state" / ".zavod-live.lock"
+        lock_path.touch(mode=0o600)
+        lock_path.chmod(0o600)
+        lock_descriptor = os.open(lock_path, os.O_RDWR)
+        contract_descriptor = os.open(contract_path, os.O_RDONLY)
+        fcntl.flock(lock_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        environment = os.environ.copy()
+        environment["ZAVOD_LIVE_LOCK_FD"] = str(lock_descriptor)
+        environment["ZAVOD_BATCH_CONTRACT_FD"] = str(contract_descriptor)
+        try:
+            return self.invoke(
+                "--live-confirmed",
+                "--timeout",
+                "300",
+                "--profile",
+                "auto-filter-live",
+                "--workspace",
+                workspace,
+                *extra,
+                env=environment,
+                pass_fds=(lock_descriptor, contract_descriptor),
+            )
+        finally:
+            fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
+            os.close(contract_descriptor)
+            os.close(lock_descriptor)
+
     def test_defaults_to_300_seconds(self):
         result = self.invoke("--live-confirmed")
         self.assertEqual(result.returncode, 0)
@@ -2853,6 +3661,137 @@ class RunGuardedWrapperTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('"--profile", "single-mint-auto"', result.stdout)
+
+    def test_auto_filter_live_requires_exact_descriptor_bound_arguments(self):
+        workspace, contract_path = self.prepare_auto_filter_workspace()
+
+        missing_descriptors = self.invoke(
+            "--live-confirmed",
+            "--timeout",
+            "300",
+            "--profile",
+            "auto-filter-live",
+            "--workspace",
+            workspace,
+        )
+        self.assertNotEqual(missing_descriptors.returncode, 0)
+
+        accepted = self.invoke_with_auto_descriptors(
+            workspace,
+            contract_path,
+        )
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        launched = json.loads(accepted.stdout)
+        self.assertEqual(
+            launched[:8],
+            [
+                "run",
+                "--live-confirmed",
+                "--timeout-seconds",
+                "300",
+                "--profile",
+                "auto-filter-live",
+                "--workspace-root",
+                workspace,
+            ],
+        )
+        self.assertEqual(launched[8], "--batch-contract-fd")
+        self.assertRegex(launched[9], r"^[0-9]+$")
+
+        forbidden = (
+            ("--test-mode",),
+            ("--config", "config.toml"),
+            ("--diagnostic-target", DIAGNOSTIC_TARGET),
+            ("--config-sha256", "1" * 64),
+            ("--tokens-sha256", "2" * 64),
+            ("--workspace", workspace),
+            ("--profile", "auto-filter-live"),
+            ("--timeout", "300"),
+        )
+        for extra in forbidden:
+            with self.subTest(extra=extra):
+                result = self.invoke_with_auto_descriptors(
+                    workspace,
+                    contract_path,
+                    *extra,
+                )
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+
+    def test_auto_filter_live_rejects_noncanonical_and_unknown_stage_paths(self):
+        workspace, contract_path = self.prepare_auto_filter_workspace()
+        invalid_paths = (
+            "/absolute/stage",
+            "state/auto-diagnose-runs/20260726T123000Z/stages/0-unknown",
+            "state/auto-diagnose-runs/20260726T123001Z/stages/1-baseline",
+            "state/auto-diagnose-runs/20260726T123000Z/stages/1-offchain",
+            "state/auto-diagnose-runs/20260726T123000Z/stages/00-baseline",
+            "state/auto-diagnose-runs/../20260726T123000Z/stages/0-baseline",
+        )
+        for invalid in invalid_paths:
+            with self.subTest(path=invalid):
+                result = self.invoke_with_auto_descriptors(
+                    invalid,
+                    contract_path,
+                )
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+
+    def test_auto_filter_live_rejects_partial_or_invalid_contract_descriptor(self):
+        workspace, contract_path = self.prepare_auto_filter_workspace()
+        auto_args = (
+            "--live-confirmed",
+            "--timeout",
+            "300",
+            "--profile",
+            "auto-filter-live",
+            "--workspace",
+            workspace,
+        )
+
+        live_only = self.invoke_with_inherited_lock(*auto_args)
+        self.assertNotEqual(live_only.returncode, 0)
+
+        contract_descriptor = os.open(contract_path, os.O_RDONLY)
+        environment = os.environ.copy()
+        environment["ZAVOD_BATCH_CONTRACT_FD"] = str(
+            contract_descriptor
+        )
+        try:
+            batch_only = self.invoke(
+                *auto_args,
+                env=environment,
+                pass_fds=(contract_descriptor,),
+            )
+        finally:
+            os.close(contract_descriptor)
+        self.assertNotEqual(batch_only.returncode, 0)
+
+        contract_path.chmod(0o644)
+        wrong_mode = self.invoke_with_auto_descriptors(
+            workspace,
+            contract_path,
+        )
+        self.assertNotEqual(wrong_mode.returncode, 0)
+        contract_path.chmod(0o600)
+
+        held = contract_path.with_name("stage-contract-held.json")
+        contract_path.rename(held)
+        contract_path.symlink_to(held.name)
+        symlink = self.invoke_with_auto_descriptors(
+            workspace,
+            contract_path,
+        )
+        self.assertNotEqual(symlink.returncode, 0)
+        contract_path.unlink()
+        held.rename(contract_path)
+
+        unrelated = self.root / "unrelated-contract"
+        unrelated.write_text("{}\n")
+        unrelated.chmod(0o600)
+        wrong_identity = self.invoke_with_auto_descriptors(
+            workspace,
+            unrelated,
+        )
+        self.assertNotEqual(wrong_identity.returncode, 0)
 
     def test_diagnostic_requires_test_mode_and_fixed_config(self):
         relative_path, _config_path = self.prepare_diagnostic_config()

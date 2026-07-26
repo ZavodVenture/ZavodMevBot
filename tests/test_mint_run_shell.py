@@ -39,6 +39,7 @@ class MintRunShellTests(unittest.TestCase):
             #!/usr/bin/env bash
             set -euo pipefail
             [[ "${ZAVOD_LIVE_LOCK_FD:-}" =~ ^[0-9]+$ ]]
+            [[ -z "${ZAVOD_BATCH_CONTRACT_FD+x}" ]]
             [[ -e "/proc/$$/fd/$ZAVOD_LIVE_LOCK_FD" ]]
             descriptor_identity="$(
               stat -Lc '%d:%i' "/proc/$$/fd/$ZAVOD_LIVE_LOCK_FD"

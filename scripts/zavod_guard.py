@@ -37,6 +37,33 @@ PROFILE_SENDERS = {
 LOSS_LIMIT_LAMPORTS = 30_000_000
 EARLY_STOP_LAMPORTS = 25_000_000
 DEFAULT_TIMEOUT_SECONDS = 300
+AUTO_FILTER_STAGE_NAMES = (
+    "baseline",
+    "offchain",
+    "activity",
+    "aggregate_profit",
+    "per_arb_profit",
+    "roi",
+    "volume",
+    "pool_liquidity",
+)
+AUTO_FILTER_CONTRACT_KEYS = frozenset(
+    {
+        "schema",
+        "batch_id",
+        "stage_index",
+        "stage_name",
+        "target_mint",
+        "timeout_seconds",
+        "batch_start_balance_lamports",
+        "early_stop_lamports",
+        "loss_limit_lamports",
+        "config_sha256",
+        "tokens_sha256",
+        "binary_sha256",
+        "three_hop_required",
+    }
+)
 TOKEN_PROGRAM_ID = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
 TOKEN_2022_PROGRAM_ID = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
 DISPATCH_SCAN_OVERLAP = 256
@@ -260,6 +287,7 @@ def validate_config(config, profile="default", root=None):
         "manual-single",
         "single-mint-auto",
         "selector-diagnostic",
+        "auto-filter-live",
         *PROFILE_SENDERS,
     ):
         errors.append("unknown validation profile")
@@ -284,7 +312,7 @@ def validate_config(config, profile="default", root=None):
     else:
         if profile == "selector-diagnostic":
             errors.extend(validate_selector_diagnostic(config))
-        elif profile == "single-mint-auto":
+        elif profile in ("single-mint-auto", "auto-filter-live"):
             errors.extend(validate_single_mint_auto(config))
         elif _get(config, "auto", "enabled") is not True:
             errors.append("auto.enabled must be true")
@@ -901,6 +929,7 @@ def supervise(
     cleanup_child=True,
     operator_signal_event=None,
     diagnostic=False,
+    enforce_input_integrity=False,
 ):
     end_balance = start_balance
     reason = None
@@ -937,7 +966,7 @@ def supervise(
                 reason = "operator_signal"
                 break
             if (
-                diagnostic
+                (diagnostic or enforce_input_integrity)
                 and input_integrity_checker is not None
                 and not input_integrity_checker()
             ):
@@ -950,7 +979,7 @@ def supervise(
                 reason = "test_mode_dispatch_violation"
                 break
             if (
-                diagnostic
+                (diagnostic or enforce_input_integrity)
                 and protected_output_event is not None
                 and protected_output_event.is_set()
             ):
@@ -1041,7 +1070,7 @@ def supervise(
     }
 
 
-def _cli_version(binary):
+def _cli_version(binary, pass_fds=()):
     try:
         result = subprocess.run(
             [str(binary), "--version"],
@@ -1049,6 +1078,7 @@ def _cli_version(binary):
             capture_output=True,
             text=True,
             timeout=5,
+            pass_fds=pass_fds,
         )
     except (OSError, subprocess.SubprocessError) as exc:
         raise GuardError("CLI version check failed") from exc
@@ -1387,6 +1417,531 @@ def _open_selector_diagnostic_config(workspace_root, requested_path):
             os.close(descriptor)
 
 
+def _auto_filter_error(message="contract is invalid"):
+    return GuardError(f"auto-filter-live {message}")
+
+
+def _auto_filter_validate_descriptor(
+    descriptor,
+    kind,
+    mode=None,
+    executable=False,
+):
+    try:
+        identity = os.fstat(descriptor)
+    except OSError as exc:
+        raise _auto_filter_error() from exc
+    expected_type = stat.S_ISDIR if kind == "directory" else stat.S_ISREG
+    if (
+        not expected_type(identity.st_mode)
+        or identity.st_uid != os.geteuid()
+        or (
+            mode is not None
+            and stat.S_IMODE(identity.st_mode) != mode
+        )
+        or (executable and identity.st_mode & 0o111 == 0)
+    ):
+        raise _auto_filter_error()
+    return identity
+
+
+def _auto_filter_open_relative(
+    parent_descriptor,
+    name,
+    kind,
+    mode=None,
+    executable=False,
+):
+    if (
+        not isinstance(name, str)
+        or not name
+        or Path(name).name != name
+    ):
+        raise _auto_filter_error()
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    if kind == "directory":
+        flags |= getattr(os, "O_DIRECTORY", 0)
+    try:
+        descriptor = os.open(name, flags, dir_fd=parent_descriptor)
+    except OSError as exc:
+        raise _auto_filter_error() from exc
+    try:
+        identity = _auto_filter_validate_descriptor(
+            descriptor,
+            kind,
+            mode=mode,
+            executable=executable,
+        )
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor, identity
+
+
+def _auto_filter_read_descriptor(descriptor):
+    try:
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        chunks = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        return b"".join(chunks)
+    except OSError as exc:
+        raise _auto_filter_error() from exc
+
+
+def _load_auto_filter_contract(data):
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate contract key")
+            result[key] = value
+        return result
+
+    try:
+        contract = json.loads(
+            data.decode("utf-8"),
+            object_pairs_hook=unique_object,
+        )
+    except (UnicodeError, ValueError, json.JSONDecodeError) as exc:
+        raise _auto_filter_error() from exc
+    if (
+        not isinstance(contract, dict)
+        or set(contract) != AUTO_FILTER_CONTRACT_KEYS
+    ):
+        raise _auto_filter_error()
+    return contract
+
+
+def _validate_auto_filter_contract_fields(contract, workspace_root):
+    batch_id = contract["batch_id"]
+    stage_index = contract["stage_index"]
+    stage_name = contract["stage_name"]
+    target = contract["target_mint"]
+    hashes = (
+        contract["config_sha256"],
+        contract["tokens_sha256"],
+        contract["binary_sha256"],
+    )
+    if (
+        type(contract["schema"]) is not int
+        or contract["schema"] != 1
+        or not isinstance(batch_id, str)
+        or re.fullmatch(r"[0-9]{8}T[0-9]{6}Z", batch_id) is None
+        or type(stage_index) is not int
+        or not 0 <= stage_index < len(AUTO_FILTER_STAGE_NAMES)
+        or not isinstance(stage_name, str)
+        or stage_name != AUTO_FILTER_STAGE_NAMES[stage_index]
+        or not isinstance(target, str)
+        or type(contract["timeout_seconds"]) is not int
+        or contract["timeout_seconds"] != DEFAULT_TIMEOUT_SECONDS
+        or type(contract["batch_start_balance_lamports"]) is not int
+        or contract["batch_start_balance_lamports"] < 0
+        or type(contract["early_stop_lamports"]) is not int
+        or contract["early_stop_lamports"] != EARLY_STOP_LAMPORTS
+        or type(contract["loss_limit_lamports"]) is not int
+        or contract["loss_limit_lamports"] != LOSS_LIMIT_LAMPORTS
+        or any(
+            not isinstance(value, str)
+            or re.fullmatch(r"[0-9a-f]{64}", value) is None
+            for value in hashes
+        )
+        or contract["three_hop_required"] is not True
+    ):
+        raise _auto_filter_error()
+    try:
+        if len(base58_decode(target)) != 32:
+            raise _auto_filter_error()
+    except (GuardError, TypeError, ValueError) as exc:
+        raise _auto_filter_error() from exc
+
+    expected_workspace = (
+        f"state/auto-diagnose-runs/{batch_id}/stages/"
+        f"{stage_index}-{stage_name}"
+    )
+    if (
+        not isinstance(workspace_root, (str, Path))
+        or str(workspace_root) != expected_workspace
+        or Path(workspace_root).is_absolute()
+    ):
+        raise _auto_filter_error("workspace is invalid")
+
+
+def _auto_filter_require_digest(data, expected):
+    if hashlib.sha256(data).hexdigest() != expected:
+        raise _auto_filter_error("input integrity violation")
+
+
+def _open_auto_filter_live_contract(
+    workspace_root,
+    batch_contract_fd,
+):
+    if (
+        isinstance(batch_contract_fd, bool)
+        or not isinstance(batch_contract_fd, int)
+        or batch_contract_fd < 0
+    ):
+        raise _auto_filter_error("batch contract descriptor is required")
+    inherited_identity = _auto_filter_validate_descriptor(
+        batch_contract_fd,
+        "file",
+        mode=0o600,
+    )
+    contract_data = _auto_filter_read_descriptor(batch_contract_fd)
+    contract = _load_auto_filter_contract(contract_data)
+    _validate_auto_filter_contract_fields(contract, workspace_root)
+
+    trusted_root = Path(__file__).resolve().parents[1]
+    descriptors = []
+    identities = {}
+    files = {}
+    file_data = {}
+    try:
+        root_descriptor = os.open(
+            trusted_root,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        descriptors.append(root_descriptor)
+        identities["root"] = _auto_filter_validate_descriptor(
+            root_descriptor,
+            "directory",
+        )
+
+        parent = root_descriptor
+        directory_specs = (
+            ("state", "state"),
+            ("auto-diagnose-runs", "runs"),
+            (contract["batch_id"], "batch"),
+            ("stages", "stages"),
+            (
+                f"{contract['stage_index']}-{contract['stage_name']}",
+                "stage",
+            ),
+        )
+        for name, label in directory_specs:
+            descriptor, identity = _auto_filter_open_relative(
+                parent,
+                name,
+                "directory",
+                mode=0o700,
+            )
+            descriptors.append(descriptor)
+            identities[label] = identity
+            parent = descriptor
+        stage_descriptor = parent
+        batch_descriptor = descriptors[3]
+        active_descriptor, active_identity = (
+            _auto_filter_open_relative(
+                descriptors[1],
+                ".mint-auto-diagnose-active",
+                "file",
+                mode=0o600,
+            )
+        )
+        descriptors.append(active_descriptor)
+        identities["active_marker"] = active_identity
+        files["active_marker"] = active_descriptor
+        file_data["active_marker"] = _auto_filter_read_descriptor(
+            active_descriptor
+        )
+        if file_data["active_marker"] != (
+            f"{contract['batch_id']}\n".encode()
+        ):
+            raise _auto_filter_error()
+
+        for name, label, mode, executable in (
+            ("stage-contract.json", "contract", 0o600, False),
+            ("config.toml", "config", 0o600, False),
+            ("tokens.toml", "tokens", 0o600, False),
+            (
+                "zavod-mev-bot-rust-version-cli",
+                "binary",
+                None,
+                True,
+            ),
+        ):
+            descriptor, identity = _auto_filter_open_relative(
+                stage_descriptor,
+                name,
+                "file",
+                mode=mode,
+                executable=executable,
+            )
+            descriptors.append(descriptor)
+            identities[label] = identity
+            files[label] = descriptor
+            file_data[label] = _auto_filter_read_descriptor(descriptor)
+
+        if (
+            inherited_identity.st_dev,
+            inherited_identity.st_ino,
+        ) != (
+            identities["contract"].st_dev,
+            identities["contract"].st_ino,
+        ) or file_data["contract"] != contract_data:
+            raise _auto_filter_error()
+
+        _auto_filter_require_digest(
+            file_data["config"],
+            contract["config_sha256"],
+        )
+        _auto_filter_require_digest(
+            file_data["tokens"],
+            contract["tokens_sha256"],
+        )
+        _auto_filter_require_digest(
+            file_data["binary"],
+            contract["binary_sha256"],
+        )
+        if file_data["tokens"] != (
+            f'tokens = ["{contract["target_mint"]}"]\n'.encode()
+        ):
+            raise _auto_filter_error("input integrity violation")
+
+        production = {}
+        for name, label, parent_descriptor, executable in (
+            ("production-config.toml", "config", batch_descriptor, False),
+            ("production-tokens.toml", "tokens", batch_descriptor, False),
+            (
+                "production-binary",
+                "binary",
+                batch_descriptor,
+                False,
+            ),
+            ("config.toml", "root_config", root_descriptor, False),
+            ("tokens.toml", "root_tokens", root_descriptor, False),
+            (
+                "zavod-mev-bot-rust-version-cli",
+                "root_binary",
+                root_descriptor,
+                True,
+            ),
+        ):
+            descriptor, _identity = _auto_filter_open_relative(
+                parent_descriptor,
+                name,
+                "file",
+                mode=None if executable else 0o600,
+                executable=executable,
+            )
+            try:
+                production[label] = _auto_filter_read_descriptor(
+                    descriptor
+                )
+            finally:
+                os.close(descriptor)
+        if (
+            production["config"] != production["root_config"]
+            or production["tokens"] != production["root_tokens"]
+            or production["binary"] != production["root_binary"]
+            or file_data["binary"] != production["root_binary"]
+        ):
+            raise _auto_filter_error("input integrity violation")
+
+        try:
+            try:
+                from scripts import mint_auto_diagnoser
+            except ModuleNotFoundError:
+                import mint_auto_diagnoser
+
+            expected_stages = {
+                name: data
+                for name, data, _mutations
+                in mint_auto_diagnoser.build_stage_configs(
+                    production["config"]
+                )
+            }
+        except Exception as exc:
+            raise _auto_filter_error("input integrity violation") from exc
+        if expected_stages.get(contract["stage_name"]) != file_data["config"]:
+            raise _auto_filter_error("input integrity violation")
+
+        config = load_config_bytes(file_data["config"])
+        if _get(config, "auto", "enable_three_hop") is not True:
+            raise _auto_filter_error("input integrity violation")
+        return {
+            "contract": contract,
+            "trusted_root": trusted_root,
+            "descriptors": descriptors,
+            "identities": identities,
+            "files": files,
+            "file_data": file_data,
+            "stage_fd": stage_descriptor,
+            "config": config,
+        }
+    except BaseException:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+        raise
+
+
+def _auto_filter_integrity_matches(
+    opened,
+    include_all_inputs=False,
+):
+    fresh = []
+    try:
+        root_descriptor = os.open(
+            opened["trusted_root"],
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        fresh.append(root_descriptor)
+        root_identity = _auto_filter_validate_descriptor(
+            root_descriptor,
+            "directory",
+        )
+        if (
+            root_identity.st_dev,
+            root_identity.st_ino,
+        ) != (
+            opened["identities"]["root"].st_dev,
+            opened["identities"]["root"].st_ino,
+        ):
+            return False
+        contract = opened["contract"]
+        parent = root_descriptor
+        directory_specs = (
+            ("state", "state"),
+            ("auto-diagnose-runs", "runs"),
+            (contract["batch_id"], "batch"),
+            ("stages", "stages"),
+            (
+                f"{contract['stage_index']}-{contract['stage_name']}",
+                "stage",
+            ),
+        )
+        for name, label in directory_specs:
+            descriptor, identity = _auto_filter_open_relative(
+                parent,
+                name,
+                "directory",
+                mode=0o700,
+            )
+            fresh.append(descriptor)
+            expected = opened["identities"][label]
+            if (identity.st_dev, identity.st_ino) != (
+                expected.st_dev,
+                expected.st_ino,
+            ):
+                return False
+            parent = descriptor
+        active_descriptor, active_identity = (
+            _auto_filter_open_relative(
+                fresh[1],
+                ".mint-auto-diagnose-active",
+                "file",
+                mode=0o600,
+            )
+        )
+        fresh.append(active_descriptor)
+        expected_active = opened["identities"]["active_marker"]
+        if (
+            (
+                active_identity.st_dev,
+                active_identity.st_ino,
+            )
+            != (
+                expected_active.st_dev,
+                expected_active.st_ino,
+            )
+            or _auto_filter_read_descriptor(active_descriptor)
+            != opened["file_data"]["active_marker"]
+            or _auto_filter_read_descriptor(
+                opened["files"]["active_marker"]
+            )
+            != opened["file_data"]["active_marker"]
+        ):
+            return False
+        file_specs = (
+            (
+                "stage-contract.json",
+                "contract",
+                0o600,
+                False,
+            ),
+            ("config.toml", "config", 0o600, False),
+            ("tokens.toml", "tokens", 0o600, False),
+            (
+                "zavod-mev-bot-rust-version-cli",
+                "binary",
+                None,
+                True,
+            ),
+        ) if include_all_inputs else (
+            ("tokens.toml", "tokens", 0o600, False),
+        )
+        for name, label, mode, executable in file_specs:
+            descriptor, identity = _auto_filter_open_relative(
+                parent,
+                name,
+                "file",
+                mode=mode,
+                executable=executable,
+            )
+            fresh.append(descriptor)
+            expected = opened["identities"][label]
+            if (
+                (identity.st_dev, identity.st_ino)
+                != (expected.st_dev, expected.st_ino)
+                or _auto_filter_read_descriptor(descriptor)
+                != opened["file_data"][label]
+                or _auto_filter_read_descriptor(opened["files"][label])
+                != opened["file_data"][label]
+            ):
+                return False
+        return True
+    except (GuardError, OSError):
+        return False
+    finally:
+        for descriptor in reversed(fresh):
+            os.close(descriptor)
+
+
+def _close_auto_filter_live_contract(opened):
+    if opened is None:
+        return
+    for descriptor in reversed(opened["descriptors"]):
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+
+
+def _open_auto_filter_log_directory(stage_descriptor):
+    try:
+        os.mkdir(
+            "logs",
+            0o700,
+            dir_fd=stage_descriptor,
+        )
+    except FileExistsError:
+        pass
+    except OSError as exc:
+        raise _auto_filter_error(
+            "private log directory is invalid"
+        ) from exc
+    try:
+        descriptor, _identity = _auto_filter_open_relative(
+            stage_descriptor,
+            "logs",
+            "directory",
+            mode=0o700,
+        )
+    except GuardError as exc:
+        raise _auto_filter_error(
+            "private log directory is invalid"
+        ) from exc
+    return descriptor
+
+
 def preflight(
     config_path,
     root=None,
@@ -1395,6 +1950,8 @@ def preflight(
     balance_reader=get_balance_lamports,
     disk_free_reader=None,
     profile="default",
+    binary_path=None,
+    binary_fd=None,
 ):
     root = Path(root or Path(config_path).resolve().parent)
     config_path = Path(config_path)
@@ -1408,10 +1965,21 @@ def preflight(
         raise GuardError("config.toml is invalid or unreadable") from exc
     if mode & 0o077:
         raise GuardError("config.toml permissions must not allow group or other access")
-    binary = root / "zavod-mev-bot-rust-version-cli"
+    binary = (
+        Path(binary_path)
+        if binary_path is not None
+        else root / "zavod-mev-bot-rust-version-cli"
+    )
     if not binary.is_file() or not os.access(binary, os.X_OK):
         raise GuardError("Zavod CLI is missing or not executable")
-    version = _cli_version(binary)
+    version = _cli_version(
+        binary,
+        pass_fds=(
+            (binary_fd,)
+            if binary_fd is not None
+            else ()
+        ),
+    )
     if version != "0.2.2":
         raise GuardError("unexpected Zavod CLI version")
     free_bytes = (disk_free_reader or (lambda path: shutil.disk_usage(path).free))(root)
@@ -1446,6 +2014,7 @@ def run_guarded(
     diagnostic_tokens_sha256=None,
     token_account_snapshot_reader=None,
     mint_account_validator=None,
+    batch_contract_fd=None,
 ):
     if (
         isinstance(timeout_seconds, bool)
@@ -1453,9 +2022,17 @@ def run_guarded(
         or not 30 <= timeout_seconds <= DEFAULT_TIMEOUT_SECONDS
     ):
         raise GuardError("timeout must be from 30 through 300 seconds")
+    if profile == "auto-filter-live" and test_mode:
+        raise GuardError("auto-filter-live does not permit test mode")
+    if profile != "auto-filter-live" and batch_contract_fd is not None:
+        raise GuardError("auto-filter-live launch contract is invalid")
     if (profile == "selector-diagnostic") != test_mode:
         raise GuardError(
             "selector-diagnostic profile and test mode must be provided together"
+        )
+    if profile == "auto-filter-live" and batch_contract_fd is None:
+        raise GuardError(
+            "auto-filter-live batch contract descriptor is required"
         )
     _validate_selector_launch_contract(
         profile,
@@ -1472,8 +2049,40 @@ def run_guarded(
     diagnostic_tokens_identity = None
     input_integrity_checker = None
     starting_token_accounts = None
+    auto_filter_contract = None
+    auto_log_directory_descriptor = None
+    fd = None
     try:
-        if profile == "selector-diagnostic":
+        if profile == "auto-filter-live":
+            auto_filter_contract = _open_auto_filter_live_contract(
+                workspace_root,
+                batch_contract_fd,
+            )
+            if (
+                timeout_seconds
+                != auto_filter_contract["contract"]["timeout_seconds"]
+            ):
+                raise _auto_filter_error(
+                    "timeout does not match the batch contract"
+                )
+            config = auto_filter_contract["config"]
+            config_path = Path(
+                f"/proc/self/fd/"
+                f"{auto_filter_contract['files']['config']}"
+            )
+            root = Path(
+                f"/proc/self/fd/{auto_filter_contract['stage_fd']}"
+            )
+            input_integrity_checker = lambda: (
+                _auto_filter_integrity_matches(auto_filter_contract)
+            )
+            full_input_integrity_checker = lambda: (
+                _auto_filter_integrity_matches(
+                    auto_filter_contract,
+                    include_all_inputs=True,
+                )
+            )
+        elif profile == "selector-diagnostic":
             root, diagnostic_config_descriptor = (
                 _open_selector_diagnostic_config(
                     workspace_root,
@@ -1502,20 +2111,77 @@ def run_guarded(
             config_path = Path(config_path).resolve()
             root = Path(workspace_root or config_path.parent).resolve()
             config = load_config(config_path)
-        summary = preflight(
-            config_path,
-            root=root,
-            config=config,
-            profile=profile,
-        )
+        preflight_options = {
+            "root": root,
+            "config": config,
+            "profile": profile,
+        }
+        if auto_filter_contract is not None:
+            preflight_options["binary_path"] = Path(
+                f"/proc/self/fd/"
+                f"{auto_filter_contract['files']['binary']}"
+            )
+            preflight_options["binary_fd"] = (
+                auto_filter_contract["files"]["binary"]
+            )
+        summary = preflight(config_path, **preflight_options)
         public_key = summary["wallet"]
         rpc_url = _get(config, "rpc", "url")
         start_balance = summary["balance_lamports"]
-        logs_dir = root / "logs"
-        logs_dir.mkdir(mode=0o700, exist_ok=True)
+        batch_start_balance = (
+            auto_filter_contract["contract"][
+                "batch_start_balance_lamports"
+            ]
+            if auto_filter_contract is not None
+            else start_balance
+        )
+        if (
+            auto_filter_contract is not None
+            and batch_start_balance - start_balance
+            >= EARLY_STOP_LAMPORTS
+        ):
+            raise _auto_filter_error(
+                "cumulative loss threshold reached"
+            )
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        log_path = logs_dir / f"{stamp}-zavod-cli.log"
-        fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        log_name = f"{stamp}-zavod-cli.log"
+        log_path = root / "logs" / log_name
+        if auto_filter_contract is not None:
+            auto_log_directory_descriptor = (
+                _open_auto_filter_log_directory(
+                    auto_filter_contract["stage_fd"]
+                )
+            )
+            try:
+                fd = os.open(
+                    log_name,
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | getattr(os, "O_NOFOLLOW", 0),
+                    0o600,
+                    dir_fd=auto_log_directory_descriptor,
+                )
+                _auto_filter_validate_descriptor(
+                    fd,
+                    "file",
+                    mode=0o600,
+                )
+            except (GuardError, OSError) as exc:
+                if fd is not None:
+                    os.close(fd)
+                    fd = None
+                raise _auto_filter_error(
+                    "private log path is invalid"
+                ) from exc
+        else:
+            logs_dir = root / "logs"
+            logs_dir.mkdir(mode=0o700, exist_ok=True)
+            fd = os.open(
+                log_path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
         started = time.monotonic()
         child = None
         pump = None
@@ -1537,6 +2203,11 @@ def run_guarded(
             os.close(diagnostic_config_descriptor)
         if diagnostic_tokens_descriptor is not None:
             os.close(diagnostic_tokens_descriptor)
+        if fd is not None:
+            os.close(fd)
+        if auto_log_directory_descriptor is not None:
+            os.close(auto_log_directory_descriptor)
+        _close_auto_filter_live_contract(auto_filter_contract)
         raise
 
     def interrupt_handler(signum, frame):
@@ -1548,6 +2219,15 @@ def run_guarded(
         signal.signal(signal.SIGINT, interrupt_handler)
         signal.signal(signal.SIGTERM, interrupt_handler)
         command = [str(root / "zavod-mev-bot-rust-version-cli"), "run"]
+        if auto_filter_contract is not None:
+            command = [
+                f"/proc/self/fd/{auto_filter_contract['files']['binary']}",
+                "run",
+                "--config",
+                str(config_path),
+            ]
+            if not full_input_integrity_checker():
+                raise _auto_filter_error("input integrity violation")
         if test_mode:
             config_bytes = _require_descriptor_bytes(
                 diagnostic_config_descriptor,
@@ -1618,7 +2298,19 @@ def run_guarded(
                 diagnostic_config_descriptor,
                 diagnostic_tokens_descriptor,
             )
+        elif auto_filter_contract is not None:
+            popen_arguments["pass_fds"] = (
+                auto_filter_contract["stage_fd"],
+                auto_filter_contract["files"]["config"],
+                auto_filter_contract["files"]["tokens"],
+                auto_filter_contract["files"]["binary"],
+            )
         child = subprocess.Popen(command, **popen_arguments)
+        if (
+            auto_filter_contract is not None
+            and not full_input_integrity_checker()
+        ):
+            raise _auto_filter_error("input integrity violation")
         if operator_signal_event.is_set():
             result = {
                 "reason": "operator_signal",
@@ -1644,7 +2336,7 @@ def run_guarded(
                 pump_started = True
                 result = supervise(
                     child=child,
-                    start_balance=start_balance,
+                    start_balance=batch_start_balance,
                     balance_reader=lambda: get_balance_lamports(
                         rpc_url,
                         public_key,
@@ -1664,6 +2356,9 @@ def run_guarded(
                     cleanup_child=False,
                     operator_signal_event=operator_signal_event,
                     diagnostic=test_mode,
+                    enforce_input_integrity=(
+                        auto_filter_contract is not None
+                    ),
                 )
     except _DiagnosticLaunchSkipped:
         pass
@@ -1726,19 +2421,35 @@ def run_guarded(
                 except Exception:
                     if pump is not None:
                         pump.output_error_event.set()
-            log_path.chmod(0o600)
+            if auto_filter_contract is None:
+                log_path.chmod(0o600)
         finally:
             try:
-                _, interrupted = _retry_keyboard_interrupt(
-                    lambda: signal.signal(signal.SIGINT, prior_sigint)
+                try:
+                    _, interrupted = _retry_keyboard_interrupt(
+                        lambda: signal.signal(
+                            signal.SIGINT,
+                            prior_sigint,
+                        )
+                    )
+                    finalization_interrupted |= interrupted
+                    _, interrupted = _retry_keyboard_interrupt(
+                        lambda: signal.signal(
+                            signal.SIGTERM,
+                            prior_sigterm,
+                        )
+                    )
+                    finalization_interrupted |= interrupted
+                except GuardError:
+                    finalization_interrupted = True
+            finally:
+                _close_auto_filter_live_contract(
+                    auto_filter_contract
                 )
-                finalization_interrupted |= interrupted
-                _, interrupted = _retry_keyboard_interrupt(
-                    lambda: signal.signal(signal.SIGTERM, prior_sigterm)
-                )
-                finalization_interrupted |= interrupted
-            except GuardError:
-                finalization_interrupted = True
+                auto_filter_contract = None
+                if auto_log_directory_descriptor is not None:
+                    os.close(auto_log_directory_descriptor)
+                    auto_log_directory_descriptor = None
     if result is None:
         result = {
             "reason": "output_error",
@@ -1758,7 +2469,7 @@ def run_guarded(
     ):
         result["reason"] = "test_mode_dispatch_violation"
     elif (
-        test_mode
+        (test_mode or profile == "auto-filter-live")
         and pump is not None
         and pump.protected_output_event.is_set()
     ):
@@ -1781,6 +2492,9 @@ def run_guarded(
     result["log_path"] = str(log_path.relative_to(root))
     result["loss_limit_lamports"] = LOSS_LIMIT_LAMPORTS
     result["early_stop_lamports"] = EARLY_STOP_LAMPORTS
+    if profile == "auto-filter-live":
+        result["batch_start_balance"] = batch_start_balance
+        result["stage_start_balance"] = start_balance
     return result
 
 
@@ -1813,6 +2527,18 @@ def _print_run_result(result):
         print(f"{key}={result[key]}")
 
 
+def _print_auto_filter_run_result(result):
+    for key in (
+        "reason",
+        "duration_seconds",
+        "child_exit_code",
+        "loss_limit_lamports",
+        "early_stop_lamports",
+        "log_path",
+    ):
+        print(f"{key}={result[key]}")
+
+
 def main(argv=None):
     parser = _GuardArgumentParser(
         description="Secret-safe Zavod operations guard"
@@ -1826,7 +2552,7 @@ def main(argv=None):
     preflight_parser.add_argument("--config", default="config.toml")
     preflight_parser.add_argument("--profile", default="default")
     run_parser = subparsers.add_parser("run")
-    run_parser.add_argument("--config", default="config.toml")
+    run_parser.add_argument("--config", action="append")
     run_parser.add_argument("--timeout-seconds", type=int, default=DEFAULT_TIMEOUT_SECONDS)
     run_parser.add_argument("--profile", default="default")
     run_parser.add_argument("--test-mode", action="store_true")
@@ -1835,6 +2561,12 @@ def main(argv=None):
     run_parser.add_argument("--diagnostic-target", action="append")
     run_parser.add_argument("--config-sha256", action="append")
     run_parser.add_argument("--tokens-sha256", action="append")
+    run_parser.add_argument("--workspace-root", action="append")
+    run_parser.add_argument(
+        "--batch-contract-fd",
+        action="append",
+        type=int,
+    )
     try:
         args = parser.parse_args(argv)
         if args.command == "preflight":
@@ -1843,6 +2575,13 @@ def main(argv=None):
         if args.command == "run":
             if not args.live_confirmed:
                 raise GuardError("live confirmation is required")
+            if args.config is not None and len(args.config) != 1:
+                raise GuardError("invalid command arguments")
+            config_path = (
+                args.config[0]
+                if args.config is not None
+                else "config.toml"
+            )
             diagnostic_contract = (
                 args.diagnostic_mode,
                 args.diagnostic_target,
@@ -1874,22 +2613,60 @@ def main(argv=None):
                     diagnostic_config_sha256,
                     diagnostic_tokens_sha256,
                 ) = (None, None, None, None)
-            result = run_guarded(
-                args.config,
-                args.timeout_seconds,
-                args.profile,
-                test_mode=args.test_mode,
-                workspace_root=(
+            if args.profile == "auto-filter-live":
+                if (
+                    args.test_mode
+                    or args.config is not None
+                    or args.workspace_root is None
+                    or len(args.workspace_root) != 1
+                    or args.batch_contract_fd is None
+                    or len(args.batch_contract_fd) != 1
+                ):
+                    raise GuardError(
+                        "auto-filter-live launch contract is invalid"
+                    )
+                selected_workspace_root = args.workspace_root[0]
+                selected_batch_contract_fd = args.batch_contract_fd[0]
+            else:
+                if (
+                    args.workspace_root is not None
+                    or args.batch_contract_fd is not None
+                ):
+                    raise GuardError(
+                        "auto-filter-live launch contract is invalid"
+                    )
+                selected_workspace_root = (
                     Path(__file__).resolve().parents[1]
                     if args.test_mode
                     else None
+                )
+                selected_batch_contract_fd = None
+            run_options = {
+                "test_mode": args.test_mode,
+                "workspace_root": selected_workspace_root,
+                "diagnostic_mode": diagnostic_mode,
+                "diagnostic_target": diagnostic_target,
+                "diagnostic_config_sha256": (
+                    diagnostic_config_sha256
                 ),
-                diagnostic_mode=diagnostic_mode,
-                diagnostic_target=diagnostic_target,
-                diagnostic_config_sha256=diagnostic_config_sha256,
-                diagnostic_tokens_sha256=diagnostic_tokens_sha256,
+                "diagnostic_tokens_sha256": (
+                    diagnostic_tokens_sha256
+                ),
+            }
+            if selected_batch_contract_fd is not None:
+                run_options["batch_contract_fd"] = (
+                    selected_batch_contract_fd
+                )
+            result = run_guarded(
+                config_path,
+                args.timeout_seconds,
+                args.profile,
+                **run_options,
             )
-            _print_run_result(result)
+            if args.profile == "auto-filter-live":
+                _print_auto_filter_run_result(result)
+            else:
+                _print_run_result(result)
             if (
                 args.test_mode
                 and result.get("reason") in DIAGNOSTIC_VIOLATION_REASONS
