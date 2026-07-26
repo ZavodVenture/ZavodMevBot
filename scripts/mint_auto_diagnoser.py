@@ -635,27 +635,6 @@ def prepare_batch(root: Path, mint: str, now=None, transport=None, balance_reade
                 finally:
                     os.close(stage_fd)
                 prepared.append(PreparedStage(index, name, relative_root, contract_relative_path, False, None))
-            first_stage = next(stage.name for stage in prepared if not stage.skipped)
-            batch_state = {
-                "schema": 1,
-                "status": "prepared",
-                "completed_stages": [],
-                "cumulative_observed_loss_lamports": 0,
-                "next_stage": first_stage,
-            }
-            _write_private_at(
-                batch_fd,
-                "batch-state.json",
-                (
-                    json.dumps(
-                        batch_state,
-                        sort_keys=True,
-                        separators=(",", ":"),
-                    )
-                    + "\n"
-                ).encode(),
-            )
-            _write_private_at(batch_fd, "batch.lock", b"")
         return PreparedBatch(
             batch_id=batch_id,
             mint=mint,
@@ -736,337 +715,6 @@ def _close_descriptors(descriptors):
                 pass
 
 
-def _lock_batch(descriptors, exclusive):
-    flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        descriptor = os.open(
-            "batch.lock", flags, dir_fd=descriptors["batch"]
-        )
-        _validate_owned(descriptor, "file", mode=0o600)
-        fcntl.flock(
-            descriptor,
-            fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH,
-        )
-    except (OSError, DiagnoserError) as exc:
-        try:
-            os.close(descriptor)
-        except (UnboundLocalError, OSError):
-            pass
-        raise DiagnoserError("batch lock is invalid") from exc
-    descriptors["lock"] = descriptor
-
-
-def _decode_json_object(
-    data, error, *, reject_duplicate_keys=False
-):
-    def object_from_pairs(pairs):
-        value = {}
-        for key, item in pairs:
-            if key in value:
-                raise ValueError("duplicate object key")
-            value[key] = item
-        return value
-
-    try:
-        value = json.loads(
-            data.decode(),
-            parse_constant=lambda item: (_ for _ in ()).throw(
-                ValueError(item)
-            ),
-            object_pairs_hook=(
-                object_from_pairs if reject_duplicate_keys else None
-            ),
-        )
-    except (UnicodeError, ValueError, TypeError, json.JSONDecodeError) as exc:
-        raise DiagnoserError(error) from exc
-    if not isinstance(value, dict):
-        raise DiagnoserError(error)
-    return value
-
-
-def _prepared_stage_names(stages_fd):
-    prepared = []
-    for index, name in enumerate(STAGE_NAMES):
-        directory = f"{index}-{name}"
-        try:
-            info = os.stat(directory, dir_fd=stages_fd, follow_symlinks=False)
-        except FileNotFoundError:
-            continue
-        except OSError as exc:
-            raise DiagnoserError("private workspace paths are invalid") from exc
-        if (
-            not stat.S_ISDIR(info.st_mode)
-            or info.st_uid != os.geteuid()
-            or stat.S_IMODE(info.st_mode) != 0o700
-        ):
-            raise DiagnoserError("private workspace paths are invalid")
-        descriptor = _open_relative_directory(
-            stages_fd, directory, mode=0o700
-        )
-        os.close(descriptor)
-        prepared.append(name)
-    if not prepared or prepared[0] != "baseline":
-        raise DiagnoserError("batch state is invalid")
-    return prepared
-
-
-def _validate_completed_results(
-    batch_fd, completed, pending_stage=None
-):
-    try:
-        results_fd = _open_relative_directory(
-            batch_fd, "results", mode=0o700
-        )
-    except DiagnoserError:
-        try:
-            os.stat("results", dir_fd=batch_fd, follow_symlinks=False)
-        except FileNotFoundError:
-            if completed:
-                raise DiagnoserError("batch state is invalid") from None
-            return
-        raise
-    try:
-        expected_directories = {
-            f"{STAGE_NAMES.index(name)}-{name}" for name in completed
-        }
-        pending_directory = (
-            f"{STAGE_NAMES.index(pending_stage)}-{pending_stage}"
-            if pending_stage is not None
-            else None
-        )
-        try:
-            observed_directories = set(os.listdir(results_fd))
-        except OSError as exc:
-            raise DiagnoserError("batch state is invalid") from exc
-        if pending_directory is not None:
-            pending_pattern = re.compile(
-                rf"\.pending-{re.escape(pending_directory)}-[0-9a-f]{{24}}"
-            )
-            abandoned = {
-                name
-                for name in observed_directories
-                if pending_pattern.fullmatch(name) is not None
-            }
-            for name in abandoned:
-                _discard_pending_result(results_fd, name)
-            observed_directories -= abandoned
-        allowed_directories = set(expected_directories)
-        if pending_directory is not None:
-            allowed_directories.add(pending_directory)
-        if (
-            observed_directories != expected_directories
-            and observed_directories != allowed_directories
-        ):
-            raise DiagnoserError("batch state is invalid")
-        pending_manifest = None
-        names = list(completed)
-        if (
-            pending_stage is not None
-            and pending_directory in observed_directories
-        ):
-            names.append(pending_stage)
-        for name in names:
-            directory = f"{STAGE_NAMES.index(name)}-{name}"
-            result_fd = _open_relative_directory(
-                results_fd, directory, mode=0o700
-            )
-            try:
-                entries = set(os.listdir(result_fd))
-                allowed = {
-                    "stage-manifest.json",
-                    *(
-                        f"generated-{artifact}"
-                        for artifact in mint_runner.OPTIONAL_FILES
-                    ),
-                }
-                if (
-                    "stage-manifest.json" not in entries
-                    or not entries <= allowed
-                ):
-                    raise DiagnoserError("batch state is invalid")
-                manifest = _decode_json_object(
-                    _read_owned_file(
-                        result_fd,
-                        "stage-manifest.json",
-                        mode=0o600,
-                    ),
-                    "batch state is invalid",
-                )
-                if (
-                    set(manifest) != STAGE_MANIFEST_KEYS
-                    or manifest.get("stage_name") != name
-                ):
-                    raise DiagnoserError("batch state is invalid")
-                if name == pending_stage:
-                    pending_manifest = manifest
-                for artifact in mint_runner.OPTIONAL_FILES:
-                    generated = f"generated-{artifact}"
-                    if generated in entries:
-                        mint_runner._read_owned_file_at(
-                            result_fd, generated, mode=0o600
-                        )
-            finally:
-                os.close(result_fd)
-        if pending_manifest is not None:
-            os.fsync(results_fd)
-            held_results = _validate_owned(
-                results_fd, "directory", mode=0o700
-            )
-            named_results = os.stat(
-                "results",
-                dir_fd=batch_fd,
-                follow_symlinks=False,
-            )
-            if (
-                not stat.S_ISDIR(named_results.st_mode)
-                or named_results.st_uid != os.geteuid()
-                or stat.S_IMODE(named_results.st_mode) != 0o700
-                or (
-                    named_results.st_dev,
-                    named_results.st_ino,
-                )
-                != (
-                    held_results.st_dev,
-                    held_results.st_ino,
-                )
-            ):
-                raise DiagnoserError("batch state is invalid")
-        return pending_manifest
-    except (OSError, mint_runner.RunnerError) as exc:
-        raise DiagnoserError("batch state is invalid") from exc
-    finally:
-        os.close(results_fd)
-
-
-def _discard_pending_result(results_fd, name):
-    pending_fd = _open_relative_directory(
-        results_fd, name, mode=0o700
-    )
-    try:
-        allowed = {
-            "stage-manifest.json",
-            *(
-                f"generated-{artifact}"
-                for artifact in mint_runner.OPTIONAL_FILES
-            ),
-        }
-        entries = set(os.listdir(pending_fd))
-        if not entries <= allowed:
-            raise DiagnoserError("batch state is invalid")
-        for entry in entries:
-            _read_owned_file(pending_fd, entry, mode=0o600)
-        for entry in entries:
-            os.unlink(entry, dir_fd=pending_fd)
-        os.fsync(pending_fd)
-    except OSError as exc:
-        raise DiagnoserError("batch state is invalid") from exc
-    finally:
-        os.close(pending_fd)
-    try:
-        os.rmdir(name, dir_fd=results_fd)
-        os.fsync(results_fd)
-    except OSError as exc:
-        raise DiagnoserError("batch state is invalid") from exc
-
-
-def _load_batch_state(batch_fd, stages_fd):
-    state = _decode_json_object(
-        _read_owned_file(batch_fd, "batch-state.json", mode=0o600),
-        "batch state is invalid",
-    )
-    if (
-        set(state) != STATE_KEYS
-        or state.get("schema") != 1
-        or state.get("status")
-        not in {"prepared", "running", *TERMINAL_BATCH_STATES}
-        or not isinstance(state.get("completed_stages"), list)
-        or any(
-            not isinstance(name, str) or name not in STAGE_NAMES
-            for name in state["completed_stages"]
-        )
-        or len(set(state["completed_stages"]))
-        != len(state["completed_stages"])
-        or type(state.get("cumulative_observed_loss_lamports")) is not int
-        or state["cumulative_observed_loss_lamports"] < 0
-        or not isinstance(state.get("next_stage"), str)
-    ):
-        raise DiagnoserError("batch state is invalid")
-    prepared = _prepared_stage_names(stages_fd)
-    completed = state["completed_stages"]
-    if completed != prepared[: len(completed)]:
-        raise DiagnoserError("batch state is invalid")
-    expected_next = (
-        prepared[len(completed)]
-        if len(completed) < len(prepared)
-        else "stop"
-    )
-    status = state["status"]
-    if status == "prepared":
-        valid = not completed and state["next_stage"] == prepared[0]
-    elif status == "running":
-        valid = (
-            expected_next != "stop"
-            and state["next_stage"] in {expected_next, "stop"}
-        )
-    elif status == "declined":
-        valid = not completed and state["next_stage"] == "stop"
-    elif status == "exhausted":
-        valid = (
-            bool(completed)
-            and expected_next == "stop"
-            and state["next_stage"] == "stop"
-        )
-    elif status == "target_positive":
-        valid = bool(completed) and state["next_stage"] == "stop"
-    else:
-        valid = state["next_stage"] == "stop"
-    if not valid:
-        raise DiagnoserError("batch state is invalid")
-    pending_stage = (
-        expected_next
-        if status == "running" and state["next_stage"] == "stop"
-        else None
-    )
-    pending = _validate_completed_results(
-        batch_fd, completed, pending_stage=pending_stage
-    )
-    return state, prepared, pending
-
-
-def _store_batch_state(batch_fd, previous, replacement):
-    old_status = previous["status"]
-    new_status = replacement["status"]
-    allowed = (
-        (old_status == "prepared" and new_status in {"running", "declined"})
-        or (old_status == "running" and new_status in {"running", "target_positive", "exhausted", "failed"})
-    )
-    if not allowed:
-        raise DiagnoserError("batch state transition is invalid")
-    try:
-        current = _decode_json_object(
-            _read_owned_file(
-                batch_fd, "batch-state.json", mode=0o600
-            ),
-            "batch state is invalid",
-        )
-        if current != previous:
-            raise DiagnoserError("batch state changed concurrently")
-        mint_runner._atomic_write_at(
-            batch_fd,
-            "batch-state.json",
-            (
-                json.dumps(
-                    replacement,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                )
-                + "\n"
-            ).encode(),
-        )
-        os.fsync(batch_fd)
-    except (mint_runner.RunnerError, OSError) as exc:
-        raise DiagnoserError("batch state transition failed") from exc
-
 
 def _validate_stage_contract(stage_fd, batch_id, stage_name):
     index = STAGE_NAMES.index(stage_name)
@@ -1123,7 +771,7 @@ def _parse_stage_guard(stage_fd, guard_exit):
     if (
         isinstance(guard_exit, bool)
         or not isinstance(guard_exit, int)
-        or guard_exit < 0
+        or not -255 <= guard_exit <= 255
     ):
         raise DiagnoserError("guard result is invalid")
     try:
@@ -1400,6 +1048,7 @@ def _selector_stage_log_summary(
 
 
 def _read_stage_artifact(stage_fd, name, started_at, ended_at, policy):
+    maximum_bytes = 1024 * 1024
     descriptor = None
     try:
         descriptor = os.open(
@@ -1412,22 +1061,50 @@ def _read_stage_artifact(stage_fd, name, started_at, ended_at, policy):
     except OSError:
         return "artifact_error", None, None
     try:
-        info = os.fstat(descriptor)
-        artifact_second = info.st_mtime_ns // 1_000_000_000
+        before = os.fstat(descriptor)
+        artifact_second = before.st_mtime_ns // 1_000_000_000
         if (
-            not stat.S_ISREG(info.st_mode)
-            or info.st_uid != os.geteuid()
-            or stat.S_IMODE(info.st_mode) != 0o600
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.geteuid()
+            or stat.S_IMODE(before.st_mode) != 0o600
+            or before.st_size > maximum_bytes
             or not started_at <= artifact_second <= ended_at
         ):
             return "artifact_error", None, None
-        chunks = []
-        while True:
-            chunk = os.read(descriptor, 1024 * 1024)
+        snapshot = bytearray()
+        while len(snapshot) <= maximum_bytes:
+            chunk = os.read(
+                descriptor,
+                min(64 * 1024, maximum_bytes + 1 - len(snapshot)),
+            )
             if not chunk:
                 break
-            chunks.append(chunk)
-        data = b"".join(chunks)
+            snapshot.extend(chunk)
+        after = os.fstat(descriptor)
+        named = os.stat(name, dir_fd=stage_fd, follow_symlinks=False)
+        stable_fields = (
+            "st_dev",
+            "st_ino",
+            "st_mode",
+            "st_uid",
+            "st_size",
+            "st_mtime_ns",
+            "st_ctime_ns",
+        )
+        if (
+            len(snapshot) > maximum_bytes
+            or len(snapshot) != after.st_size
+            or any(
+                getattr(before, field) != getattr(after, field)
+                for field in stable_fields
+            )
+            or any(
+                getattr(after, field) != getattr(named, field)
+                for field in stable_fields
+            )
+        ):
+            return "artifact_error", None, None
+        data = bytes(snapshot)
         sanitized = mint_runner._sanitize_generated_artifact(data, policy)
         parsed = json.loads(sanitized)
     except (
@@ -1518,203 +1195,36 @@ def _artifact_evidence(
     }
 
 
-def _owned_directory_identity_at(parent_fd, name):
-    try:
-        info = os.stat(
-            name,
-            dir_fd=parent_fd,
-            follow_symlinks=False,
-        )
-    except FileNotFoundError:
-        return None
-    except OSError as exc:
-        raise DiagnoserError("stage result publication failed") from exc
-    if (
-        not stat.S_ISDIR(info.st_mode)
-        or info.st_uid != os.geteuid()
-        or stat.S_IMODE(info.st_mode) != 0o700
-    ):
-        raise DiagnoserError("stage result publication failed")
-    return info.st_dev, info.st_ino
-
-
-def _publish_stage_result(results_fd, stage_directory, artifacts, manifest):
-    try:
-        os.stat(
-            stage_directory,
-            dir_fd=results_fd,
-            follow_symlinks=False,
-        )
-    except FileNotFoundError:
-        pass
-    except OSError as exc:
-        raise DiagnoserError("stage result publication failed") from exc
-    else:
-        raise DiagnoserError("stage result already exists")
-    temporary = f".pending-{stage_directory}-{secrets.token_hex(12)}"
-    temporary_fd = _create_directory(
-        results_fd, temporary, mode=0o700
-    )
-    temporary_info = _validate_owned(
-        temporary_fd, "directory", mode=0o700
-    )
-    temporary_identity = temporary_info.st_dev, temporary_info.st_ino
-    created = []
-    published = False
-    try:
-        for name, rendered in artifacts.items():
-            destination = f"generated-{name}"
-            _write_private_at(temporary_fd, destination, rendered)
-            created.append(destination)
-        _write_private_at(
-            temporary_fd, "stage-manifest.json", manifest
-        )
-        created.append("stage-manifest.json")
-        os.fsync(temporary_fd)
-        os.rename(
-            temporary,
-            stage_directory,
-            src_dir_fd=results_fd,
-            dst_dir_fd=results_fd,
-        )
-        published = True
-        os.fsync(results_fd)
-    except BaseException:
-        if not published:
-            try:
-                final_identity = _owned_directory_identity_at(
-                    results_fd, stage_directory
-                )
-                named_temporary_identity = _owned_directory_identity_at(
-                    results_fd, temporary
-                )
-            except DiagnoserError:
-                final_identity = None
-                named_temporary_identity = None
-            if (
-                final_identity == temporary_identity
-                and named_temporary_identity is None
-            ):
-                published = True
-            elif (
-                named_temporary_identity == temporary_identity
-                and final_identity is None
-            ):
-                for name in reversed(created):
-                    try:
-                        os.unlink(name, dir_fd=temporary_fd)
-                    except OSError:
-                        pass
-                try:
-                    os.rmdir(temporary, dir_fd=results_fd)
-                except OSError:
-                    pass
-        raise
-    finally:
-        os.close(temporary_fd)
-    return published
-
 
 def _empty_stage_chain():
     return mint_runner._empty_chain_summary()
 
 
-def _terminal_stage_status(
-    guard_reason,
-    guard_exit,
-    child_exit_code,
-    cumulative_loss,
-    artifact_error,
-    aggregation_failed,
-    target_positive,
-    is_last,
+def _stage_evaluation(
+    stage_name,
+    decision,
+    stop_reason,
+    target_status="unproven",
+    three_hop_status="unproven",
+    sender_accepted=0,
+    sender_rejected=0,
+    target_landed=0,
+    cumulative_loss_lamports=0,
 ):
-    if artifact_error:
-        return "artifact_error", "failed"
-    if guard_reason == "rpc_error" or aggregation_failed:
-        return "rpc_error", "failed"
-    if (
-        guard_reason == "loss_threshold"
-        or cumulative_loss >= EARLY_STOP_LAMPORTS
-    ):
-        return "loss_threshold", "failed"
-    if guard_reason == "cleanup_failed":
-        return "cleanup_failed", "failed"
-    if (
-        guard_exit != 0
-        or guard_reason not in {"timeout", "child_exit"}
-        or (
-            guard_reason == "child_exit"
-            and child_exit_code not in (None, 0)
-        )
-    ):
-        return "failed", "failed"
-    if target_positive:
-        return "target_positive", "target_positive"
-    if is_last:
-        return "no_target", "exhausted"
-    return "no_target", "running"
-
-
-def _pending_replacement(state, prepared, manifest):
-    completed = state["completed_stages"]
-    if len(completed) >= len(prepared):
-        raise DiagnoserError("batch state is invalid")
-    stage_name = prepared[len(completed)]
-    if manifest.get("stage_name") != stage_name:
-        raise DiagnoserError("batch state is invalid")
-    cumulative_loss = manifest.get(
-        "cumulative_observed_loss_lamports"
-    )
-    if (
-        type(cumulative_loss) is not int
-        or cumulative_loss
-        < state["cumulative_observed_loss_lamports"]
-    ):
-        raise DiagnoserError("batch state is invalid")
-    stage_status = manifest.get("stage_status")
-    new_completed = completed + [stage_name]
-    if stage_status == "target_positive":
-        status = "target_positive"
-        decision = "stop"
-    elif stage_status == "no_target":
-        decision = (
-            prepared[len(new_completed)]
-            if len(new_completed) < len(prepared)
-            else "stop"
-        )
-        status = "running" if decision != "stop" else "exhausted"
-    elif stage_status in {
-        "artifact_error",
-        "rpc_error",
-        "loss_threshold",
-        "cleanup_failed",
-        "failed",
-    }:
-        status = "failed"
-        decision = "stop"
-    else:
-        raise DiagnoserError("batch state is invalid")
-    if manifest.get("next_decision") != decision:
-        raise DiagnoserError("batch state is invalid")
     return {
-        "schema": 1,
-        "status": status,
-        "completed_stages": new_completed,
-        "cumulative_observed_loss_lamports": cumulative_loss,
-        "next_stage": decision,
+        "stage_name": stage_name,
+        "decision": decision,
+        "stop_reason": stop_reason,
+        "target_status": target_status,
+        "three_hop_status": three_hop_status,
+        "sender_accepted": sender_accepted,
+        "sender_rejected": sender_rejected,
+        "target_landed": target_landed,
+        "cumulative_loss_lamports": cumulative_loss_lamports,
     }
 
 
-def _recover_pending_result(batch_fd, state, prepared, pending):
-    if pending is None:
-        return state
-    replacement = _pending_replacement(state, prepared, pending)
-    _store_batch_state(batch_fd, state, replacement)
-    return replacement
-
-
-def record_stage_result(
+def evaluate_stage(
     root: Path,
     batch_id: str,
     stage_name: str,
@@ -1723,52 +1233,23 @@ def record_stage_result(
     ended_at: int,
     transport=None,
 ) -> dict:
-    """Record fixed evidence for exactly the current stage without retrying."""
+    """Evaluate one completed stage without storing execution state."""
     batch_id = _validate_batch_id(batch_id)
     if stage_name not in STAGE_NAMES:
         raise DiagnoserError("stage name is invalid")
     _validate_window(started_at, ended_at)
-    descriptors = _batch_descriptors(root, batch_id, include_results=True)
+    descriptors = _batch_descriptors(root, batch_id)
     stage_fd = None
-    attempt_started = False
-    publication_started = False
-    state = None
     try:
-        _lock_batch(descriptors, exclusive=True)
-        state, prepared, pending = _load_batch_state(
-            descriptors["batch"], descriptors["stages"]
-        )
-        if pending is not None:
-            if pending.get("stage_name") != stage_name:
-                raise DiagnoserError("stage order is invalid")
-            _recover_pending_result(
-                descriptors["batch"], state, prepared, pending
-            )
-            return pending
-        if state["status"] in TERMINAL_BATCH_STATES:
-            raise DiagnoserError("batch is already terminal")
-        if state["next_stage"] == "stop":
-            raise DiagnoserError("interrupted stage cannot be retried")
-        if state["next_stage"] != stage_name:
-            raise DiagnoserError("stage order is invalid")
-        running = dict(state)
-        running["status"] = "running"
-        running["next_stage"] = "stop"
-        _store_batch_state(descriptors["batch"], state, running)
-        state = running
-        attempt_started = True
         index = STAGE_NAMES.index(stage_name)
-        stage_directory = f"{index}-{stage_name}"
         stage_fd = _open_relative_directory(
-            descriptors["stages"], stage_directory, mode=0o700
+            descriptors["stages"],
+            f"{index}-{stage_name}",
+            mode=0o700,
         )
         contract = _validate_stage_contract(stage_fd, batch_id, stage_name)
-        guard, guard_integers, duration = _parse_stage_guard(
-            stage_fd, guard_exit
-        )
-        log_snapshot = _stage_log_snapshot(
-            stage_fd, guard["log_path"]
-        )
+        guard, guard_integers, _ = _parse_stage_guard(stage_fd, guard_exit)
+        log_snapshot = _stage_log_snapshot(stage_fd, guard["log_path"])
         log_events = _aggregate_stage_log(log_snapshot)
         config_bytes = _read_owned_file(stage_fd, "config.toml", mode=0o600)
         try:
@@ -1782,7 +1263,6 @@ def record_stage_result(
         policy = zavod_guard.ProtectedOutputPolicy(
             base_policy.secrets + (wallet,)
         )
-
         evidence = _artifact_evidence(
             stage_fd,
             contract["target_mint"],
@@ -1790,625 +1270,93 @@ def record_stage_result(
             ended_at,
             policy,
         )
-        artifact_error = evidence is None
-        chain = _empty_stage_chain()
-        aggregation_failed = False
-        observed_loss = state["cumulative_observed_loss_lamports"]
-        if not artifact_error and guard["reason"] != "rpc_error":
-            try:
-                current_balance = zavod_guard.get_balance_lamports(
-                    config["rpc"]["url"],
-                    wallet,
-                    transport=transport,
-                )
-                observed_loss = max(
-                    observed_loss,
-                    max(
-                        0,
-                        contract["batch_start_balance_lamports"]
-                        - current_balance,
-                    ),
-                )
-                chain = mint_runner._sanitize_chain_summary(
-                    mint_runner.aggregate_chain(
-                        config,
-                        contract["target_mint"],
-                        started_at,
-                        ended_at,
-                        transport=transport,
-                        pubkey_resolver=lambda ignored: wallet,
-                    )
-                )
-            except Exception:
-                chain = _empty_stage_chain()
-                aggregation_failed = True
-
         if evidence is None:
-            selector = {
-                "selected_count_histogram": {},
-                "target_artifact_present": False,
-                "target_pool_count": 0,
-                "target_lut_count": 0,
-                "target_runtime_observation_count": 0,
-            }
-            routing_target_count = 0
-            three_hop_count = 0
-        else:
-            selector = _selector_stage_log_summary(
-                log_snapshot,
-                contract["target_mint"],
-                evidence["artifacts"],
-                guard["reason"],
+            return _stage_evaluation(
+                stage_name,
+                "failed",
+                "artifact_error",
+                sender_accepted=log_events["sent_events"],
+                sender_rejected=log_events["error_events"],
             )
-            routing_target_count = evidence["routing_target_count"]
-            three_hop_count = evidence["three_hop_count"]
-
-        target_artifact_count = (
-            int(selector["target_artifact_present"])
-            + int(routing_target_count > 0)
-        )
-        target_pool_count = selector["target_pool_count"]
-        target_lut_count = selector["target_lut_count"]
-        target_runtime_count = selector[
-            "target_runtime_observation_count"
-        ]
-        for count in (
-            target_pool_count,
-            target_lut_count,
-            target_runtime_count,
-        ):
-            if type(count) is not int or count < 0:
-                target_pool_count = 0
-                target_lut_count = 0
-                target_runtime_count = 0
-                break
-        target_positive = (
-            target_artifact_count > 0 or chain["landed"] > 0
-        )
-        cumulative_loss = max(
-            state["cumulative_observed_loss_lamports"],
-            observed_loss,
-        )
-        is_last = stage_name == prepared[-1]
-        stage_status, batch_status = _terminal_stage_status(
-            guard["reason"],
-            guard_exit,
-            guard_integers["child_exit_code"],
-            cumulative_loss,
-            artifact_error,
-            aggregation_failed,
-            target_positive,
-            is_last,
-        )
-        completed = state["completed_stages"] + [stage_name]
-        if batch_status == "running":
-            next_decision = prepared[len(completed)]
-        else:
-            next_decision = "stop"
-        manifest = {
-            "stage_name": stage_name,
-            "stage_status": stage_status,
-            "stop_reason": guard["reason"],
-            "duration_seconds": duration,
-            "guard_exit": guard_exit,
-            "selector_histogram": selector[
-                "selected_count_histogram"
-            ],
-            "target_artifact_count": target_artifact_count,
-            "target_pool_count": target_pool_count,
-            "target_lut_count": target_lut_count,
-            "target_runtime_count": target_runtime_count,
-            "route_status": (
-                "target_route_observed"
-                if routing_target_count
-                else "target_route_unproven"
-            ),
-            "three_hop_status": (
-                "three_hop_observed"
-                if three_hop_count
-                else "three_hop_unproven"
-            ),
-            "sender_acceptance_count": log_events["sent_events"],
-            "sender_rejection_count": log_events["error_events"],
-            "target_filtered_landed": chain["landed"],
-            "target_filtered_successful": chain["successful"],
-            "target_filtered_failed": chain["failed"],
-            "fees_lamports": chain["fees_lamports"],
-            "rent_lamports": chain["rent_lamports"],
-            "transfers_lamports": chain["transfers_lamports"],
-            "sol_delta_lamports": chain["sol_delta_lamports"],
-            "wsol_delta_raw": chain["wsol_delta_raw"],
-            "cumulative_observed_loss_lamports": cumulative_loss,
-            "next_decision": next_decision,
-        }
-        rendered = (
-            json.dumps(
-                manifest,
-                sort_keys=True,
-                separators=(",", ":"),
+        try:
+            current_balance = zavod_guard.get_balance_lamports(
+                config["rpc"]["url"],
+                wallet,
+                transport=transport,
             )
-            + "\n"
-        )
-        if policy.contains_protected(rendered):
-            raise DiagnoserError("stage result contains protected data")
-        publication_started = True
-        _publish_stage_result(
-            descriptors["results"],
-            stage_directory,
-            (
-                {}
-                if evidence is None
-                else evidence["sanitized"]
-            ),
-            rendered.encode(),
-        )
-        replacement = {
-            "schema": 1,
-            "status": batch_status,
-            "completed_stages": completed,
-            "cumulative_observed_loss_lamports": cumulative_loss,
-            "next_stage": next_decision,
-        }
-        _store_batch_state(descriptors["batch"], state, replacement)
-        return manifest
-    except BaseException:
-        if (
-            attempt_started
-            and not publication_started
-            and state is not None
-        ):
-            failed = {
-                **state,
-                "status": "failed",
-                "next_stage": "stop",
-            }
-            try:
-                _store_batch_state(
-                    descriptors["batch"], state, failed
+            chain = mint_runner._sanitize_chain_summary(
+                mint_runner.aggregate_chain(
+                    config,
+                    contract["target_mint"],
+                    started_at,
+                    ended_at,
+                    transport=transport,
+                    pubkey_resolver=lambda ignored: wallet,
                 )
-            except BaseException:
-                pass
-        raise
+            )
+        except Exception:
+            return _stage_evaluation(
+                stage_name,
+                "failed",
+                "rpc_error",
+                sender_accepted=log_events["sent_events"],
+                sender_rejected=log_events["error_events"],
+            )
+        cumulative_loss = max(
+            0,
+            contract["batch_start_balance_lamports"] - current_balance,
+        )
+        selector = _selector_stage_log_summary(
+            log_snapshot,
+            contract["target_mint"],
+            evidence["artifacts"],
+            guard["reason"],
+        )
+        target_positive = (
+            selector["target_artifact_present"]
+            or evidence["routing_target_count"] > 0
+            or chain["landed"] > 0
+        )
+        if guard_exit != 0:
+            decision, stop_reason = "failed", "guard_exit"
+        elif guard["reason"] == "loss_threshold":
+            decision, stop_reason = "failed", "loss_threshold"
+        elif cumulative_loss >= EARLY_STOP_LAMPORTS:
+            decision, stop_reason = "failed", "loss_threshold"
+        elif (
+            guard["reason"] not in {"timeout", "child_exit"}
+            or (
+                guard["reason"] == "child_exit"
+                and guard_integers["child_exit_code"] not in (None, 0)
+            )
+        ):
+            decision, stop_reason = "failed", guard["reason"]
+        elif target_positive:
+            decision, stop_reason = "target_positive", guard["reason"]
+        else:
+            decision, stop_reason = "continue", guard["reason"]
+        return _stage_evaluation(
+            stage_name,
+            decision,
+            stop_reason,
+            target_status=("positive" if target_positive else "absent"),
+            three_hop_status=(
+                "observed"
+                if evidence["three_hop_count"] > 0
+                else "unproven"
+            ),
+            sender_accepted=log_events["sent_events"],
+            sender_rejected=log_events["error_events"],
+            target_landed=chain["landed"],
+            cumulative_loss_lamports=cumulative_loss,
+        )
+    except DiagnoserError:
+        return _stage_evaluation(stage_name, "failed", "evaluation_error")
     finally:
-        for descriptor in (stage_fd,):
-            if descriptor is not None:
-                try:
-                    os.close(descriptor)
-                except OSError:
-                    pass
+        if stage_fd is not None:
+            os.close(stage_fd)
         _close_descriptors(descriptors)
 
-
-def next_stage(root: Path, batch_id: str) -> str:
-    """Return the only permitted next stage, or ``stop`` for terminal batches."""
-    batch_id = _validate_batch_id(batch_id)
-    descriptors = _batch_descriptors(root, batch_id)
-    try:
-        _lock_batch(descriptors, exclusive=True)
-        state, prepared, pending = _load_batch_state(
-            descriptors["batch"], descriptors["stages"]
-        )
-        state = _recover_pending_result(
-            descriptors["batch"], state, prepared, pending
-        )
-        return state["next_stage"]
-    finally:
-        _close_descriptors(descriptors)
-
-
-def _existing_batch_result(batch_fd, expected):
-    descriptor = None
-    try:
-        descriptor = os.open(
-            "batch-result.json",
-            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
-            dir_fd=batch_fd,
-        )
-    except FileNotFoundError:
-        return None
-    except OSError as exc:
-        raise DiagnoserError("batch result is invalid") from exc
-    try:
-        _validate_owned(descriptor, "file", mode=0o600)
-        chunks = []
-        while True:
-            chunk = os.read(descriptor, 1024 * 1024)
-            if not chunk:
-                break
-            chunks.append(chunk)
-        data = b"".join(chunks)
-        result = _decode_json_object(
-            data,
-            "batch result is invalid",
-            reject_duplicate_keys=True,
-        )
-        if (
-            set(result) != BATCH_RESULT_KEYS
-            or not isinstance(result.get("status"), str)
-            or result["status"] not in TERMINAL_BATCH_STATES
-            or not isinstance(result.get("completed_stages"), list)
-            or any(
-                not isinstance(name, str) or name not in STAGE_NAMES
-                for name in result["completed_stages"]
-            )
-            or type(
-                result.get("cumulative_observed_loss_lamports")
-            )
-            is not int
-            or result["cumulative_observed_loss_lamports"] < 0
-            or result != expected
-        ):
-            raise DiagnoserError("batch result is invalid")
-        return result, descriptor
-    except (OSError, DiagnoserError) as exc:
-        os.close(descriptor)
-        raise DiagnoserError("batch result is invalid") from exc
-    except BaseException:
-        os.close(descriptor)
-        raise
-
-
-def _revalidate_batch_result_path(batch_fd, descriptor):
-    try:
-        identity = _validate_owned(descriptor, "file", mode=0o600)
-        named = os.stat(
-            "batch-result.json",
-            dir_fd=batch_fd,
-            follow_symlinks=False,
-        )
-    except (OSError, DiagnoserError) as exc:
-        raise DiagnoserError("batch result is invalid") from exc
-    if (
-        not stat.S_ISREG(named.st_mode)
-        or named.st_uid != os.geteuid()
-        or stat.S_IMODE(named.st_mode) != 0o600
-        or (named.st_dev, named.st_ino)
-        != (identity.st_dev, identity.st_ino)
-    ):
-        raise DiagnoserError("batch result is invalid")
-
-
-def _private_marker_stat(state_fd, name):
-    try:
-        info = os.stat(
-            name,
-            dir_fd=state_fd,
-            follow_symlinks=False,
-        )
-    except FileNotFoundError:
-        return None
-    except OSError as exc:
-        raise DiagnoserError(
-            "active batch marker is invalid"
-        ) from exc
-    if (
-        not stat.S_ISREG(info.st_mode)
-        or info.st_uid != os.geteuid()
-        or stat.S_IMODE(info.st_mode) != 0o600
-    ):
-        raise DiagnoserError("active batch marker is invalid")
-    return info
-
-
-def _marker_identity(info):
-    return info.st_dev, info.st_ino
-
-
-def _raise_marker_error_after_sync(state_fd, cause=None):
-    try:
-        os.fsync(state_fd)
-    except OSError as exc:
-        raise DiagnoserError(
-            "active batch marker is invalid"
-        ) from exc
-    if cause is None:
-        raise DiagnoserError("active batch marker is invalid")
-    raise DiagnoserError("active batch marker is invalid") from cause
-
-
-def _rollback_quarantined_marker(
-    state_fd,
-    quarantine,
-    quarantine_fd,
-):
-    try:
-        held = _validate_owned(
-            quarantine_fd, "file", mode=0o600
-        )
-        expected = _marker_identity(held)
-        named = _private_marker_stat(state_fd, quarantine)
-    except DiagnoserError as exc:
-        _raise_marker_error_after_sync(state_fd, exc)
-    if named is None or _marker_identity(named) != expected:
-        _raise_marker_error_after_sync(state_fd)
-    try:
-        os.link(
-            quarantine,
-            ACTIVE_MARKER,
-            src_dir_fd=state_fd,
-            dst_dir_fd=state_fd,
-            follow_symlinks=False,
-        )
-    except OSError as exc:
-        _raise_marker_error_after_sync(state_fd, exc)
-    try:
-        os.fsync(state_fd)
-    except OSError as exc:
-        _raise_marker_error_after_sync(state_fd, exc)
-    try:
-        held = _validate_owned(
-            quarantine_fd, "file", mode=0o600
-        )
-        active = _private_marker_stat(state_fd, ACTIVE_MARKER)
-        remaining = _private_marker_stat(state_fd, quarantine)
-    except DiagnoserError as exc:
-        _raise_marker_error_after_sync(state_fd, exc)
-    expected = _marker_identity(held)
-    if (
-        active is None
-        or remaining is None
-        or _marker_identity(active) != expected
-        or _marker_identity(remaining) != expected
-    ):
-        _raise_marker_error_after_sync(state_fd)
-    try:
-        os.unlink(quarantine, dir_fd=state_fd)
-        os.fsync(state_fd)
-    except OSError as exc:
-        _raise_marker_error_after_sync(state_fd, exc)
-
-
-def _read_marker_descriptor(descriptor):
-    chunks = []
-    total = 0
-    while True:
-        chunk = os.read(descriptor, 1024)
-        if not chunk:
-            return b"".join(chunks)
-        total += len(chunk)
-        if total > 1024:
-            raise DiagnoserError("active batch marker is invalid")
-        chunks.append(chunk)
-
-
-def _remove_finalized_active_marker(
-    state_fd,
-    batch_id,
-    *,
-    batch_fd,
-    result_fd,
-):
-    descriptor = None
-    quarantine_fd = None
-    quarantine = None
-    try:
-        try:
-            descriptor = os.open(
-                ACTIVE_MARKER,
-                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
-                dir_fd=state_fd,
-            )
-        except FileNotFoundError:
-            _revalidate_batch_result_path(batch_fd, result_fd)
-            return
-        except OSError as exc:
-            raise DiagnoserError(
-                "active batch marker is invalid"
-            ) from exc
-        try:
-            identity = _validate_owned(
-                descriptor, "file", mode=0o600
-            )
-            marker = _read_marker_descriptor(descriptor)
-        except (OSError, DiagnoserError) as exc:
-            raise DiagnoserError(
-                "active batch marker is invalid"
-            ) from exc
-        if marker != f"{batch_id}\n".encode():
-            raise DiagnoserError("active batch marker is invalid")
-        quarantine = (
-            f"{ACTIVE_MARKER}.releasing-{secrets.token_hex(12)}"
-        )
-        try:
-            named = _private_marker_stat(
-                state_fd, ACTIVE_MARKER
-            )
-            existing_quarantine = _private_marker_stat(
-                state_fd, quarantine
-            )
-        except DiagnoserError as exc:
-            _raise_marker_error_after_sync(state_fd, exc)
-        if (
-            named is None
-            or _marker_identity(named)
-            != _marker_identity(identity)
-            or existing_quarantine is not None
-        ):
-            _raise_marker_error_after_sync(state_fd)
-        try:
-            os.rename(
-                ACTIVE_MARKER,
-                quarantine,
-                src_dir_fd=state_fd,
-                dst_dir_fd=state_fd,
-            )
-        except OSError as exc:
-            _raise_marker_error_after_sync(state_fd, exc)
-        try:
-            quarantine_fd = os.open(
-                quarantine,
-                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
-                dir_fd=state_fd,
-            )
-            quarantine_identity = _validate_owned(
-                quarantine_fd, "file", mode=0o600
-            )
-            quarantine_marker = _read_marker_descriptor(
-                quarantine_fd
-            )
-        except (OSError, DiagnoserError) as exc:
-            _raise_marker_error_after_sync(state_fd, exc)
-        if (
-            _marker_identity(quarantine_identity)
-            != _marker_identity(identity)
-            or quarantine_marker != marker
-        ):
-            _rollback_quarantined_marker(
-                state_fd, quarantine, quarantine_fd
-            )
-            raise DiagnoserError("active batch marker is invalid")
-        try:
-            _revalidate_batch_result_path(batch_fd, result_fd)
-        except DiagnoserError:
-            _rollback_quarantined_marker(
-                state_fd, quarantine, quarantine_fd
-            )
-            raise
-        try:
-            remaining = _private_marker_stat(
-                state_fd, quarantine
-            )
-            active = _private_marker_stat(
-                state_fd, ACTIVE_MARKER
-            )
-        except DiagnoserError as exc:
-            _raise_marker_error_after_sync(state_fd, exc)
-        expected = _marker_identity(quarantine_identity)
-        if remaining is None or _marker_identity(remaining) != expected:
-            _raise_marker_error_after_sync(state_fd)
-        if active is not None:
-            _rollback_quarantined_marker(
-                state_fd, quarantine, quarantine_fd
-            )
-            raise DiagnoserError("active batch marker is invalid")
-        try:
-            _revalidate_batch_result_path(batch_fd, result_fd)
-        except DiagnoserError:
-            _rollback_quarantined_marker(
-                state_fd, quarantine, quarantine_fd
-            )
-            raise
-        try:
-            remaining = _private_marker_stat(
-                state_fd, quarantine
-            )
-            active = _private_marker_stat(
-                state_fd, ACTIVE_MARKER
-            )
-        except DiagnoserError as exc:
-            _raise_marker_error_after_sync(state_fd, exc)
-        if (
-            remaining is None
-            or _marker_identity(remaining) != expected
-        ):
-            _raise_marker_error_after_sync(state_fd)
-        if active is not None:
-            _rollback_quarantined_marker(
-                state_fd, quarantine, quarantine_fd
-            )
-            raise DiagnoserError("active batch marker is invalid")
-        try:
-            os.unlink(quarantine, dir_fd=state_fd)
-            os.fsync(state_fd)
-        except OSError as exc:
-            _raise_marker_error_after_sync(state_fd, exc)
-        try:
-            active = _private_marker_stat(
-                state_fd, ACTIVE_MARKER
-            )
-        except DiagnoserError as exc:
-            _raise_marker_error_after_sync(state_fd, exc)
-        if active is not None:
-            _raise_marker_error_after_sync(state_fd)
-    finally:
-        for held_fd in (quarantine_fd, descriptor):
-            if held_fd is not None:
-                try:
-                    os.close(held_fd)
-                except OSError:
-                    pass
-
-
-def finalize_batch(root: Path, batch_id: str) -> dict:
-    """Publish one fixed batch result and release its active marker."""
-    batch_id = _validate_batch_id(batch_id)
-    descriptors = _batch_descriptors(root, batch_id)
-    result_fd = None
-    try:
-        _lock_batch(descriptors, exclusive=True)
-        descriptors["state_lock"] = _acquire_state_marker_lock(
-            descriptors["state"]
-        )
-        state, prepared, pending = _load_batch_state(
-            descriptors["batch"], descriptors["stages"]
-        )
-        state = _recover_pending_result(
-            descriptors["batch"], state, prepared, pending
-        )
-        if state["status"] == "prepared":
-            replacement = {
-                **state,
-                "status": "declined",
-                "next_stage": "stop",
-            }
-            _store_batch_state(descriptors["batch"], state, replacement)
-            state = replacement
-        elif state["status"] == "running":
-            if state["next_stage"] != "stop":
-                raise DiagnoserError("batch is not terminal")
-            replacement = {
-                **state,
-                "status": "failed",
-            }
-            _store_batch_state(
-                descriptors["batch"], state, replacement
-            )
-            state = replacement
-        result = {
-            "status": state["status"],
-            "completed_stages": state["completed_stages"],
-            "cumulative_observed_loss_lamports": state[
-                "cumulative_observed_loss_lamports"
-            ],
-        }
-        existing_result = _existing_batch_result(
-            descriptors["batch"], result
-        )
-        if existing_result is None:
-            _write_private_at(
-                descriptors["batch"],
-                "batch-result.json",
-                (
-                    json.dumps(
-                        result,
-                        sort_keys=True,
-                        separators=(",", ":"),
-                    )
-                    + "\n"
-                ).encode(),
-            )
-            existing_result = _existing_batch_result(
-                descriptors["batch"], result
-            )
-            if existing_result is None:
-                raise DiagnoserError("batch result is invalid")
-        result, result_fd = existing_result
-        os.fsync(descriptors["batch"])
-        _remove_active_marker(
-            descriptors["state"],
-            batch_id,
-            strict=True,
-            batch_fd=descriptors["batch"],
-            result_fd=result_fd,
-        )
-        return result
-    finally:
-        if result_fd is not None:
-            try:
-                os.close(result_fd)
-            except OSError:
-                pass
-        _close_descriptors(descriptors)
 
 
 def restore_batch(root: Path, batch_id: str) -> None:
@@ -2503,19 +1451,13 @@ def main(argv=None):
     contract.add_argument("name")
     result = commands.add_parser("batch-result-path")
     result.add_argument("batch_id")
-    record = commands.add_parser("record-stage")
-    record.add_argument("root", type=Path)
-    record.add_argument("batch_id")
-    record.add_argument("stage_name")
-    record.add_argument("--guard-exit", required=True, type=int)
-    record.add_argument("--started-at", required=True, type=int)
-    record.add_argument("--ended-at", required=True, type=int)
-    advance = commands.add_parser("next-stage")
-    advance.add_argument("root", type=Path)
-    advance.add_argument("batch_id")
-    finalize = commands.add_parser("finalize")
-    finalize.add_argument("root", type=Path)
-    finalize.add_argument("batch_id")
+    evaluate = commands.add_parser("evaluate-stage")
+    evaluate.add_argument("root", type=Path)
+    evaluate.add_argument("batch_id")
+    evaluate.add_argument("stage_name")
+    evaluate.add_argument("--guard-exit", required=True, type=int)
+    evaluate.add_argument("--started-at", required=True, type=int)
+    evaluate.add_argument("--ended-at", required=True, type=int)
     args = parser.parse_args(argv)
     if args.command == "prepare":
         print(json.dumps(_safe_batch_summary(prepare_batch(args.root, args.mint)), sort_keys=True))
@@ -2527,10 +1469,10 @@ def main(argv=None):
         print(stage_contract_path(args.batch_id, args.index, args.name))
     elif args.command == "batch-result-path":
         print(batch_result_path(args.batch_id))
-    elif args.command == "record-stage":
+    elif args.command == "evaluate-stage":
         print(
             json.dumps(
-                record_stage_result(
+                evaluate_stage(
                     args.root,
                     args.batch_id,
                     args.stage_name,
@@ -2541,10 +1483,6 @@ def main(argv=None):
                 sort_keys=True,
             )
         )
-    elif args.command == "next-stage":
-        print(next_stage(args.root, args.batch_id))
-    else:
-        print(json.dumps(finalize_batch(args.root, args.batch_id), sort_keys=True))
 
 
 if __name__ == "__main__":

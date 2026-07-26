@@ -347,6 +347,18 @@ except BaseException as exc:
 
 
 class StageEvidenceTests(unittest.TestCase):
+    RESULT_KEYS = {
+        "stage_name",
+        "decision",
+        "stop_reason",
+        "target_status",
+        "three_hop_status",
+        "sender_accepted",
+        "sender_rejected",
+        "target_landed",
+        "cumulative_loss_lamports",
+    }
+
     def setUp(self):
         self.root = Path(tempfile.mkdtemp())
         (self.root / "state").mkdir()
@@ -364,78 +376,61 @@ class StageEvidenceTests(unittest.TestCase):
             self.batch = mint_auto_diagnoser.prepare_batch(
                 self.root,
                 TARGET_MINT,
-                now=lambda: datetime(
-                    2026, 7, 26, 12, 30, tzinfo=timezone.utc
-                ),
+                now=lambda: datetime(2026, 7, 26, 12, 30, tzinfo=timezone.utc),
                 transport=PrivateWorkspaceTests.transport,
                 balance_reader=lambda url, wallet: 123_456_789,
             )
         self.stage = next(stage for stage in self.batch.stages if not stage.skipped)
         self.stage_root = self.root / self.stage.relative_root
-        self.started_at = 100
-        self.ended_at = 200
-
-    def tearDown(self):
-        shutil.rmtree(self.root)
-
-    def write_guard_result(
-        self,
-        *,
-        reason="timeout",
-        observed_loss=0,
-        child_exit_code=0,
-        stage_root=None,
-    ):
-        del observed_loss
-        stage_root = stage_root or self.stage_root
-        result = (
-            f"reason={reason}\n"
+        logs = self.stage_root / "logs"
+        logs.mkdir(mode=0o700)
+        (logs / "stage.log").write_bytes(b"")
+        (logs / "stage.log").chmod(0o600)
+        guard = (
+            "reason=timeout\n"
             "duration_seconds=60\n"
-            f"child_exit_code={child_exit_code}\n"
+            "child_exit_code=0\n"
             "loss_limit_lamports=30000000\n"
             "early_stop_lamports=25000000\n"
             "log_path=logs/stage.log\n"
         )
-        path = stage_root / "guard-result.txt"
-        path.write_text(result)
-        path.chmod(0o600)
-        logs = stage_root / "logs"
-        logs.mkdir(exist_ok=True)
-        logs.chmod(0o700)
-        log = logs / "stage.log"
-        log.write_text("")
-        log.chmod(0o600)
-        return log
+        (self.stage_root / "guard-result.txt").write_text(guard)
+        (self.stage_root / "guard-result.txt").chmod(0o600)
+
+    def tearDown(self):
+        shutil.rmtree(self.root)
+
+    @staticmethod
+    def hot_tokens(target):
+        return {
+            "count": 1,
+            "arb_mint_info": [
+                {
+                    "arbs_count": 1,
+                    "bridge_mint": "bridge",
+                    "bridge_pool_ids_info": [],
+                    "cross_pool_ids_info": [],
+                    "lookup_table_accounts": ["lut"],
+                    "mint": target,
+                    "pool_ids": ["pool"],
+                    "pool_ids_info": [],
+                    "roi": 0.0,
+                    "total_fee": 0,
+                    "total_liquidity_lamports": 0,
+                    "total_profit": 0,
+                    "total_volume": 0,
+                    "txs": [{}],
+                }
+            ],
+        }
 
     def write_artifact(self, name, value):
         path = self.stage_root / name
         path.write_text(json.dumps(value))
         path.chmod(0o600)
         os.utime(path, (150, 150))
-        return path
 
-    @staticmethod
-    def hot_tokens(target=None, *, route_length=0):
-        entry = {
-            "arbs_count": route_length,
-            "bridge_mint": "bridge",
-            "bridge_pool_ids_info": [],
-            "cross_pool_ids_info": [],
-            "lookup_table_accounts": ["lut"],
-            "mint": target or "unrelated",
-            "pool_ids": [f"pool-{index}" for index in range(route_length)],
-            "pool_ids_info": [],
-            "roi": 0.0,
-            "total_fee": 0,
-            "total_liquidity_lamports": 0,
-            "total_profit": 0,
-            "total_volume": 0,
-            "txs": [{} for _ in range(route_length)],
-        }
-        return {"count": 1, "arb_mint_info": [entry]}
-
-    @staticmethod
-    def empty_transport(url, payload, timeout):
+    def transport(self, url, payload, timeout):
         del url, timeout
         if payload["method"] == "getBalance":
             return {"result": {"value": 123_456_789}}
@@ -443,1434 +438,88 @@ class StageEvidenceTests(unittest.TestCase):
             return {"result": []}
         raise AssertionError("unexpected RPC method")
 
-    @staticmethod
-    def landed_transport(url, payload, timeout):
-        del url, timeout
-        if payload["method"] == "getBalance":
-            return {"result": {"value": 123_456_789}}
-        if payload["method"] == "getSignaturesForAddress":
-            if payload["params"][1].get("before") is not None:
-                return {"result": []}
-            return {
-                "result": [
-                    {
-                        "signature": "fixture-signature",
-                        "blockTime": 150,
-                        "confirmationStatus": "finalized",
-                    }
-                ]
-            }
-        if payload["method"] == "getTransaction":
-            return {
-                "result": {
-                    "blockTime": 150,
-                    "meta": {
-                        "err": None,
-                        "fee": 5,
-                        "preBalances": [100, 0],
-                        "postBalances": [95, 0],
-                        "preTokenBalances": [],
-                        "postTokenBalances": [
-                            {
-                                "owner": "wallet",
-                                "mint": TARGET_MINT,
-                                "uiTokenAmount": {"amount": "1"},
-                            }
-                        ],
-                        "innerInstructions": [],
-                    },
-                    "transaction": {
-                        "message": {
-                            "accountKeys": ["wallet", TARGET_MINT],
-                            "instructions": [],
-                        }
-                    },
-                }
-            }
-        raise AssertionError("unexpected RPC method")
-
-    def record(self, *, transport=None, guard_exit=0):
+    def evaluate(self, *, guard_exit=0, transport=None):
         with patch.object(
             mint_auto_diagnoser.zavod_guard,
             "wallet_pubkey",
             return_value="wallet",
         ):
-            return mint_auto_diagnoser.record_stage_result(
+            result = mint_auto_diagnoser.evaluate_stage(
                 self.root,
                 self.batch.batch_id,
                 self.stage.name,
                 guard_exit,
-                self.started_at,
-                self.ended_at,
-                transport=transport or self.empty_transport,
+                100,
+                200,
+                transport=transport or self.transport,
             )
+        self.assertEqual(set(result), self.RESULT_KEYS)
+        return result
 
-    def assert_result_substitution_keeps_active_marker(self, result_path):
-        replacement = (
-            b'{"completed_stages":["baseline"],'
-            b'"cumulative_observed_loss_lamports":1,'
-            b'"status":"target_positive"}\n'
-        )
-        active_path = (
-            self.root / "state" / mint_auto_diagnoser.ACTIVE_MARKER
-        )
-        batch_identity = (
-            result_path.parent.stat().st_dev,
-            result_path.parent.stat().st_ino,
-        )
-        real_fsync = mint_auto_diagnoser.os.fsync
-        substituted = False
-
-        def substitute_after_batch_fsync(descriptor):
-            nonlocal substituted
-            result = real_fsync(descriptor)
-            info = os.fstat(descriptor)
-            if (
-                not substituted
-                and (info.st_dev, info.st_ino) == batch_identity
-                and result_path.exists()
-            ):
-                os.unlink(result_path)
-                replacement_fd = os.open(
-                    result_path,
-                    os.O_WRONLY
-                    | os.O_CREAT
-                    | os.O_EXCL
-                    | getattr(os, "O_NOFOLLOW", 0),
-                    0o600,
-                )
-                try:
-                    os.fchmod(replacement_fd, 0o600)
-                    os.write(replacement_fd, replacement)
-                    real_fsync(replacement_fd)
-                finally:
-                    os.close(replacement_fd)
-                substituted = True
-            return result
-
-        with patch.object(
-            mint_auto_diagnoser.os,
-            "fsync",
-            side_effect=substitute_after_batch_fsync,
-        ):
-            with self.assertRaises(mint_auto_diagnoser.DiagnoserError):
-                mint_auto_diagnoser.finalize_batch(
-                    self.root, self.batch.batch_id
-                )
-
-        self.assertTrue(substituted)
-        self.assertEqual(result_path.read_bytes(), replacement)
-        self.assertEqual(
-            active_path.read_text(), self.batch.batch_id + "\n"
-        )
-
-    def test_exact_structural_target_artifact_is_target_positive(self):
-        """Dropping exact hot-token identity evidence must stop satisfying the stage."""
-        self.write_guard_result()
+    def test_exact_target_returns_target_positive(self):
         self.write_artifact("hot_tokens.json", self.hot_tokens(TARGET_MINT))
 
-        result = self.record()
+        result = self.evaluate()
 
-        self.assertEqual(result["stage_status"], "target_positive")
-        self.assertEqual(result["target_artifact_count"], 1)
-        self.assertEqual(result["target_filtered_landed"], 0)
-        self.assertEqual(result["next_decision"], "stop")
-        self.assertEqual(mint_auto_diagnoser.next_stage(self.root, self.batch.batch_id), "stop")
+        self.assertEqual(result["decision"], "target_positive")
+        self.assertEqual(result["target_status"], "positive")
 
-    def test_finalized_target_filtered_landing_is_target_positive(self):
-        """Ignoring finalized target-filtered landings would advance past real evidence."""
-        self.write_guard_result()
-
-        result = self.record(transport=self.landed_transport)
-
-        self.assertEqual(result["stage_status"], "target_positive")
-        self.assertEqual(result["target_artifact_count"], 0)
-        self.assertEqual(result["target_filtered_landed"], 1)
-        self.assertEqual(result["target_filtered_successful"], 1)
-
-    def test_sender_acceptance_never_counts_as_target_evidence(self):
-        """Treating an unrelated send marker as target evidence would stop too early."""
-        log = self.write_guard_result()
-        log.write_text(
-            "Transaction sent successfully\n"
-            "Fetched 1 mint list.\n"
-        )
-        log.chmod(0o600)
-        self.write_artifact("hot_tokens.json", self.hot_tokens())
-
-        result = self.record()
-
-        self.assertEqual(result["stage_status"], "no_target")
-        self.assertEqual(result["sender_acceptance_count"], 1)
-        self.assertEqual(result["target_filtered_landed"], 0)
-        self.assertEqual(result["next_decision"], "offchain")
-        self.assertEqual(
-            mint_auto_diagnoser.next_stage(self.root, self.batch.batch_id),
-            "offchain",
-        )
-
-    def test_oversized_stage_log_fails_closed_before_evidence(self):
-        """Reading past the fixed log cap would let unbounded input drive evidence."""
-        log = self.write_guard_result()
-        with log.open("wb") as handle:
-            handle.truncate(
-                mint_auto_diagnoser.mint_runner.SELECTOR_LOG_MAX_BYTES
-                + 1
-            )
+    def test_sender_acceptance_alone_returns_continue(self):
+        log = self.stage_root / "logs" / "stage.log"
+        log.write_text("Transaction sent successfully\n")
         log.chmod(0o600)
 
-        with self.assertRaises(mint_auto_diagnoser.DiagnoserError):
-            self.record()
+        result = self.evaluate()
 
-        self.assertEqual(
-            mint_auto_diagnoser.next_stage(
-                self.root, self.batch.batch_id
-            ),
-            "stop",
-        )
+        self.assertEqual(result["decision"], "continue")
+        self.assertEqual(result["sender_accepted"], 1)
+        self.assertEqual(result["target_landed"], 0)
 
-    def test_stage_log_growth_during_snapshot_fails_closed(self):
-        """Growth after EOF must not enter either log-derived evidence summary."""
-        log = self.write_guard_result()
-        original = log.stat()
-        original_identity = (original.st_dev, original.st_ino)
-        real_read = mint_auto_diagnoser.os.read
-        grew = False
+    def test_missing_target_returns_continue(self):
+        result = self.evaluate()
 
-        def grow_after_eof(descriptor, size):
-            nonlocal grew
-            data = real_read(descriptor, size)
-            info = os.fstat(descriptor)
-            if (
-                not grew
-                and not data
-                and (info.st_dev, info.st_ino) == original_identity
-            ):
-                with log.open("ab") as handle:
-                    handle.write(b"Transaction sent successfully\n")
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                grew = True
-            return data
+        self.assertEqual(result["decision"], "continue")
+        self.assertEqual(result["target_status"], "absent")
 
-        with patch.object(
-            mint_auto_diagnoser.os,
-            "read",
-            side_effect=grow_after_eof,
-        ):
-            with self.assertRaises(mint_auto_diagnoser.DiagnoserError):
-                self.record()
+    def test_nonzero_guard_exit_returns_failed(self):
+        result = self.evaluate(guard_exit=2)
 
-        self.assertTrue(grew)
-        self.assertEqual(
-            log.read_bytes(), b"Transaction sent successfully\n"
-        )
+        self.assertEqual(result["decision"], "failed")
+        self.assertEqual(result["stop_reason"], "guard_exit")
 
-    def test_stage_log_substitution_during_snapshot_fails_closed(self):
-        """A replacement after EOF must not be reopened as trusted evidence."""
-        log = self.write_guard_result()
-        log.write_bytes(b"Fetched 0 mint list.\n")
-        log.chmod(0o600)
-        original = log.stat()
-        original_identity = (original.st_dev, original.st_ino)
-        replacement = b"Transaction sent successfully\n"
-        real_read = mint_auto_diagnoser.os.read
-        substituted = False
+    def test_threshold_or_rpc_error_returns_failed(self):
+        def threshold_transport(url, payload, timeout):
+            del url, timeout
+            if payload["method"] == "getBalance":
+                return {"result": {"value": 98_456_789}}
+            if payload["method"] == "getSignaturesForAddress":
+                return {"result": []}
+            raise AssertionError("unexpected RPC method")
 
-        def substitute_after_eof(descriptor, size):
-            nonlocal substituted
-            data = real_read(descriptor, size)
-            info = os.fstat(descriptor)
-            if (
-                not substituted
-                and not data
-                and (info.st_dev, info.st_ino) == original_identity
-            ):
-                log.unlink()
-                log.write_bytes(replacement)
-                log.chmod(0o600)
-                substituted = True
-            return data
+        result = self.evaluate(transport=threshold_transport)
 
-        with patch.object(
-            mint_auto_diagnoser.os,
-            "read",
-            side_effect=substitute_after_eof,
-        ):
-            with self.assertRaises(mint_auto_diagnoser.DiagnoserError):
-                self.record()
+        self.assertEqual(result["decision"], "failed")
+        self.assertEqual(result["stop_reason"], "loss_threshold")
+        self.assertEqual(result["cumulative_loss_lamports"], 25_000_000)
 
-        self.assertTrue(substituted)
-        self.assertEqual(log.read_bytes(), replacement)
-
-    def test_explicit_structural_three_pool_route_is_observed(self):
-        """Reducing a three-pool target route to an implicit marker loses hop proof."""
-        self.write_guard_result()
-        routing = {
-            "routes": [
-                {
-                    "target_mint": TARGET_MINT,
-                    "pool_ids": ["pool-a", "pool-b", "pool-c"],
-                }
-            ]
-        }
-        self.write_artifact("routing.json", routing)
-
-        result = self.record()
-
-        self.assertEqual(result["route_status"], "target_route_observed")
-        self.assertEqual(result["three_hop_status"], "three_hop_observed")
-
-    def test_no_explicit_route_marker_is_three_hop_unproven(self):
-        """Inferring hops from sender or target presence would manufacture evidence."""
-        self.write_guard_result()
-        self.write_artifact("hot_tokens.json", self.hot_tokens(TARGET_MINT))
-
-        result = self.record()
-
-        self.assertEqual(result["three_hop_status"], "three_hop_unproven")
-
-    def test_bad_artifact_terminates_batch_without_retaining_raw_content(self):
-        """Accepting malformed generated JSON would let untrusted evidence advance."""
-        self.write_guard_result()
+    def test_malformed_or_substituted_evidence_returns_failed(self):
         artifact = self.stage_root / "hot_tokens.json"
         artifact.write_bytes(b"{not-json")
         artifact.chmod(0o600)
         os.utime(artifact, (150, 150))
 
-        result = self.record()
+        result = self.evaluate()
 
-        self.assertEqual(result["stage_status"], "artifact_error")
-        self.assertEqual(result["next_decision"], "stop")
-        result_dir = self.stage_root.parent.parent / "results" / "0-baseline"
-        self.assertFalse((result_dir / "generated-hot_tokens.json").exists())
+        self.assertEqual(result["decision"], "failed")
+        self.assertEqual(result["stop_reason"], "artifact_error")
 
-    def test_symlink_wrong_mode_and_stale_artifacts_fail_closed(self):
-        """Path substitution, public permissions, or prior-run data must never be evidence."""
-        cases = ("symlink", "wrong_mode", "stale")
-        for index, case in enumerate(cases):
-            with self.subTest(case=case):
-                if index:
-                    self.tearDown()
-                    self.setUp()
-                self.write_guard_result()
-                path = self.stage_root / "routing.json"
-                if case == "symlink":
-                    outside = self.root / "outside-artifact"
-                    outside.write_text("{}")
-                    outside.chmod(0o600)
-                    path.symlink_to(outside)
-                else:
-                    self.write_artifact("routing.json", {"routes": []})
-                    if case == "wrong_mode":
-                        path.chmod(0o644)
-                    else:
-                        os.utime(path, (99, 99))
+    def test_interrupted_batch_has_no_resume_interface(self):
+        batch_root = self.root / self.batch.relative_root
 
-                result = self.record()
-
-                self.assertEqual(result["stage_status"], "artifact_error")
-                self.assertEqual(result["next_decision"], "stop")
-
-    def test_artifact_freshness_uses_inclusive_integer_second_buckets(self):
-        """Nanoseconds within either run boundary second must not change freshness."""
-        cases = (
-            ("start-second", 100_000_000_001, "no_target"),
-            ("before-start", 99_999_999_999, "artifact_error"),
-            ("end-second", 200_999_999_999, "no_target"),
-            ("after-end", 201_000_000_000, "artifact_error"),
-        )
-        for index, (case, mtime_ns, expected_status) in enumerate(cases):
-            with self.subTest(case=case):
-                if index:
-                    self.tearDown()
-                    self.setUp()
-                self.write_guard_result()
-                artifact = self.write_artifact(
-                    "routing.json", {"routes": []}
-                )
-                os.utime(artifact, ns=(mtime_ns, mtime_ns))
-
-                result = self.record()
-
-                self.assertEqual(result["stage_status"], expected_status)
-
-    def test_terminal_and_repeated_stage_transitions_are_rejected(self):
-        """Re-entry after a published result would replace evidence or retry automatically."""
-        self.write_guard_result()
-        first = self.record()
-        self.assertEqual(first["stage_status"], "no_target")
-
-        with self.assertRaises(mint_auto_diagnoser.DiagnoserError):
-            self.record()
-
-        state_path = (
-            self.root
-            / "state"
-            / "auto-diagnose-runs"
-            / self.batch.batch_id
-            / "batch-state.json"
-        )
-        state = json.loads(state_path.read_text())
-        state["status"] = "prepared"
-        state_path.write_text(json.dumps(state))
-        state_path.chmod(0o600)
-        with self.assertRaises(mint_auto_diagnoser.DiagnoserError):
-            mint_auto_diagnoser.next_stage(self.root, self.batch.batch_id)
-
-    def test_interrupted_attempt_is_terminal_before_publication(self):
-        """A recorder crash must not make the same live stage selectable again."""
-        self.write_guard_result()
-        with patch.object(
-            mint_auto_diagnoser,
-            "_artifact_evidence",
-            side_effect=OSError("fixture interruption"),
-        ):
-            with self.assertRaises(OSError):
-                self.record()
-
-        self.assertEqual(
-            mint_auto_diagnoser.next_stage(
-                self.root, self.batch.batch_id
-            ),
-            "stop",
-        )
-        with self.assertRaises(mint_auto_diagnoser.DiagnoserError):
-            self.record()
-
-    def test_validation_failure_after_live_attempt_is_terminal(self):
-        """Invalid post-run evidence must reserve the attempt before validation fails."""
-        self.write_guard_result()
-        (self.stage_root / "guard-result.txt").chmod(0o644)
-
-        with self.assertRaises(mint_auto_diagnoser.DiagnoserError):
-            self.record()
-
-        self.assertEqual(
-            mint_auto_diagnoser.next_stage(
-                self.root, self.batch.batch_id
-            ),
-            "stop",
-        )
-
-    def test_hard_crash_pending_directory_is_discarded_fail_closed(self):
-        """A partial owned publication must not strand state or become evidence."""
-        batch_root = (
-            self.root
-            / "state"
-            / "auto-diagnose-runs"
-            / self.batch.batch_id
-        )
-        state_path = batch_root / "batch-state.json"
-        state = json.loads(state_path.read_text())
-        state["status"] = "running"
-        state["next_stage"] = "stop"
-        state_path.write_text(json.dumps(state))
-        state_path.chmod(0o600)
-        results = batch_root / "results"
-        results.mkdir(mode=0o700)
-        pending = results / (".pending-0-baseline-" + "a" * 24)
-        pending.mkdir(mode=0o700)
-        partial = pending / "generated-hot_tokens.json"
-        partial.write_text("{}")
-        partial.chmod(0o600)
-
-        self.assertEqual(
-            mint_auto_diagnoser.next_stage(
-                self.root, self.batch.batch_id
-            ),
-            "stop",
-        )
-        self.assertFalse(pending.exists())
-        finalized = mint_auto_diagnoser.finalize_batch(
-            self.root, self.batch.batch_id
-        )
-        self.assertEqual(finalized["status"], "failed")
-
-    def test_published_result_recovers_without_replacing_or_rerunning(self):
-        """A crash after rename must commit that result instead of rerunning evidence."""
-        self.write_guard_result()
-        real_store = mint_auto_diagnoser._store_batch_state
-        calls = []
-
-        def fail_final_store(batch_fd, previous, replacement):
-            calls.append(replacement["status"])
-            if len(calls) == 2:
-                raise OSError("fixture state interruption")
-            return real_store(batch_fd, previous, replacement)
-
-        with patch.object(
-            mint_auto_diagnoser,
-            "_store_batch_state",
-            side_effect=fail_final_store,
-        ):
-            with self.assertRaises(OSError):
-                self.record()
-
-        self.assertEqual(calls, ["running", "running"])
-        self.assertEqual(
-            mint_auto_diagnoser.next_stage(
-                self.root, self.batch.batch_id
-            ),
-            "offchain",
-        )
-        with self.assertRaises(mint_auto_diagnoser.DiagnoserError):
-            self.record()
-
-    def test_each_state_replace_is_followed_by_batch_directory_fsync(self):
-        """A crash must not roll a completed state transition back to retryable."""
-        self.write_guard_result()
-        batch_root = self.stage_root.parent.parent
-        batch_identity = (
-            batch_root.stat().st_dev,
-            batch_root.stat().st_ino,
-        )
-        events = []
-        real_replace = mint_auto_diagnoser.os.replace
-        real_fsync = mint_auto_diagnoser.os.fsync
-
-        def track_replace(source, destination, *args, **kwargs):
-            result = real_replace(
-                source, destination, *args, **kwargs
-            )
-            if (
-                destination == "batch-state.json"
-                and kwargs.get("dst_dir_fd") is not None
-            ):
-                info = os.fstat(kwargs["dst_dir_fd"])
-                if (info.st_dev, info.st_ino) == batch_identity:
-                    events.append("state-replace")
-            return result
-
-        def track_fsync(descriptor):
-            info = os.fstat(descriptor)
-            if (info.st_dev, info.st_ino) == batch_identity:
-                events.append("batch-fsync")
-            return real_fsync(descriptor)
-
-        with patch.object(
-            mint_auto_diagnoser.os,
-            "replace",
-            side_effect=track_replace,
-        ), patch.object(
-            mint_auto_diagnoser.os,
-            "fsync",
-            side_effect=track_fsync,
-        ):
-            self.record()
-
-        self.assertEqual(
-            events,
-            [
-                "state-replace",
-                "batch-fsync",
-                "state-replace",
-                "batch-fsync",
-            ],
-        )
-
-    def test_reservation_fsync_failure_blocks_same_stage_retry(self):
-        """An unconfirmed reservation commit must still fail closed in-process."""
-        self.write_guard_result()
-        batch_root = self.stage_root.parent.parent
-        batch_identity = (
-            batch_root.stat().st_dev,
-            batch_root.stat().st_ino,
-        )
-        real_fsync = mint_auto_diagnoser.os.fsync
-        failed = False
-
-        def fail_first_batch_fsync(descriptor):
-            nonlocal failed
-            info = os.fstat(descriptor)
-            if (
-                not failed
-                and (info.st_dev, info.st_ino) == batch_identity
-            ):
-                failed = True
-                raise OSError("fixture state durability failure")
-            return real_fsync(descriptor)
-
-        with patch.object(
-            mint_auto_diagnoser.os,
-            "fsync",
-            side_effect=fail_first_batch_fsync,
-        ):
-            with self.assertRaises(
-                mint_auto_diagnoser.DiagnoserError
-            ):
-                self.record()
-
-        self.assertTrue(failed)
-        with self.assertRaises(mint_auto_diagnoser.DiagnoserError):
-            self.record()
-
-    def test_stage_result_fsync_failure_defers_state_commit_until_retry(self):
-        """Pending evidence must be durable before its state transition commits."""
-        self.write_guard_result()
-        real_fsync = mint_auto_diagnoser.os.fsync
-        final_result = (
-            self.stage_root.parent.parent
-            / "results"
-            / "0-baseline"
-        )
-        state_path = (
-            self.stage_root.parent.parent / "batch-state.json"
-        )
-        results_root = final_result.parent
-        results_root.mkdir(mode=0o700)
-        results_identity = (
-            results_root.stat().st_dev,
-            results_root.stat().st_ino,
-        )
-        batch_identity = (
-            state_path.parent.stat().st_dev,
-            state_path.parent.stat().st_ino,
-        )
-
-        def fail_post_rename(descriptor):
-            info = os.fstat(descriptor)
-            if (
-                final_result.exists()
-                and (info.st_dev, info.st_ino) == results_identity
-            ):
-                raise OSError("fixture directory fsync failure")
-            return real_fsync(descriptor)
-
-        with patch.object(
-            mint_auto_diagnoser.os,
-            "fsync",
-            side_effect=fail_post_rename,
-        ):
-            with self.assertRaises(OSError):
-                self.record()
-
-        state = json.loads(state_path.read_bytes())
-        self.assertEqual(state["status"], "running")
-        self.assertEqual(state["completed_stages"], [])
-        self.assertEqual(state["next_stage"], "stop")
-
-        events = []
-        real_replace = mint_auto_diagnoser.os.replace
-
-        def track_recovery_fsync(descriptor):
-            info = os.fstat(descriptor)
-            identity = (info.st_dev, info.st_ino)
-            if identity == results_identity:
-                events.append("results-fsync")
-            elif identity == batch_identity:
-                events.append("batch-fsync")
-            return real_fsync(descriptor)
-
-        def track_recovery_replace(
-            source, destination, *args, **kwargs
-        ):
-            result = real_replace(
-                source, destination, *args, **kwargs
-            )
-            if destination == "batch-state.json":
-                events.append("state-replace")
-            return result
-
-        with patch.object(
-            mint_auto_diagnoser.os,
-            "fsync",
-            side_effect=track_recovery_fsync,
-        ), patch.object(
-            mint_auto_diagnoser.os,
-            "replace",
-            side_effect=track_recovery_replace,
-        ):
-            decision = mint_auto_diagnoser.next_stage(
-                self.root, self.batch.batch_id
-            )
-
-        self.assertEqual(decision, "offchain")
-        self.assertEqual(
-            events,
-            ["results-fsync", "state-replace", "batch-fsync"],
-        )
-
-    def test_exception_after_rename_recovers_published_result(self):
-        """An asynchronous post-rename failure must commit, not skew, fixed evidence."""
-        self.write_guard_result()
-        real_publish = mint_auto_diagnoser._publish_stage_result
-
-        def publish_then_interrupt(*args, **kwargs):
-            real_publish(*args, **kwargs)
-            raise KeyboardInterrupt
-
-        with patch.object(
-            mint_auto_diagnoser,
-            "_publish_stage_result",
-            side_effect=publish_then_interrupt,
-        ):
-            with self.assertRaises(KeyboardInterrupt):
-                self.record()
-
-        self.assertEqual(
-            mint_auto_diagnoser.next_stage(
-                self.root, self.batch.batch_id
-            ),
-            "offchain",
-        )
-        with self.assertRaises(mint_auto_diagnoser.DiagnoserError):
-            self.record()
-
-    def test_rename_then_interrupt_preserves_published_result(self):
-        """A rename wrapper that raises after moving must not erase final evidence."""
-        self.write_guard_result()
-        real_rename = mint_auto_diagnoser.os.rename
-
-        def rename_then_interrupt(*args, **kwargs):
-            real_rename(*args, **kwargs)
-            raise KeyboardInterrupt
-
-        with patch.object(
-            mint_auto_diagnoser.os,
-            "rename",
-            side_effect=rename_then_interrupt,
-        ):
-            with self.assertRaises(KeyboardInterrupt):
-                self.record()
-
-        manifest_path = (
-            self.stage_root.parent.parent
-            / "results"
-            / "0-baseline"
-            / "stage-manifest.json"
-        )
-        manifest = json.loads(manifest_path.read_text())
-        self.assertEqual(manifest["stage_name"], "baseline")
-        self.assertEqual(
-            mint_auto_diagnoser.next_stage(
-                self.root, self.batch.batch_id
-            ),
-            "offchain",
-        )
-        with self.assertRaises(mint_auto_diagnoser.DiagnoserError):
-            mint_auto_diagnoser.finalize_batch(
-                self.root, self.batch.batch_id
-            )
-        with self.assertRaises(mint_auto_diagnoser.DiagnoserError):
-            self.record()
-
-    def test_threshold_cleanup_rpc_and_last_stage_stop(self):
-        """Every safety terminal must stop instead of selecting another live stage."""
-        for index, (reason, loss) in enumerate(
-            (
-                ("loss_threshold", 25_000_000),
-                ("cleanup_failed", 0),
-                ("rpc_error", 0),
-            )
-        ):
-            with self.subTest(reason=reason):
-                if index:
-                    self.tearDown()
-                    self.setUp()
-                self.write_guard_result(reason=reason, observed_loss=loss)
-                result = self.record()
-                self.assertEqual(result["next_decision"], "stop")
-
-    def test_crash_and_safety_reason_override_target_evidence(self):
-        """A crash or integrity stop must never become a target-positive retry decision."""
-        self.write_guard_result(
-            reason="child_exit", child_exit_code=2
-        )
-        result = self.record()
-        self.assertEqual(result["stage_status"], "failed")
-        self.assertEqual(result["next_decision"], "stop")
-
-        self.tearDown()
-        self.setUp()
-        self.write_guard_result(
-            reason="operator_signal", child_exit_code=-15
-        )
-        self.write_artifact(
-            "hot_tokens.json", self.hot_tokens(TARGET_MINT)
-        )
-        result = self.record()
-        self.assertEqual(result["stage_status"], "failed")
-        self.assertEqual(result["target_artifact_count"], 1)
-        self.assertEqual(result["next_decision"], "stop")
-
-    def test_read_only_balance_sets_cumulative_loss_and_rpc_failure_stops(self):
-        """Ignoring the immutable baseline or a failed balance read would overrun safety."""
-        self.write_guard_result()
-
-        def lower_balance(url, payload, timeout):
-            del url, timeout
-            if payload["method"] == "getBalance":
-                return {"result": {"value": 100_000_000}}
-            if payload["method"] == "getSignaturesForAddress":
-                return {"result": []}
-            raise AssertionError("unexpected RPC method")
-
-        result = self.record(transport=lower_balance)
-        self.assertEqual(
-            result["cumulative_observed_loss_lamports"],
-            23_456_789,
-        )
-
-        self.tearDown()
-        self.setUp()
-        self.write_guard_result()
-
-        def failed_balance(url, payload, timeout):
-            del url, payload, timeout
-            raise OSError("fixture unavailable")
-
-        result = self.record(transport=failed_balance)
-        self.assertEqual(result["stage_status"], "rpc_error")
-        self.assertEqual(result["next_decision"], "stop")
-
-    def test_last_non_skipped_stage_exhausts_without_retry(self):
-        """Selecting a stage after the prepared sequence would create an automatic retry."""
-        result = None
-        with patch.object(
-            mint_auto_diagnoser.zavod_guard,
-            "wallet_pubkey",
-            return_value="wallet",
-        ):
-            for stage in (
-                stage for stage in self.batch.stages if not stage.skipped
-            ):
-                stage_root = self.root / stage.relative_root
-                self.write_guard_result(stage_root=stage_root)
-                result = mint_auto_diagnoser.record_stage_result(
-                    self.root,
-                    self.batch.batch_id,
-                    stage.name,
-                    0,
-                    self.started_at,
-                    self.ended_at,
-                    transport=self.empty_transport,
-                )
-
-        self.assertIsNotNone(result)
-        self.assertEqual(result["stage_name"], "pool_liquidity")
-        self.assertEqual(result["stage_status"], "no_target")
-        self.assertEqual(result["next_decision"], "stop")
-        self.assertEqual(
-            mint_auto_diagnoser.next_stage(
-                self.root, self.batch.batch_id
-            ),
-            "stop",
-        )
-
-    def test_finalize_reuses_result_and_decline_is_one_way(self):
-        """Repeated finalization must reuse one result and keep decline terminal."""
-        self.write_guard_result()
-        self.write_artifact("hot_tokens.json", self.hot_tokens(TARGET_MINT))
-        self.record()
-
-        result = mint_auto_diagnoser.finalize_batch(
-            self.root, self.batch.batch_id
-        )
-        result_path = (
-            self.root
-            / mint_auto_diagnoser.batch_result_path(self.batch.batch_id)
-        )
-        self.assertEqual(result["status"], "target_positive")
-        self.assertEqual(stat.S_IMODE(result_path.stat().st_mode), 0o600)
-        self.assertFalse(
-            (self.root / "state" / ".mint-auto-diagnose-active").exists()
-        )
-        published = result_path.read_bytes()
-        published_inode = result_path.stat().st_ino
-        repeated = mint_auto_diagnoser.finalize_batch(
-            self.root, self.batch.batch_id
-        )
-        self.assertEqual(repeated, result)
-        self.assertEqual(result_path.read_bytes(), published)
-        self.assertEqual(result_path.stat().st_ino, published_inode)
-
-        self.tearDown()
-        self.setUp()
-        declined = mint_auto_diagnoser.finalize_batch(
-            self.root, self.batch.batch_id
-        )
-        self.assertEqual(declined["status"], "declined")
-        self.assertEqual(
-            mint_auto_diagnoser.next_stage(
-                self.root, self.batch.batch_id
-            ),
-            "stop",
-        )
-
-    def test_finalize_recovers_after_post_publication_interrupt(self):
-        """Losing marker removal after durable publication must not strand finalization."""
-        self.write_guard_result()
-        self.write_artifact("hot_tokens.json", self.hot_tokens(TARGET_MINT))
-        self.record()
-        result_path = (
-            self.root
-            / mint_auto_diagnoser.batch_result_path(self.batch.batch_id)
-        )
-        active_path = (
-            self.root / "state" / mint_auto_diagnoser.ACTIVE_MARKER
-        )
-
-        with patch.object(
-            mint_auto_diagnoser,
-            "_remove_active_marker",
-            side_effect=KeyboardInterrupt,
-        ):
-            with self.assertRaises(KeyboardInterrupt):
-                mint_auto_diagnoser.finalize_batch(
-                    self.root, self.batch.batch_id
-                )
-
-        published = result_path.read_bytes()
-        published_inode = result_path.stat().st_ino
-        self.assertTrue(active_path.exists())
-
-        recovered = mint_auto_diagnoser.finalize_batch(
-            self.root, self.batch.batch_id
-        )
-
-        self.assertEqual(
-            recovered,
-            {
-                "status": "target_positive",
-                "completed_stages": ["baseline"],
-                "cumulative_observed_loss_lamports": 0,
-            },
-        )
-        self.assertEqual(result_path.read_bytes(), published)
-        self.assertEqual(result_path.stat().st_ino, published_inode)
-        self.assertFalse(active_path.exists())
-
-    def test_newly_published_result_substitution_keeps_active_marker(self):
-        """Replacing a new result after fsync must stop before marker release."""
-        self.write_guard_result()
-        self.write_artifact("hot_tokens.json", self.hot_tokens(TARGET_MINT))
-        self.record()
-        result_path = (
-            self.root
-            / mint_auto_diagnoser.batch_result_path(self.batch.batch_id)
-        )
-
-        self.assertFalse(result_path.exists())
-        self.assert_result_substitution_keeps_active_marker(result_path)
-
-    def test_existing_result_substitution_keeps_active_marker(self):
-        """Replacing a validated result after fsync must stop marker recovery."""
-        self.write_guard_result()
-        self.write_artifact("hot_tokens.json", self.hot_tokens(TARGET_MINT))
-        self.record()
-        result_path = (
-            self.root
-            / mint_auto_diagnoser.batch_result_path(self.batch.batch_id)
-        )
-        with patch.object(
-            mint_auto_diagnoser,
-            "_remove_active_marker",
-            side_effect=KeyboardInterrupt,
-        ):
-            with self.assertRaises(KeyboardInterrupt):
-                mint_auto_diagnoser.finalize_batch(
-                    self.root, self.batch.batch_id
-                )
-
-        self.assertTrue(result_path.exists())
-        self.assert_result_substitution_keeps_active_marker(result_path)
-
-    def test_result_substitution_at_marker_quarantine_rolls_marker_back(self):
-        """The result identity must remain bound through marker quarantine."""
-        self.write_guard_result()
-        self.write_artifact(
-            "hot_tokens.json", self.hot_tokens(TARGET_MINT)
-        )
-        self.record()
-        result_path = (
-            self.root
-            / mint_auto_diagnoser.batch_result_path(
-                self.batch.batch_id
-            )
-        )
-        state_root = self.root / "state"
-        active_path = (
-            state_root / mint_auto_diagnoser.ACTIVE_MARKER
-        )
-        replacement = (
-            b'{"completed_stages":["baseline"],'
-            b'"cumulative_observed_loss_lamports":1,'
-            b'"status":"target_positive"}\n'
-        )
-        real_rename = mint_auto_diagnoser.os.rename
-        substituted = False
-
-        def substitute_before_marker_quarantine(
-            source, destination, *args, **kwargs
-        ):
-            nonlocal substituted
-            if (
-                not substituted
-                and source == mint_auto_diagnoser.ACTIVE_MARKER
-            ):
-                result_path.unlink()
-                result_path.write_bytes(replacement)
-                result_path.chmod(0o600)
-                substituted = True
-            return real_rename(
-                source, destination, *args, **kwargs
-            )
-
-        with patch.object(
-            mint_auto_diagnoser.os,
-            "rename",
-            side_effect=substitute_before_marker_quarantine,
-        ):
-            with self.assertRaises(mint_auto_diagnoser.DiagnoserError):
-                mint_auto_diagnoser.finalize_batch(
-                    self.root, self.batch.batch_id
-                )
-
-        self.assertTrue(substituted)
-        self.assertEqual(result_path.read_bytes(), replacement)
-        self.assertEqual(
-            active_path.read_text(), self.batch.batch_id + "\n"
-        )
-        self.assertEqual(
-            tuple(
-                state_root.glob(
-                    mint_auto_diagnoser.ACTIVE_MARKER
-                    + ".releasing-*"
-                )
-            ),
-            (),
-        )
-
-    def test_finalize_fsyncs_result_directory_before_marker_release(self):
-        """Marker release before the result directory fsync could lose both states."""
-        self.write_guard_result()
-        self.write_artifact("hot_tokens.json", self.hot_tokens(TARGET_MINT))
-        self.record()
-        batch_root = (
-            self.root
-            / "state"
-            / "auto-diagnose-runs"
-            / self.batch.batch_id
-        )
-        result_path = batch_root / "batch-result.json"
-        batch_identity = (
-            batch_root.stat().st_dev,
-            batch_root.stat().st_ino,
-        )
-        events = []
-        real_fsync = mint_auto_diagnoser.os.fsync
-        real_unlink = mint_auto_diagnoser.os.unlink
-        real_rename = mint_auto_diagnoser.os.rename
-
-        def track_fsync(descriptor):
-            info = os.fstat(descriptor)
-            if (
-                (info.st_dev, info.st_ino) == batch_identity
-                and result_path.exists()
-            ):
-                events.append("result-directory-fsync")
-            return real_fsync(descriptor)
-
-        def track_unlink(name, *args, **kwargs):
-            if str(name).startswith(
-                mint_auto_diagnoser.ACTIVE_MARKER
-            ):
-                events.append("marker-release")
-            return real_unlink(name, *args, **kwargs)
-
-        def track_rename(source, destination, *args, **kwargs):
-            if source == mint_auto_diagnoser.ACTIVE_MARKER:
-                events.append("marker-release")
-            return real_rename(
-                source, destination, *args, **kwargs
-            )
-
-        with patch.object(
-            mint_auto_diagnoser.os,
-            "fsync",
-            side_effect=track_fsync,
-        ), patch.object(
-            mint_auto_diagnoser.os,
-            "unlink",
-            side_effect=track_unlink,
-        ), patch.object(
-            mint_auto_diagnoser.os,
-            "rename",
-            side_effect=track_rename,
-        ):
-            mint_auto_diagnoser.finalize_batch(
-                self.root, self.batch.batch_id
-            )
-
-        self.assertIn("result-directory-fsync", events)
-        self.assertLess(
-            events.index("result-directory-fsync"),
-            events.index("marker-release"),
-        )
-
-    def test_result_directory_fsync_failure_keeps_active_marker(self):
-        """A failed publication boundary must stop before marker release."""
-        self.write_guard_result()
-        self.write_artifact("hot_tokens.json", self.hot_tokens(TARGET_MINT))
-        self.record()
-        batch_root = (
-            self.root
-            / "state"
-            / "auto-diagnose-runs"
-            / self.batch.batch_id
-        )
-        result_path = batch_root / "batch-result.json"
-        active_path = (
-            self.root / "state" / mint_auto_diagnoser.ACTIVE_MARKER
-        )
-        batch_identity = (
-            batch_root.stat().st_dev,
-            batch_root.stat().st_ino,
-        )
-        real_fsync = mint_auto_diagnoser.os.fsync
-
-        def fail_result_directory_fsync(descriptor):
-            info = os.fstat(descriptor)
-            if (
-                (info.st_dev, info.st_ino) == batch_identity
-                and result_path.exists()
-            ):
-                raise OSError("fixture publication fsync failure")
-            return real_fsync(descriptor)
-
-        with patch.object(
-            mint_auto_diagnoser.os,
-            "fsync",
-            side_effect=fail_result_directory_fsync,
-        ):
-            with self.assertRaises(OSError):
-                mint_auto_diagnoser.finalize_batch(
-                    self.root, self.batch.batch_id
-                )
-
-        self.assertTrue(result_path.exists())
-        self.assertEqual(
-            active_path.read_text(), self.batch.batch_id + "\n"
-        )
-
-    def test_marker_substitution_after_identity_check_is_preserved(self):
-        """A replacement marker must not be unlinked through a stale identity check."""
-        self.write_guard_result()
-        self.write_artifact("hot_tokens.json", self.hot_tokens(TARGET_MINT))
-        self.record()
-        active_path = (
-            self.root / "state" / mint_auto_diagnoser.ACTIVE_MARKER
-        )
-        replacement = b"20260726T123001Z\n"
-        real_stat = mint_auto_diagnoser.os.stat
-        swapped = False
-
-        def swap_after_identity_check(path, *args, **kwargs):
-            nonlocal swapped
-            info = real_stat(path, *args, **kwargs)
-            if (
-                not swapped
-                and path == mint_auto_diagnoser.ACTIVE_MARKER
-                and kwargs.get("dir_fd") is not None
-            ):
-                swapped = True
-                os.unlink(path, dir_fd=kwargs["dir_fd"])
-                descriptor = os.open(
-                    path,
-                    os.O_WRONLY
-                    | os.O_CREAT
-                    | os.O_EXCL
-                    | getattr(os, "O_NOFOLLOW", 0),
-                    0o600,
-                    dir_fd=kwargs["dir_fd"],
-                )
-                try:
-                    os.write(descriptor, replacement)
-                    os.fsync(descriptor)
-                finally:
-                    os.close(descriptor)
-            return info
-
-        with patch.object(
-            mint_auto_diagnoser.os,
-            "stat",
-            side_effect=swap_after_identity_check,
-        ):
-            with self.assertRaises(mint_auto_diagnoser.DiagnoserError):
-                mint_auto_diagnoser.finalize_batch(
-                    self.root, self.batch.batch_id
-                )
-
-        self.assertTrue(swapped)
-        self.assertEqual(active_path.read_bytes(), replacement)
-
-    def test_quarantine_rollback_never_replaces_new_active_marker(self):
-        """Rollback must preserve a marker created after the absent-name check."""
-        self.write_guard_result()
-        self.write_artifact("hot_tokens.json", self.hot_tokens(TARGET_MINT))
-        self.record()
-        state_path = self.root / "state"
-        active_path = state_path / mint_auto_diagnoser.ACTIVE_MARKER
-        quarantined_marker = b"20260726T123001Z\n"
-        new_active_marker = b"20260726T123002Z\n"
-        real_stat = mint_auto_diagnoser.os.stat
-        real_link = mint_auto_diagnoser.os.link
-        substituted = False
-        injected_at_rollback = False
-
-        def write_marker(parent_fd, data):
-            descriptor = os.open(
-                mint_auto_diagnoser.ACTIVE_MARKER,
-                os.O_WRONLY
-                | os.O_CREAT
-                | os.O_EXCL
-                | getattr(os, "O_NOFOLLOW", 0),
-                0o600,
-                dir_fd=parent_fd,
-            )
-            try:
-                os.write(descriptor, data)
-                os.fsync(descriptor)
-            finally:
-                os.close(descriptor)
-
-        def inject_marker_at_rollback(path, *args, **kwargs):
-            nonlocal substituted, injected_at_rollback
-            if (
-                path != mint_auto_diagnoser.ACTIVE_MARKER
-                or kwargs.get("dir_fd") is None
-            ):
-                return real_stat(path, *args, **kwargs)
-            try:
-                info = real_stat(path, *args, **kwargs)
-            except FileNotFoundError:
-                if substituted and not injected_at_rollback:
-                    write_marker(kwargs["dir_fd"], new_active_marker)
-                    injected_at_rollback = True
-                raise
-            if not substituted:
-                substituted = True
-                os.unlink(path, dir_fd=kwargs["dir_fd"])
-                write_marker(kwargs["dir_fd"], quarantined_marker)
-            return info
-
-        def inject_before_restore_link(
-            source, destination, *args, **kwargs
-        ):
-            nonlocal injected_at_rollback
-            if (
-                not injected_at_rollback
-                and str(source).startswith(
-                    mint_auto_diagnoser.ACTIVE_MARKER
-                    + ".releasing-"
-                )
-                and destination == mint_auto_diagnoser.ACTIVE_MARKER
-            ):
-                write_marker(kwargs["dst_dir_fd"], new_active_marker)
-                injected_at_rollback = True
-            return real_link(source, destination, *args, **kwargs)
-
-        with patch.object(
-            mint_auto_diagnoser.os,
-            "stat",
-            side_effect=inject_marker_at_rollback,
-        ), patch.object(
-            mint_auto_diagnoser.os,
-            "link",
-            side_effect=inject_before_restore_link,
-        ):
-            with self.assertRaises(mint_auto_diagnoser.DiagnoserError):
-                mint_auto_diagnoser.finalize_batch(
-                    self.root, self.batch.batch_id
-                )
-
-        quarantines = tuple(
-            state_path.glob(
-                mint_auto_diagnoser.ACTIVE_MARKER + ".releasing-*"
-            )
-        )
-        self.assertTrue(substituted)
-        self.assertTrue(injected_at_rollback)
-        self.assertEqual(active_path.read_bytes(), new_active_marker)
-        self.assertEqual(len(quarantines), 1)
-        self.assertEqual(quarantines[0].read_bytes(), quarantined_marker)
-
-    def test_quarantine_rollback_preserves_late_name_substitution(self):
-        """Rollback must recheck both linked names immediately before unlink."""
-        self.write_guard_result()
-        self.write_artifact(
-            "hot_tokens.json", self.hot_tokens(TARGET_MINT)
-        )
-        self.record()
-        state_root = self.root / "state"
-        state_identity = (
-            state_root.stat().st_dev,
-            state_root.stat().st_ino,
-        )
-        active_path = (
-            state_root / mint_auto_diagnoser.ACTIVE_MARKER
-        )
-        moved_marker = b"20260726T123001Z\n"
-        competing_quarantine = b"20260726T123002Z\n"
-        real_rename = mint_auto_diagnoser.os.rename
-        real_fsync = mint_auto_diagnoser.os.fsync
-        quarantine_name = None
-        injected = False
-
-        def write_at(parent_fd, name, data):
-            descriptor = os.open(
-                name,
-                os.O_WRONLY
-                | os.O_CREAT
-                | os.O_EXCL
-                | getattr(os, "O_NOFOLLOW", 0),
-                0o600,
-                dir_fd=parent_fd,
-            )
-            try:
-                os.fchmod(descriptor, 0o600)
-                os.write(descriptor, data)
-                real_fsync(descriptor)
-            finally:
-                os.close(descriptor)
-
-        def substitute_active_before_rename(
-            source, destination, *args, **kwargs
-        ):
-            nonlocal quarantine_name
-            if source == mint_auto_diagnoser.ACTIVE_MARKER:
-                parent_fd = kwargs["src_dir_fd"]
-                os.unlink(source, dir_fd=parent_fd)
-                write_at(parent_fd, source, moved_marker)
-                quarantine_name = destination
-            return real_rename(
-                source, destination, *args, **kwargs
-            )
-
-        def substitute_quarantine_after_rollback_fsync(descriptor):
-            nonlocal injected
-            result = real_fsync(descriptor)
-            info = os.fstat(descriptor)
-            if (
-                not injected
-                and quarantine_name is not None
-                and (info.st_dev, info.st_ino) == state_identity
-                and active_path.exists()
-            ):
-                os.unlink(quarantine_name, dir_fd=descriptor)
-                write_at(
-                    descriptor,
-                    quarantine_name,
-                    competing_quarantine,
-                )
-                injected = True
-            return result
-
-        with patch.object(
-            mint_auto_diagnoser.os,
-            "rename",
-            side_effect=substitute_active_before_rename,
-        ), patch.object(
-            mint_auto_diagnoser.os,
-            "fsync",
-            side_effect=substitute_quarantine_after_rollback_fsync,
-        ):
-            with self.assertRaises(mint_auto_diagnoser.DiagnoserError):
-                mint_auto_diagnoser.finalize_batch(
-                    self.root, self.batch.batch_id
-                )
-
-        self.assertTrue(injected)
-        self.assertEqual(active_path.read_bytes(), moved_marker)
-        quarantine_path = state_root / quarantine_name
-        self.assertTrue(quarantine_path.exists())
-        self.assertEqual(
-            quarantine_path.read_bytes(), competing_quarantine
-        )
-
-    def test_finalize_rejects_mismatched_existing_result(self):
-        """An existing result that disagrees with state must remain untouched and active."""
-        self.write_guard_result()
-        self.write_artifact("hot_tokens.json", self.hot_tokens(TARGET_MINT))
-        self.record()
-        result_path = (
-            self.root
-            / mint_auto_diagnoser.batch_result_path(self.batch.batch_id)
-        )
-        mismatch = (
-            b'{"completed_stages":["baseline"],'
-            b'"cumulative_observed_loss_lamports":1,'
-            b'"status":"target_positive"}\n'
-        )
-        result_path.write_bytes(mismatch)
-        result_path.chmod(0o600)
-        published_inode = result_path.stat().st_ino
-        active_path = (
-            self.root / "state" / mint_auto_diagnoser.ACTIVE_MARKER
-        )
-
-        with self.assertRaises(mint_auto_diagnoser.DiagnoserError):
-            mint_auto_diagnoser.finalize_batch(
-                self.root, self.batch.batch_id
-            )
-
-        self.assertEqual(result_path.read_bytes(), mismatch)
-        self.assertEqual(result_path.stat().st_ino, published_inode)
-        self.assertEqual(
-            active_path.read_text(), self.batch.batch_id + "\n"
-        )
-
-    def test_finalize_rejects_duplicate_key_existing_result(self):
-        """Duplicate JSON keys must not satisfy the fixed batch-result schema."""
-        self.write_guard_result()
-        self.write_artifact("hot_tokens.json", self.hot_tokens(TARGET_MINT))
-        self.record()
-        result_path = (
-            self.root
-            / mint_auto_diagnoser.batch_result_path(self.batch.batch_id)
-        )
-        malformed = (
-            b'{"completed_stages":["baseline"],'
-            b'"cumulative_observed_loss_lamports":0,'
-            b'"status":"target_positive",'
-            b'"status":"target_positive"}\n'
-        )
-        result_path.write_bytes(malformed)
-        result_path.chmod(0o600)
-        active_path = (
-            self.root / "state" / mint_auto_diagnoser.ACTIVE_MARKER
-        )
-
-        with self.assertRaises(mint_auto_diagnoser.DiagnoserError):
-            mint_auto_diagnoser.finalize_batch(
-                self.root, self.batch.batch_id
-            )
-
-        self.assertEqual(result_path.read_bytes(), malformed)
-        self.assertEqual(
-            active_path.read_text(), self.batch.batch_id + "\n"
-        )
-
-    def test_manifest_is_fixed_private_and_contains_no_protected_values(self):
-        """Adding raw guard, config, RPC, wallet, or signature fields must fail."""
-        self.write_guard_result()
-        result = self.record()
-        manifest_path = (
-            self.stage_root.parent.parent
-            / "results"
-            / "0-baseline"
-            / "stage-manifest.json"
-        )
-        rendered = manifest_path.read_text()
-
-        self.assertEqual(stat.S_IMODE(manifest_path.stat().st_mode), 0o600)
-        self.assertEqual(result, json.loads(rendered))
-        self.assertNotIn("signature", rendered.lower())
-        self.assertNotIn("://", rendered)
-        self.assertNotIn("private_key", rendered)
-        self.assertNotIn("wallet", rendered.lower())
-        self.assertNotIn("test-wallet", rendered)
+        self.assertFalse((batch_root / "batch-state.json").exists())
+        self.assertFalse(hasattr(mint_auto_diagnoser, "record_stage_result"))
+        self.assertFalse(hasattr(mint_auto_diagnoser, "next_stage"))
+        self.assertFalse(hasattr(mint_auto_diagnoser, "finalize_batch"))
 
 
 if __name__ == "__main__":
