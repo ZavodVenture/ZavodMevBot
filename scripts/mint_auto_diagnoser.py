@@ -33,6 +33,7 @@ LOSS_LIMIT_LAMPORTS = 30_000_000
 TIMEOUT_SECONDS = 300
 BINARY_NAME = "zavod-mev-bot-rust-version-cli"
 ACTIVE_MARKER = ".mint-auto-diagnose-active"
+STATE_MARKER_LOCK = ".mint-auto-diagnose.lock"
 RUNS_DIRECTORY = "auto-diagnose-runs"
 
 
@@ -450,6 +451,33 @@ def _link_or_copy_binary(root_fd, stage_fd, binary):
         raise DiagnoserError("private binary preparation failed")
 
 
+def _acquire_state_marker_lock(state_fd):
+    """Lock marker state; batch lock must be acquired first when both are held."""
+    descriptor = None
+    flags = (
+        os.O_RDWR
+        | os.O_CREAT
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        descriptor = os.open(
+            STATE_MARKER_LOCK,
+            flags,
+            0o600,
+            dir_fd=state_fd,
+        )
+        _validate_owned(descriptor, "file", mode=0o600)
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        return descriptor
+    except (OSError, DiagnoserError) as exc:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        raise DiagnoserError("active batch marker lock is invalid") from exc
+
+
 def _remove_active_marker(state_fd, batch_id, *, strict=False):
     if strict:
         _remove_finalized_active_marker(state_fd, batch_id)
@@ -538,7 +566,8 @@ def prepare_batch(root: Path, mint: str, now=None, transport=None, balance_reade
     """Validate one mint and create private stage workspaces without editing production."""
     if threading.current_thread() is not threading.main_thread():
         raise DiagnoserError("batch preparation must run on the main thread")
-    root_fd = state_fd = runs_fd = batch_fd = stages_fd = None
+    root_fd = state_fd = state_lock_fd = None
+    runs_fd = batch_fd = stages_fd = None
     batch_id = None
     active_created = False
     try:
@@ -569,6 +598,7 @@ def prepare_batch(root: Path, mint: str, now=None, transport=None, balance_reade
             state_fd = _open_relative_directory(root_fd, "state")
         except DiagnoserError:
             state_fd = _create_directory(root_fd, "state")
+        state_lock_fd = _acquire_state_marker_lock(state_fd)
         runs_fd = _open_or_create_directory(state_fd, RUNS_DIRECTORY)
         batch_fd = _create_directory(runs_fd, batch_id)
         _write_private_at(batch_fd, "production-config.toml", config_bytes)
@@ -624,7 +654,14 @@ def prepare_batch(root: Path, mint: str, now=None, transport=None, balance_reade
             _remove_active_marker(state_fd, batch_id)
         raise
     finally:
-        for descriptor in (stages_fd, batch_fd, runs_fd, state_fd, root_fd):
+        for descriptor in (
+            stages_fd,
+            batch_fd,
+            runs_fd,
+            state_lock_fd,
+            state_fd,
+            root_fd,
+        ):
             if descriptor is not None:
                 try:
                     os.close(descriptor)
@@ -641,6 +678,7 @@ def _batch_descriptors(root, batch_id, include_results=False):
         "stages": None,
         "results": None,
         "lock": None,
+        "state_lock": None,
     }
     try:
         descriptors["root"] = _open_root(root)
@@ -668,6 +706,7 @@ def _batch_descriptors(root, batch_id, include_results=False):
 
 def _close_descriptors(descriptors):
     for name in (
+        "state_lock",
         "lock",
         "results",
         "stages",
@@ -1818,6 +1857,9 @@ def _remove_finalized_active_marker(state_fd, batch_id):
         os.close(descriptor)
     if marker != f"{batch_id}\n".encode():
         raise DiagnoserError("active batch marker is invalid")
+    quarantine = (
+        f"{ACTIVE_MARKER}.releasing-{secrets.token_hex(12)}"
+    )
     try:
         named = os.stat(
             ACTIVE_MARKER,
@@ -1832,10 +1874,90 @@ def _remove_finalized_active_marker(state_fd, batch_id):
             != (identity.st_dev, identity.st_ino)
         ):
             raise DiagnoserError("active batch marker is invalid")
-        os.unlink(ACTIVE_MARKER, dir_fd=state_fd)
-        os.fsync(state_fd)
+        try:
+            os.stat(
+                quarantine,
+                dir_fd=state_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            pass
+        else:
+            raise DiagnoserError("active batch marker is invalid")
+        os.rename(
+            ACTIVE_MARKER,
+            quarantine,
+            src_dir_fd=state_fd,
+            dst_dir_fd=state_fd,
+        )
     except FileNotFoundError:
         return
+    except OSError as exc:
+        raise DiagnoserError("active batch marker is invalid") from exc
+    quarantine_fd = None
+    quarantine_valid = False
+    try:
+        quarantine_fd = os.open(
+            quarantine,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=state_fd,
+        )
+        quarantine_identity = _validate_owned(
+            quarantine_fd, "file", mode=0o600
+        )
+        chunks = []
+        while True:
+            chunk = os.read(quarantine_fd, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        quarantine_marker = b"".join(chunks)
+        quarantine_valid = (
+            (
+                quarantine_identity.st_dev,
+                quarantine_identity.st_ino,
+            )
+            == (identity.st_dev, identity.st_ino)
+            and quarantine_marker == marker
+        )
+    except (OSError, DiagnoserError):
+        quarantine_valid = False
+    finally:
+        if quarantine_fd is not None:
+            os.close(quarantine_fd)
+    if not quarantine_valid:
+        try:
+            os.stat(
+                ACTIVE_MARKER,
+                dir_fd=state_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            try:
+                os.rename(
+                    quarantine,
+                    ACTIVE_MARKER,
+                    src_dir_fd=state_fd,
+                    dst_dir_fd=state_fd,
+                )
+                os.fsync(state_fd)
+            except OSError as exc:
+                raise DiagnoserError(
+                    "active batch marker is invalid"
+                ) from exc
+        raise DiagnoserError("active batch marker is invalid")
+    try:
+        os.unlink(quarantine, dir_fd=state_fd)
+        os.fsync(state_fd)
+        try:
+            os.stat(
+                ACTIVE_MARKER,
+                dir_fd=state_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            return
+        raise DiagnoserError("active batch marker is invalid")
     except OSError as exc:
         raise DiagnoserError("active batch marker is invalid") from exc
 
@@ -1846,6 +1968,9 @@ def finalize_batch(root: Path, batch_id: str) -> dict:
     descriptors = _batch_descriptors(root, batch_id)
     try:
         _lock_batch(descriptors, exclusive=True)
+        descriptors["state_lock"] = _acquire_state_marker_lock(
+            descriptors["state"]
+        )
         state, prepared, pending = _load_batch_state(
             descriptors["batch"], descriptors["stages"]
         )
@@ -1896,6 +2021,7 @@ def finalize_batch(root: Path, batch_id: str) -> dict:
             )
         else:
             result = existing
+        os.fsync(descriptors["batch"])
         _remove_active_marker(
             descriptors["state"], batch_id, strict=True
         )
@@ -1907,22 +2033,24 @@ def finalize_batch(root: Path, batch_id: str) -> dict:
 def restore_batch(root: Path, batch_id: str) -> None:
     """Idempotently release the active batch marker; production was never modified."""
     _validate_batch_id(batch_id)
-    root_fd = state_fd = None
+    root_fd = state_fd = state_lock_fd = None
     try:
         root_fd = _open_root(root)
         state_fd = _open_relative_directory(root_fd, "state")
+        state_lock_fd = _acquire_state_marker_lock(state_fd)
         _remove_active_marker(state_fd, batch_id)
     finally:
-        for descriptor in (state_fd, root_fd):
+        for descriptor in (state_lock_fd, state_fd, root_fd):
             if descriptor is not None:
                 os.close(descriptor)
 
 
 def restore_active(root: Path) -> None:
-    root_fd = state_fd = None
+    root_fd = state_fd = state_lock_fd = None
     try:
         root_fd = _open_root(root)
         state_fd = _open_relative_directory(root_fd, "state")
+        state_lock_fd = _acquire_state_marker_lock(state_fd)
         try:
             marker = _read_owned_file(state_fd, ACTIVE_MARKER, mode=0o600)
         except DiagnoserError:
@@ -1936,7 +2064,7 @@ def restore_active(root: Path) -> None:
         batch_id = _validate_batch_id(marker_text[:-1])
         _remove_active_marker(state_fd, batch_id)
     finally:
-        for descriptor in (state_fd, root_fd):
+        for descriptor in (state_lock_fd, state_fd, root_fd):
             if descriptor is not None:
                 os.close(descriptor)
 

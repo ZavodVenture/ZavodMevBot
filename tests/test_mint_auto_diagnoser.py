@@ -1051,6 +1051,169 @@ class StageEvidenceTests(unittest.TestCase):
         self.assertEqual(result_path.stat().st_ino, published_inode)
         self.assertFalse(active_path.exists())
 
+    def test_finalize_fsyncs_result_directory_before_marker_release(self):
+        """Marker release before the result directory fsync could lose both states."""
+        self.write_guard_result()
+        self.write_artifact("hot_tokens.json", self.hot_tokens(TARGET_MINT))
+        self.record()
+        batch_root = (
+            self.root
+            / "state"
+            / "auto-diagnose-runs"
+            / self.batch.batch_id
+        )
+        result_path = batch_root / "batch-result.json"
+        batch_identity = (
+            batch_root.stat().st_dev,
+            batch_root.stat().st_ino,
+        )
+        events = []
+        real_fsync = mint_auto_diagnoser.os.fsync
+        real_unlink = mint_auto_diagnoser.os.unlink
+        real_rename = mint_auto_diagnoser.os.rename
+
+        def track_fsync(descriptor):
+            info = os.fstat(descriptor)
+            if (
+                (info.st_dev, info.st_ino) == batch_identity
+                and result_path.exists()
+            ):
+                events.append("result-directory-fsync")
+            return real_fsync(descriptor)
+
+        def track_unlink(name, *args, **kwargs):
+            if str(name).startswith(
+                mint_auto_diagnoser.ACTIVE_MARKER
+            ):
+                events.append("marker-release")
+            return real_unlink(name, *args, **kwargs)
+
+        def track_rename(source, destination, *args, **kwargs):
+            if source == mint_auto_diagnoser.ACTIVE_MARKER:
+                events.append("marker-release")
+            return real_rename(
+                source, destination, *args, **kwargs
+            )
+
+        with patch.object(
+            mint_auto_diagnoser.os,
+            "fsync",
+            side_effect=track_fsync,
+        ), patch.object(
+            mint_auto_diagnoser.os,
+            "unlink",
+            side_effect=track_unlink,
+        ), patch.object(
+            mint_auto_diagnoser.os,
+            "rename",
+            side_effect=track_rename,
+        ):
+            mint_auto_diagnoser.finalize_batch(
+                self.root, self.batch.batch_id
+            )
+
+        self.assertIn("result-directory-fsync", events)
+        self.assertLess(
+            events.index("result-directory-fsync"),
+            events.index("marker-release"),
+        )
+
+    def test_result_directory_fsync_failure_keeps_active_marker(self):
+        """A failed publication boundary must stop before marker release."""
+        self.write_guard_result()
+        self.write_artifact("hot_tokens.json", self.hot_tokens(TARGET_MINT))
+        self.record()
+        batch_root = (
+            self.root
+            / "state"
+            / "auto-diagnose-runs"
+            / self.batch.batch_id
+        )
+        result_path = batch_root / "batch-result.json"
+        active_path = (
+            self.root / "state" / mint_auto_diagnoser.ACTIVE_MARKER
+        )
+        batch_identity = (
+            batch_root.stat().st_dev,
+            batch_root.stat().st_ino,
+        )
+        real_fsync = mint_auto_diagnoser.os.fsync
+
+        def fail_result_directory_fsync(descriptor):
+            info = os.fstat(descriptor)
+            if (
+                (info.st_dev, info.st_ino) == batch_identity
+                and result_path.exists()
+            ):
+                raise OSError("fixture publication fsync failure")
+            return real_fsync(descriptor)
+
+        with patch.object(
+            mint_auto_diagnoser.os,
+            "fsync",
+            side_effect=fail_result_directory_fsync,
+        ):
+            with self.assertRaises(OSError):
+                mint_auto_diagnoser.finalize_batch(
+                    self.root, self.batch.batch_id
+                )
+
+        self.assertTrue(result_path.exists())
+        self.assertEqual(
+            active_path.read_text(), self.batch.batch_id + "\n"
+        )
+
+    def test_marker_substitution_after_identity_check_is_preserved(self):
+        """A replacement marker must not be unlinked through a stale identity check."""
+        self.write_guard_result()
+        self.write_artifact("hot_tokens.json", self.hot_tokens(TARGET_MINT))
+        self.record()
+        active_path = (
+            self.root / "state" / mint_auto_diagnoser.ACTIVE_MARKER
+        )
+        replacement = b"20260726T123001Z\n"
+        real_stat = mint_auto_diagnoser.os.stat
+        swapped = False
+
+        def swap_after_identity_check(path, *args, **kwargs):
+            nonlocal swapped
+            info = real_stat(path, *args, **kwargs)
+            if (
+                not swapped
+                and path == mint_auto_diagnoser.ACTIVE_MARKER
+                and kwargs.get("dir_fd") is not None
+            ):
+                swapped = True
+                os.unlink(path, dir_fd=kwargs["dir_fd"])
+                descriptor = os.open(
+                    path,
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | getattr(os, "O_NOFOLLOW", 0),
+                    0o600,
+                    dir_fd=kwargs["dir_fd"],
+                )
+                try:
+                    os.write(descriptor, replacement)
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+            return info
+
+        with patch.object(
+            mint_auto_diagnoser.os,
+            "stat",
+            side_effect=swap_after_identity_check,
+        ):
+            with self.assertRaises(mint_auto_diagnoser.DiagnoserError):
+                mint_auto_diagnoser.finalize_batch(
+                    self.root, self.batch.batch_id
+                )
+
+        self.assertTrue(swapped)
+        self.assertEqual(active_path.read_bytes(), replacement)
+
     def test_finalize_rejects_mismatched_existing_result(self):
         """An existing result that disagrees with state must remain untouched and active."""
         self.write_guard_result()
