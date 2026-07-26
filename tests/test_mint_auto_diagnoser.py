@@ -346,5 +346,623 @@ except BaseException as exc:
         self.assertFalse((self.root / "state" / "auto-diagnose-runs").exists())
 
 
+class StageEvidenceTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        (self.root / "state").mkdir()
+        (self.root / "config.toml").write_bytes(SOURCE)
+        (self.root / "tokens.toml").write_bytes(b'tokens = ["old"]\n')
+        (self.root / "zavod-mev-bot-rust-version-cli").write_bytes(b"test binary")
+        (self.root / "config.toml").chmod(0o600)
+        (self.root / "tokens.toml").chmod(0o600)
+        (self.root / "zavod-mev-bot-rust-version-cli").chmod(0o700)
+        with patch.object(
+            mint_auto_diagnoser.zavod_guard,
+            "wallet_pubkey",
+            return_value="wallet",
+        ):
+            self.batch = mint_auto_diagnoser.prepare_batch(
+                self.root,
+                TARGET_MINT,
+                now=lambda: datetime(
+                    2026, 7, 26, 12, 30, tzinfo=timezone.utc
+                ),
+                transport=PrivateWorkspaceTests.transport,
+                balance_reader=lambda url, wallet: 123_456_789,
+            )
+        self.stage = next(stage for stage in self.batch.stages if not stage.skipped)
+        self.stage_root = self.root / self.stage.relative_root
+        self.started_at = 100
+        self.ended_at = 200
+
+    def tearDown(self):
+        shutil.rmtree(self.root)
+
+    def write_guard_result(
+        self,
+        *,
+        reason="timeout",
+        observed_loss=0,
+        child_exit_code=0,
+        stage_root=None,
+    ):
+        del observed_loss
+        stage_root = stage_root or self.stage_root
+        result = (
+            f"reason={reason}\n"
+            "duration_seconds=60\n"
+            f"child_exit_code={child_exit_code}\n"
+            "loss_limit_lamports=30000000\n"
+            "early_stop_lamports=25000000\n"
+            "log_path=logs/stage.log\n"
+        )
+        path = stage_root / "guard-result.txt"
+        path.write_text(result)
+        path.chmod(0o600)
+        logs = stage_root / "logs"
+        logs.mkdir(exist_ok=True)
+        logs.chmod(0o700)
+        log = logs / "stage.log"
+        log.write_text("")
+        log.chmod(0o600)
+        return log
+
+    def write_artifact(self, name, value):
+        path = self.stage_root / name
+        path.write_text(json.dumps(value))
+        path.chmod(0o600)
+        os.utime(path, (150, 150))
+        return path
+
+    @staticmethod
+    def hot_tokens(target=None, *, route_length=0):
+        entry = {
+            "arbs_count": route_length,
+            "bridge_mint": "bridge",
+            "bridge_pool_ids_info": [],
+            "cross_pool_ids_info": [],
+            "lookup_table_accounts": ["lut"],
+            "mint": target or "unrelated",
+            "pool_ids": [f"pool-{index}" for index in range(route_length)],
+            "pool_ids_info": [],
+            "roi": 0.0,
+            "total_fee": 0,
+            "total_liquidity_lamports": 0,
+            "total_profit": 0,
+            "total_volume": 0,
+            "txs": [{} for _ in range(route_length)],
+        }
+        return {"count": 1, "arb_mint_info": [entry]}
+
+    @staticmethod
+    def empty_transport(url, payload, timeout):
+        del url, timeout
+        if payload["method"] == "getBalance":
+            return {"result": {"value": 123_456_789}}
+        if payload["method"] == "getSignaturesForAddress":
+            return {"result": []}
+        raise AssertionError("unexpected RPC method")
+
+    @staticmethod
+    def landed_transport(url, payload, timeout):
+        del url, timeout
+        if payload["method"] == "getBalance":
+            return {"result": {"value": 123_456_789}}
+        if payload["method"] == "getSignaturesForAddress":
+            if payload["params"][1].get("before") is not None:
+                return {"result": []}
+            return {
+                "result": [
+                    {
+                        "signature": "fixture-signature",
+                        "blockTime": 150,
+                        "confirmationStatus": "finalized",
+                    }
+                ]
+            }
+        if payload["method"] == "getTransaction":
+            return {
+                "result": {
+                    "blockTime": 150,
+                    "meta": {
+                        "err": None,
+                        "fee": 5,
+                        "preBalances": [100, 0],
+                        "postBalances": [95, 0],
+                        "preTokenBalances": [],
+                        "postTokenBalances": [
+                            {
+                                "owner": "wallet",
+                                "mint": TARGET_MINT,
+                                "uiTokenAmount": {"amount": "1"},
+                            }
+                        ],
+                        "innerInstructions": [],
+                    },
+                    "transaction": {
+                        "message": {
+                            "accountKeys": ["wallet", TARGET_MINT],
+                            "instructions": [],
+                        }
+                    },
+                }
+            }
+        raise AssertionError("unexpected RPC method")
+
+    def record(self, *, transport=None, guard_exit=0):
+        with patch.object(
+            mint_auto_diagnoser.zavod_guard,
+            "wallet_pubkey",
+            return_value="wallet",
+        ):
+            return mint_auto_diagnoser.record_stage_result(
+                self.root,
+                self.batch.batch_id,
+                self.stage.name,
+                guard_exit,
+                self.started_at,
+                self.ended_at,
+                transport=transport or self.empty_transport,
+            )
+
+    def test_exact_structural_target_artifact_is_target_positive(self):
+        """Dropping exact hot-token identity evidence must stop satisfying the stage."""
+        self.write_guard_result()
+        self.write_artifact("hot_tokens.json", self.hot_tokens(TARGET_MINT))
+
+        result = self.record()
+
+        self.assertEqual(result["stage_status"], "target_positive")
+        self.assertEqual(result["target_artifact_count"], 1)
+        self.assertEqual(result["target_filtered_landed"], 0)
+        self.assertEqual(result["next_decision"], "stop")
+        self.assertEqual(mint_auto_diagnoser.next_stage(self.root, self.batch.batch_id), "stop")
+
+    def test_finalized_target_filtered_landing_is_target_positive(self):
+        """Ignoring finalized target-filtered landings would advance past real evidence."""
+        self.write_guard_result()
+
+        result = self.record(transport=self.landed_transport)
+
+        self.assertEqual(result["stage_status"], "target_positive")
+        self.assertEqual(result["target_artifact_count"], 0)
+        self.assertEqual(result["target_filtered_landed"], 1)
+        self.assertEqual(result["target_filtered_successful"], 1)
+
+    def test_sender_acceptance_never_counts_as_target_evidence(self):
+        """Treating an unrelated send marker as target evidence would stop too early."""
+        log = self.write_guard_result()
+        log.write_text(
+            "Transaction sent successfully\n"
+            "Fetched 1 mint list.\n"
+        )
+        log.chmod(0o600)
+        self.write_artifact("hot_tokens.json", self.hot_tokens())
+
+        result = self.record()
+
+        self.assertEqual(result["stage_status"], "no_target")
+        self.assertEqual(result["sender_acceptance_count"], 1)
+        self.assertEqual(result["target_filtered_landed"], 0)
+        self.assertEqual(result["next_decision"], "offchain")
+        self.assertEqual(
+            mint_auto_diagnoser.next_stage(self.root, self.batch.batch_id),
+            "offchain",
+        )
+
+    def test_explicit_structural_three_pool_route_is_observed(self):
+        """Reducing a three-pool target route to an implicit marker loses hop proof."""
+        self.write_guard_result()
+        routing = {
+            "routes": [
+                {
+                    "target_mint": TARGET_MINT,
+                    "pool_ids": ["pool-a", "pool-b", "pool-c"],
+                }
+            ]
+        }
+        self.write_artifact("routing.json", routing)
+
+        result = self.record()
+
+        self.assertEqual(result["route_status"], "target_route_observed")
+        self.assertEqual(result["three_hop_status"], "three_hop_observed")
+
+    def test_no_explicit_route_marker_is_three_hop_unproven(self):
+        """Inferring hops from sender or target presence would manufacture evidence."""
+        self.write_guard_result()
+        self.write_artifact("hot_tokens.json", self.hot_tokens(TARGET_MINT))
+
+        result = self.record()
+
+        self.assertEqual(result["three_hop_status"], "three_hop_unproven")
+
+    def test_bad_artifact_terminates_batch_without_retaining_raw_content(self):
+        """Accepting malformed generated JSON would let untrusted evidence advance."""
+        self.write_guard_result()
+        artifact = self.stage_root / "hot_tokens.json"
+        artifact.write_bytes(b"{not-json")
+        artifact.chmod(0o600)
+        os.utime(artifact, (150, 150))
+
+        result = self.record()
+
+        self.assertEqual(result["stage_status"], "artifact_error")
+        self.assertEqual(result["next_decision"], "stop")
+        result_dir = self.stage_root.parent.parent / "results" / "0-baseline"
+        self.assertFalse((result_dir / "generated-hot_tokens.json").exists())
+
+    def test_symlink_wrong_mode_and_stale_artifacts_fail_closed(self):
+        """Path substitution, public permissions, or prior-run data must never be evidence."""
+        cases = ("symlink", "wrong_mode", "stale")
+        for index, case in enumerate(cases):
+            with self.subTest(case=case):
+                if index:
+                    self.tearDown()
+                    self.setUp()
+                self.write_guard_result()
+                path = self.stage_root / "routing.json"
+                if case == "symlink":
+                    outside = self.root / "outside-artifact"
+                    outside.write_text("{}")
+                    outside.chmod(0o600)
+                    path.symlink_to(outside)
+                else:
+                    self.write_artifact("routing.json", {"routes": []})
+                    if case == "wrong_mode":
+                        path.chmod(0o644)
+                    else:
+                        os.utime(path, (99, 99))
+
+                result = self.record()
+
+                self.assertEqual(result["stage_status"], "artifact_error")
+                self.assertEqual(result["next_decision"], "stop")
+
+    def test_terminal_and_repeated_stage_transitions_are_rejected(self):
+        """Re-entry after a published result would replace evidence or retry automatically."""
+        self.write_guard_result()
+        first = self.record()
+        self.assertEqual(first["stage_status"], "no_target")
+
+        with self.assertRaises(mint_auto_diagnoser.DiagnoserError):
+            self.record()
+
+        state_path = (
+            self.root
+            / "state"
+            / "auto-diagnose-runs"
+            / self.batch.batch_id
+            / "batch-state.json"
+        )
+        state = json.loads(state_path.read_text())
+        state["status"] = "prepared"
+        state_path.write_text(json.dumps(state))
+        state_path.chmod(0o600)
+        with self.assertRaises(mint_auto_diagnoser.DiagnoserError):
+            mint_auto_diagnoser.next_stage(self.root, self.batch.batch_id)
+
+    def test_interrupted_attempt_is_terminal_before_publication(self):
+        """A recorder crash must not make the same live stage selectable again."""
+        self.write_guard_result()
+        with patch.object(
+            mint_auto_diagnoser,
+            "_artifact_evidence",
+            side_effect=OSError("fixture interruption"),
+        ):
+            with self.assertRaises(OSError):
+                self.record()
+
+        self.assertEqual(
+            mint_auto_diagnoser.next_stage(
+                self.root, self.batch.batch_id
+            ),
+            "stop",
+        )
+        with self.assertRaises(mint_auto_diagnoser.DiagnoserError):
+            self.record()
+
+    def test_validation_failure_after_live_attempt_is_terminal(self):
+        """Invalid post-run evidence must reserve the attempt before validation fails."""
+        self.write_guard_result()
+        (self.stage_root / "guard-result.txt").chmod(0o644)
+
+        with self.assertRaises(mint_auto_diagnoser.DiagnoserError):
+            self.record()
+
+        self.assertEqual(
+            mint_auto_diagnoser.next_stage(
+                self.root, self.batch.batch_id
+            ),
+            "stop",
+        )
+
+    def test_hard_crash_pending_directory_is_discarded_fail_closed(self):
+        """A partial owned publication must not strand state or become evidence."""
+        batch_root = (
+            self.root
+            / "state"
+            / "auto-diagnose-runs"
+            / self.batch.batch_id
+        )
+        state_path = batch_root / "batch-state.json"
+        state = json.loads(state_path.read_text())
+        state["status"] = "running"
+        state["next_stage"] = "stop"
+        state_path.write_text(json.dumps(state))
+        state_path.chmod(0o600)
+        results = batch_root / "results"
+        results.mkdir(mode=0o700)
+        pending = results / (".pending-0-baseline-" + "a" * 24)
+        pending.mkdir(mode=0o700)
+        partial = pending / "generated-hot_tokens.json"
+        partial.write_text("{}")
+        partial.chmod(0o600)
+
+        self.assertEqual(
+            mint_auto_diagnoser.next_stage(
+                self.root, self.batch.batch_id
+            ),
+            "stop",
+        )
+        self.assertFalse(pending.exists())
+        finalized = mint_auto_diagnoser.finalize_batch(
+            self.root, self.batch.batch_id
+        )
+        self.assertEqual(finalized["status"], "failed")
+
+    def test_published_result_recovers_without_replacing_or_rerunning(self):
+        """A crash after rename must commit that result instead of rerunning evidence."""
+        self.write_guard_result()
+        real_store = mint_auto_diagnoser._store_batch_state
+        calls = []
+
+        def fail_final_store(batch_fd, previous, replacement):
+            calls.append(replacement["status"])
+            if len(calls) == 2:
+                raise OSError("fixture state interruption")
+            return real_store(batch_fd, previous, replacement)
+
+        with patch.object(
+            mint_auto_diagnoser,
+            "_store_batch_state",
+            side_effect=fail_final_store,
+        ):
+            with self.assertRaises(OSError):
+                self.record()
+
+        self.assertEqual(calls, ["running", "running"])
+        self.assertEqual(
+            mint_auto_diagnoser.next_stage(
+                self.root, self.batch.batch_id
+            ),
+            "offchain",
+        )
+        with self.assertRaises(mint_auto_diagnoser.DiagnoserError):
+            self.record()
+
+    def test_post_rename_directory_fsync_error_keeps_published_result(self):
+        """A durability-report error after rename must not create state/result skew."""
+        self.write_guard_result()
+        real_fsync = mint_auto_diagnoser.os.fsync
+        final_result = (
+            self.stage_root.parent.parent
+            / "results"
+            / "0-baseline"
+        )
+
+        def fail_post_rename(descriptor):
+            if final_result.exists():
+                try:
+                    target = os.readlink(
+                        f"/proc/self/fd/{descriptor}"
+                    )
+                except OSError:
+                    target = ""
+                if target.endswith("/results"):
+                    raise OSError("fixture directory fsync failure")
+            return real_fsync(descriptor)
+
+        with patch.object(
+            mint_auto_diagnoser.os,
+            "fsync",
+            side_effect=fail_post_rename,
+        ):
+            result = self.record()
+
+        self.assertEqual(result["stage_status"], "no_target")
+        self.assertEqual(
+            mint_auto_diagnoser.next_stage(
+                self.root, self.batch.batch_id
+            ),
+            "offchain",
+        )
+
+    def test_exception_after_rename_recovers_published_result(self):
+        """An asynchronous post-rename failure must commit, not skew, fixed evidence."""
+        self.write_guard_result()
+        real_publish = mint_auto_diagnoser._publish_stage_result
+
+        def publish_then_interrupt(*args, **kwargs):
+            real_publish(*args, **kwargs)
+            raise KeyboardInterrupt
+
+        with patch.object(
+            mint_auto_diagnoser,
+            "_publish_stage_result",
+            side_effect=publish_then_interrupt,
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                self.record()
+
+        self.assertEqual(
+            mint_auto_diagnoser.next_stage(
+                self.root, self.batch.batch_id
+            ),
+            "offchain",
+        )
+        with self.assertRaises(mint_auto_diagnoser.DiagnoserError):
+            self.record()
+
+    def test_threshold_cleanup_rpc_and_last_stage_stop(self):
+        """Every safety terminal must stop instead of selecting another live stage."""
+        for index, (reason, loss) in enumerate(
+            (
+                ("loss_threshold", 25_000_000),
+                ("cleanup_failed", 0),
+                ("rpc_error", 0),
+            )
+        ):
+            with self.subTest(reason=reason):
+                if index:
+                    self.tearDown()
+                    self.setUp()
+                self.write_guard_result(reason=reason, observed_loss=loss)
+                result = self.record()
+                self.assertEqual(result["next_decision"], "stop")
+
+    def test_crash_and_safety_reason_override_target_evidence(self):
+        """A crash or integrity stop must never become a target-positive retry decision."""
+        self.write_guard_result(
+            reason="child_exit", child_exit_code=2
+        )
+        result = self.record()
+        self.assertEqual(result["stage_status"], "failed")
+        self.assertEqual(result["next_decision"], "stop")
+
+        self.tearDown()
+        self.setUp()
+        self.write_guard_result(
+            reason="operator_signal", child_exit_code=-15
+        )
+        self.write_artifact(
+            "hot_tokens.json", self.hot_tokens(TARGET_MINT)
+        )
+        result = self.record()
+        self.assertEqual(result["stage_status"], "failed")
+        self.assertEqual(result["target_artifact_count"], 1)
+        self.assertEqual(result["next_decision"], "stop")
+
+    def test_read_only_balance_sets_cumulative_loss_and_rpc_failure_stops(self):
+        """Ignoring the immutable baseline or a failed balance read would overrun safety."""
+        self.write_guard_result()
+
+        def lower_balance(url, payload, timeout):
+            del url, timeout
+            if payload["method"] == "getBalance":
+                return {"result": {"value": 100_000_000}}
+            if payload["method"] == "getSignaturesForAddress":
+                return {"result": []}
+            raise AssertionError("unexpected RPC method")
+
+        result = self.record(transport=lower_balance)
+        self.assertEqual(
+            result["cumulative_observed_loss_lamports"],
+            23_456_789,
+        )
+
+        self.tearDown()
+        self.setUp()
+        self.write_guard_result()
+
+        def failed_balance(url, payload, timeout):
+            del url, payload, timeout
+            raise OSError("fixture unavailable")
+
+        result = self.record(transport=failed_balance)
+        self.assertEqual(result["stage_status"], "rpc_error")
+        self.assertEqual(result["next_decision"], "stop")
+
+    def test_last_non_skipped_stage_exhausts_without_retry(self):
+        """Selecting a stage after the prepared sequence would create an automatic retry."""
+        result = None
+        with patch.object(
+            mint_auto_diagnoser.zavod_guard,
+            "wallet_pubkey",
+            return_value="wallet",
+        ):
+            for stage in (
+                stage for stage in self.batch.stages if not stage.skipped
+            ):
+                stage_root = self.root / stage.relative_root
+                self.write_guard_result(stage_root=stage_root)
+                result = mint_auto_diagnoser.record_stage_result(
+                    self.root,
+                    self.batch.batch_id,
+                    stage.name,
+                    0,
+                    self.started_at,
+                    self.ended_at,
+                    transport=self.empty_transport,
+                )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["stage_name"], "pool_liquidity")
+        self.assertEqual(result["stage_status"], "no_target")
+        self.assertEqual(result["next_decision"], "stop")
+        self.assertEqual(
+            mint_auto_diagnoser.next_stage(
+                self.root, self.batch.batch_id
+            ),
+            "stop",
+        )
+
+    def test_finalize_publishes_once_and_decline_is_one_way(self):
+        """Replacing a batch result or returning from declined to prepared must fail."""
+        self.write_guard_result()
+        self.write_artifact("hot_tokens.json", self.hot_tokens(TARGET_MINT))
+        self.record()
+
+        result = mint_auto_diagnoser.finalize_batch(
+            self.root, self.batch.batch_id
+        )
+        result_path = (
+            self.root
+            / mint_auto_diagnoser.batch_result_path(self.batch.batch_id)
+        )
+        self.assertEqual(result["status"], "target_positive")
+        self.assertEqual(stat.S_IMODE(result_path.stat().st_mode), 0o600)
+        self.assertFalse(
+            (self.root / "state" / ".mint-auto-diagnose-active").exists()
+        )
+        with self.assertRaises(mint_auto_diagnoser.DiagnoserError):
+            mint_auto_diagnoser.finalize_batch(
+                self.root, self.batch.batch_id
+            )
+
+        self.tearDown()
+        self.setUp()
+        declined = mint_auto_diagnoser.finalize_batch(
+            self.root, self.batch.batch_id
+        )
+        self.assertEqual(declined["status"], "declined")
+        self.assertEqual(
+            mint_auto_diagnoser.next_stage(
+                self.root, self.batch.batch_id
+            ),
+            "stop",
+        )
+
+    def test_manifest_is_fixed_private_and_contains_no_protected_values(self):
+        """Adding raw guard, config, RPC, wallet, or signature fields must fail."""
+        self.write_guard_result()
+        result = self.record()
+        manifest_path = (
+            self.stage_root.parent.parent
+            / "results"
+            / "0-baseline"
+            / "stage-manifest.json"
+        )
+        rendered = manifest_path.read_text()
+
+        self.assertEqual(stat.S_IMODE(manifest_path.stat().st_mode), 0o600)
+        self.assertEqual(result, json.loads(rendered))
+        self.assertNotIn("signature", rendered.lower())
+        self.assertNotIn("://", rendered)
+        self.assertNotIn("private_key", rendered)
+        self.assertNotIn("wallet", rendered.lower())
+        self.assertNotIn("test-wallet", rendered)
+
+
 if __name__ == "__main__":
     unittest.main()
