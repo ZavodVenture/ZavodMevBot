@@ -2,6 +2,7 @@
 """Private, immutable configuration staging for the auto-filter diagnoser."""
 
 import argparse
+import codecs
 import copy
 import fcntl
 import hashlib
@@ -478,9 +479,21 @@ def _acquire_state_marker_lock(state_fd):
         raise DiagnoserError("active batch marker lock is invalid") from exc
 
 
-def _remove_active_marker(state_fd, batch_id, *, strict=False):
+def _remove_active_marker(
+    state_fd,
+    batch_id,
+    *,
+    strict=False,
+    batch_fd=None,
+    result_fd=None,
+):
     if strict:
-        _remove_finalized_active_marker(state_fd, batch_id)
+        _remove_finalized_active_marker(
+            state_fd,
+            batch_id,
+            batch_fd=batch_fd,
+            result_fd=result_fd,
+        )
         return
     try:
         marker = _read_owned_file(state_fd, ACTIVE_MARKER, mode=0o600)
@@ -894,6 +907,30 @@ def _validate_completed_results(
                         )
             finally:
                 os.close(result_fd)
+        if pending_manifest is not None:
+            os.fsync(results_fd)
+            held_results = _validate_owned(
+                results_fd, "directory", mode=0o700
+            )
+            named_results = os.stat(
+                "results",
+                dir_fd=batch_fd,
+                follow_symlinks=False,
+            )
+            if (
+                not stat.S_ISDIR(named_results.st_mode)
+                or named_results.st_uid != os.geteuid()
+                or stat.S_IMODE(named_results.st_mode) != 0o700
+                or (
+                    named_results.st_dev,
+                    named_results.st_ino,
+                )
+                != (
+                    held_results.st_dev,
+                    held_results.st_ino,
+                )
+            ):
+                raise DiagnoserError("batch state is invalid")
         return pending_manifest
     except (OSError, mint_runner.RunnerError) as exc:
         raise DiagnoserError("batch state is invalid") from exc
@@ -1026,6 +1063,7 @@ def _store_batch_state(batch_fd, previous, replacement):
                 + "\n"
             ).encode(),
         )
+        os.fsync(batch_fd)
     except (mint_runner.RunnerError, OSError) as exc:
         raise DiagnoserError("batch state transition failed") from exc
 
@@ -1144,7 +1182,7 @@ def _parse_stage_guard(stage_fd, guard_exit):
     return guard, integers, duration
 
 
-def _stage_log_path(stage_fd, log_value):
+def _stage_log_snapshot(stage_fd, log_value):
     if not isinstance(log_value, str):
         raise DiagnoserError("stage log is invalid")
     relative = Path(log_value)
@@ -1156,14 +1194,209 @@ def _stage_log_path(stage_fd, log_value):
     ):
         raise DiagnoserError("stage log is invalid")
     logs_fd = _open_relative_directory(stage_fd, "logs", mode=0o700)
+    descriptor = None
     try:
-        log_data = _read_owned_file(
-            logs_fd, relative.parts[1], mode=0o600
+        descriptor = os.open(
+            relative.parts[1],
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=logs_fd,
         )
-        del log_data
+        before = _validate_owned(descriptor, "file", mode=0o600)
+        if before.st_size > mint_runner.SELECTOR_LOG_MAX_BYTES:
+            raise DiagnoserError("stage log is invalid")
+        snapshot = bytearray()
+        while len(snapshot) <= mint_runner.SELECTOR_LOG_MAX_BYTES:
+            chunk = os.read(
+                descriptor,
+                min(
+                    mint_runner.SELECTOR_LOG_READ_SIZE,
+                    mint_runner.SELECTOR_LOG_MAX_BYTES
+                    + 1
+                    - len(snapshot),
+                ),
+            )
+            if not chunk:
+                break
+            snapshot.extend(chunk)
+        if len(snapshot) > mint_runner.SELECTOR_LOG_MAX_BYTES:
+            raise DiagnoserError("stage log is invalid")
+        after = os.fstat(descriptor)
+        named = os.stat(
+            relative.parts[1],
+            dir_fd=logs_fd,
+            follow_symlinks=False,
+        )
+        stable_fields = (
+            "st_dev",
+            "st_ino",
+            "st_mode",
+            "st_uid",
+            "st_size",
+            "st_mtime_ns",
+            "st_ctime_ns",
+        )
+        if (
+            len(snapshot) != after.st_size
+            or any(
+                getattr(before, field) != getattr(after, field)
+                for field in stable_fields
+            )
+            or any(
+                getattr(after, field) != getattr(named, field)
+                for field in stable_fields
+            )
+            or not stat.S_ISREG(named.st_mode)
+            or named.st_uid != os.geteuid()
+            or stat.S_IMODE(named.st_mode) != 0o600
+        ):
+            raise DiagnoserError("stage log is invalid")
+        return bytes(snapshot)
+    except (OSError, DiagnoserError) as exc:
+        raise DiagnoserError("stage log is invalid") from exc
     finally:
+        if descriptor is not None:
+            os.close(descriptor)
         os.close(logs_fd)
-    return Path(f"/proc/self/fd/{stage_fd}") / relative
+
+
+def _iter_stage_log_lines(snapshot):
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    buffer = ""
+    discarding_line = False
+    offset = 0
+    while True:
+        chunk = snapshot[
+            offset : offset + mint_runner.SELECTOR_LOG_READ_SIZE
+        ]
+        offset += len(chunk)
+        physical_eof = not chunk
+        text = decoder.decode(chunk, final=physical_eof)
+        while text:
+            if discarding_line:
+                newline = text.find("\n")
+                if newline < 0:
+                    text = ""
+                    continue
+                text = text[newline + 1 :]
+                discarding_line = False
+                continue
+            newline = text.find("\n")
+            if newline < 0:
+                if (
+                    len(buffer) + len(text)
+                    > mint_runner.SELECTOR_LOG_MAX_LINE_CHARS
+                ):
+                    buffer = ""
+                    discarding_line = True
+                else:
+                    buffer += text
+                text = ""
+                continue
+            segment = text[:newline]
+            text = text[newline + 1 :]
+            if (
+                len(buffer) + len(segment)
+                <= mint_runner.SELECTOR_LOG_MAX_LINE_CHARS
+            ):
+                yield (buffer + segment).removesuffix("\r")
+            buffer = ""
+        if physical_eof:
+            if buffer and not discarding_line:
+                yield buffer.removesuffix("\r")
+            break
+
+
+def _aggregate_stage_log(snapshot):
+    counts = {name: 0 for name in mint_runner.LOG_PATTERNS}
+    for line in _iter_stage_log_lines(snapshot):
+        for name, pattern in mint_runner.LOG_PATTERNS.items():
+            counts[name] += len(pattern.findall(line))
+    return counts
+
+
+def _selector_stage_log_summary(
+    snapshot,
+    target_mint,
+    artifacts,
+    guard_reason,
+):
+    summary = mint_runner._selector_diagnostic_summary(
+        None,
+        target_mint,
+        artifacts,
+        guard_reason,
+    )
+    refresh_count = 0
+    zero_refresh_count = 0
+    histogram_counts = {}
+    selected_count_min = None
+    selected_count_max = None
+    construction_observed = False
+    dispatch_marker_observed = False
+    for line in _iter_stage_log_lines(snapshot):
+        if line == mint_runner.SELECTOR_CONSTRUCTION_MARKER:
+            construction_observed = True
+        if line == mint_runner.SELECTOR_DISPATCH_VIOLATION_MARKER:
+            dispatch_marker_observed = True
+        match = mint_runner.SELECTOR_REFRESH_PATTERN.fullmatch(line)
+        if (
+            match is not None
+            and refresh_count < mint_runner.SELECTOR_MAX_OBSERVATIONS
+        ):
+            count = int(match.group(1))
+            refresh_count += 1
+            if count == 0:
+                zero_refresh_count += 1
+            histogram_counts[count] = (
+                histogram_counts.get(count, 0) + 1
+            )
+            if (
+                selected_count_min is None
+                or count < selected_count_min
+            ):
+                selected_count_min = count
+            if (
+                selected_count_max is None
+                or count > selected_count_max
+            ):
+                selected_count_max = count
+            if refresh_count >= mint_runner.SELECTOR_MAX_OBSERVATIONS:
+                break
+    summary.update(
+        {
+            "refresh_count": refresh_count,
+            "zero_refresh_count": zero_refresh_count,
+            "selected_count_histogram": {
+                str(count): occurrences
+                for count, occurrences in histogram_counts.items()
+            },
+            "selected_count_min": (
+                selected_count_min
+                if selected_count_min is not None
+                else mint_runner.SELECTOR_UNAVAILABLE
+            ),
+            "selected_count_max": (
+                selected_count_max
+                if selected_count_max is not None
+                else mint_runner.SELECTOR_UNAVAILABLE
+            ),
+            "candidate_construction": (
+                "observed_in_log"
+                if construction_observed
+                else "not_observed_in_log"
+            ),
+            "dispatch": (
+                "test_mode_dispatch_violation"
+                if (
+                    dispatch_marker_observed
+                    or summary["dispatch"]
+                    == "test_mode_dispatch_violation"
+                )
+                else "not_applicable"
+            ),
+        }
+    )
+    return summary
 
 
 def _read_stage_artifact(stage_fd, name, started_at, ended_at, policy):
@@ -1345,10 +1578,7 @@ def _publish_stage_result(results_fd, stage_directory, artifacts, manifest):
             dst_dir_fd=results_fd,
         )
         published = True
-        try:
-            os.fsync(results_fd)
-        except OSError:
-            pass
+        os.fsync(results_fd)
     except BaseException:
         if not published:
             try:
@@ -1501,7 +1731,7 @@ def record_stage_result(
     descriptors = _batch_descriptors(root, batch_id, include_results=True)
     stage_fd = None
     attempt_started = False
-    published = False
+    publication_started = False
     state = None
     try:
         _lock_batch(descriptors, exclusive=True)
@@ -1536,11 +1766,10 @@ def record_stage_result(
         guard, guard_integers, duration = _parse_stage_guard(
             stage_fd, guard_exit
         )
-        log_path = _stage_log_path(stage_fd, guard["log_path"])
-        try:
-            log_events = mint_runner.aggregate_log(log_path)
-        except mint_runner.RunnerError as exc:
-            raise DiagnoserError("stage log is invalid") from exc
+        log_snapshot = _stage_log_snapshot(
+            stage_fd, guard["log_path"]
+        )
+        log_events = _aggregate_stage_log(log_snapshot)
         config_bytes = _read_owned_file(stage_fd, "config.toml", mode=0o600)
         try:
             config = zavod_guard.load_config_bytes(config_bytes)
@@ -1605,8 +1834,8 @@ def record_stage_result(
             routing_target_count = 0
             three_hop_count = 0
         else:
-            selector = mint_runner._selector_diagnostic_summary(
-                log_path,
+            selector = _selector_stage_log_summary(
+                log_snapshot,
                 contract["target_mint"],
                 evidence["artifacts"],
                 guard["reason"],
@@ -1702,7 +1931,8 @@ def record_stage_result(
         )
         if policy.contains_protected(rendered):
             raise DiagnoserError("stage result contains protected data")
-        published = _publish_stage_result(
+        publication_started = True
+        _publish_stage_result(
             descriptors["results"],
             stage_directory,
             (
@@ -1722,36 +1952,22 @@ def record_stage_result(
         _store_batch_state(descriptors["batch"], state, replacement)
         return manifest
     except BaseException:
-        if attempt_started and not published and state is not None:
+        if (
+            attempt_started
+            and not publication_started
+            and state is not None
+        ):
+            failed = {
+                **state,
+                "status": "failed",
+                "next_stage": "stop",
+            }
             try:
-                current, current_prepared, pending = (
-                    _load_batch_state(
-                        descriptors["batch"],
-                        descriptors["stages"],
-                    )
+                _store_batch_state(
+                    descriptors["batch"], state, failed
                 )
-                if pending is not None:
-                    _recover_pending_result(
-                        descriptors["batch"],
-                        current,
-                        current_prepared,
-                        pending,
-                    )
-                    published = True
             except BaseException:
                 pass
-            if not published:
-                failed = {
-                    **state,
-                    "status": "failed",
-                    "next_stage": "stop",
-                }
-                try:
-                    _store_batch_state(
-                        descriptors["batch"], state, failed
-                    )
-                except BaseException:
-                    pass
         raise
     finally:
         for descriptor in (stage_fd,):
@@ -1852,180 +2068,265 @@ def _revalidate_batch_result_path(batch_fd, descriptor):
         raise DiagnoserError("batch result is invalid")
 
 
-def _remove_finalized_active_marker(state_fd, batch_id):
-    descriptor = None
+def _private_marker_stat(state_fd, name):
     try:
-        descriptor = os.open(
-            ACTIVE_MARKER,
-            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
-            dir_fd=state_fd,
-        )
-    except FileNotFoundError:
-        return
-    except OSError as exc:
-        raise DiagnoserError("active batch marker is invalid") from exc
-    try:
-        identity = _validate_owned(descriptor, "file", mode=0o600)
-        chunks = []
-        while True:
-            chunk = os.read(descriptor, 1024 * 1024)
-            if not chunk:
-                break
-            chunks.append(chunk)
-        marker = b"".join(chunks)
-    except (OSError, DiagnoserError) as exc:
-        raise DiagnoserError("active batch marker is invalid") from exc
-    finally:
-        os.close(descriptor)
-    if marker != f"{batch_id}\n".encode():
-        raise DiagnoserError("active batch marker is invalid")
-    quarantine = (
-        f"{ACTIVE_MARKER}.releasing-{secrets.token_hex(12)}"
-    )
-    try:
-        named = os.stat(
-            ACTIVE_MARKER,
+        info = os.stat(
+            name,
             dir_fd=state_fd,
             follow_symlinks=False,
         )
-        if (
-            not stat.S_ISREG(named.st_mode)
-            or named.st_uid != os.geteuid()
-            or stat.S_IMODE(named.st_mode) != 0o600
-            or (named.st_dev, named.st_ino)
-            != (identity.st_dev, identity.st_ino)
-        ):
-            raise DiagnoserError("active batch marker is invalid")
-        try:
-            os.stat(
-                quarantine,
-                dir_fd=state_fd,
-                follow_symlinks=False,
-            )
-        except FileNotFoundError:
-            pass
-        else:
-            raise DiagnoserError("active batch marker is invalid")
-        os.rename(
-            ACTIVE_MARKER,
-            quarantine,
-            src_dir_fd=state_fd,
-            dst_dir_fd=state_fd,
-        )
     except FileNotFoundError:
-        return
+        return None
     except OSError as exc:
-        raise DiagnoserError("active batch marker is invalid") from exc
-    quarantine_fd = None
-    quarantine_identity = None
-    quarantine_valid = False
+        raise DiagnoserError(
+            "active batch marker is invalid"
+        ) from exc
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid != os.geteuid()
+        or stat.S_IMODE(info.st_mode) != 0o600
+    ):
+        raise DiagnoserError("active batch marker is invalid")
+    return info
+
+
+def _marker_identity(info):
+    return info.st_dev, info.st_ino
+
+
+def _raise_marker_error_after_sync(state_fd, cause=None):
     try:
-        quarantine_fd = os.open(
-            quarantine,
-            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
-            dir_fd=state_fd,
-        )
-        quarantine_identity = _validate_owned(
+        os.fsync(state_fd)
+    except OSError as exc:
+        raise DiagnoserError(
+            "active batch marker is invalid"
+        ) from exc
+    if cause is None:
+        raise DiagnoserError("active batch marker is invalid")
+    raise DiagnoserError("active batch marker is invalid") from cause
+
+
+def _rollback_quarantined_marker(
+    state_fd,
+    quarantine,
+    quarantine_fd,
+):
+    try:
+        held = _validate_owned(
             quarantine_fd, "file", mode=0o600
         )
-        chunks = []
-        while True:
-            chunk = os.read(quarantine_fd, 1024 * 1024)
-            if not chunk:
-                break
-            chunks.append(chunk)
-        quarantine_marker = b"".join(chunks)
-        quarantine_valid = (
-            (
-                quarantine_identity.st_dev,
-                quarantine_identity.st_ino,
-            )
-            == (identity.st_dev, identity.st_ino)
-            and quarantine_marker == marker
+        expected = _marker_identity(held)
+        named = _private_marker_stat(state_fd, quarantine)
+    except DiagnoserError as exc:
+        _raise_marker_error_after_sync(state_fd, exc)
+    if named is None or _marker_identity(named) != expected:
+        _raise_marker_error_after_sync(state_fd)
+    try:
+        os.link(
+            quarantine,
+            ACTIVE_MARKER,
+            src_dir_fd=state_fd,
+            dst_dir_fd=state_fd,
+            follow_symlinks=False,
         )
-    except (OSError, DiagnoserError):
-        quarantine_valid = False
-    finally:
-        if quarantine_fd is not None:
-            os.close(quarantine_fd)
-    if not quarantine_valid:
+    except OSError as exc:
+        _raise_marker_error_after_sync(state_fd, exc)
+    try:
+        os.fsync(state_fd)
+    except OSError as exc:
+        _raise_marker_error_after_sync(state_fd, exc)
+    try:
+        held = _validate_owned(
+            quarantine_fd, "file", mode=0o600
+        )
+        active = _private_marker_stat(state_fd, ACTIVE_MARKER)
+        remaining = _private_marker_stat(state_fd, quarantine)
+    except DiagnoserError as exc:
+        _raise_marker_error_after_sync(state_fd, exc)
+    expected = _marker_identity(held)
+    if (
+        active is None
+        or remaining is None
+        or _marker_identity(active) != expected
+        or _marker_identity(remaining) != expected
+    ):
+        _raise_marker_error_after_sync(state_fd)
+    try:
+        os.unlink(quarantine, dir_fd=state_fd)
+        os.fsync(state_fd)
+    except OSError as exc:
+        _raise_marker_error_after_sync(state_fd, exc)
+
+
+def _read_marker_descriptor(descriptor):
+    chunks = []
+    total = 0
+    while True:
+        chunk = os.read(descriptor, 1024)
+        if not chunk:
+            return b"".join(chunks)
+        total += len(chunk)
+        if total > 1024:
+            raise DiagnoserError("active batch marker is invalid")
+        chunks.append(chunk)
+
+
+def _remove_finalized_active_marker(
+    state_fd,
+    batch_id,
+    *,
+    batch_fd,
+    result_fd,
+):
+    descriptor = None
+    quarantine_fd = None
+    quarantine = None
+    try:
         try:
-            named_quarantine = os.stat(
-                quarantine,
-                dir_fd=state_fd,
-                follow_symlinks=False,
-            )
-            if (
-                quarantine_identity is None
-                or not stat.S_ISREG(named_quarantine.st_mode)
-                or named_quarantine.st_uid != os.geteuid()
-                or stat.S_IMODE(named_quarantine.st_mode) != 0o600
-                or (
-                    named_quarantine.st_dev,
-                    named_quarantine.st_ino,
-                )
-                != (
-                    quarantine_identity.st_dev,
-                    quarantine_identity.st_ino,
-                )
-            ):
-                raise DiagnoserError(
-                    "active batch marker is invalid"
-                )
-            os.link(
-                quarantine,
+            descriptor = os.open(
                 ACTIVE_MARKER,
-                src_dir_fd=state_fd,
-                dst_dir_fd=state_fd,
-                follow_symlinks=False,
-            )
-            restored = os.stat(
-                ACTIVE_MARKER,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
                 dir_fd=state_fd,
-                follow_symlinks=False,
             )
-            remaining = os.stat(
-                quarantine,
-                dir_fd=state_fd,
-                follow_symlinks=False,
-            )
-            expected_identity = (
-                quarantine_identity.st_dev,
-                quarantine_identity.st_ino,
-            )
-            if (
-                (restored.st_dev, restored.st_ino)
-                != expected_identity
-                or (remaining.st_dev, remaining.st_ino)
-                != expected_identity
-            ):
-                raise DiagnoserError(
-                    "active batch marker is invalid"
-                )
-            os.fsync(state_fd)
-            os.unlink(quarantine, dir_fd=state_fd)
-            os.fsync(state_fd)
-        except DiagnoserError:
-            raise
+        except FileNotFoundError:
+            _revalidate_batch_result_path(batch_fd, result_fd)
+            return
         except OSError as exc:
             raise DiagnoserError(
                 "active batch marker is invalid"
             ) from exc
-        raise DiagnoserError("active batch marker is invalid")
-    try:
-        os.unlink(quarantine, dir_fd=state_fd)
-        os.fsync(state_fd)
         try:
-            os.stat(
-                ACTIVE_MARKER,
-                dir_fd=state_fd,
-                follow_symlinks=False,
+            identity = _validate_owned(
+                descriptor, "file", mode=0o600
             )
-        except FileNotFoundError:
-            return
-        raise DiagnoserError("active batch marker is invalid")
-    except OSError as exc:
-        raise DiagnoserError("active batch marker is invalid") from exc
+            marker = _read_marker_descriptor(descriptor)
+        except (OSError, DiagnoserError) as exc:
+            raise DiagnoserError(
+                "active batch marker is invalid"
+            ) from exc
+        if marker != f"{batch_id}\n".encode():
+            raise DiagnoserError("active batch marker is invalid")
+        quarantine = (
+            f"{ACTIVE_MARKER}.releasing-{secrets.token_hex(12)}"
+        )
+        try:
+            named = _private_marker_stat(
+                state_fd, ACTIVE_MARKER
+            )
+            existing_quarantine = _private_marker_stat(
+                state_fd, quarantine
+            )
+        except DiagnoserError as exc:
+            _raise_marker_error_after_sync(state_fd, exc)
+        if (
+            named is None
+            or _marker_identity(named)
+            != _marker_identity(identity)
+            or existing_quarantine is not None
+        ):
+            _raise_marker_error_after_sync(state_fd)
+        try:
+            os.rename(
+                ACTIVE_MARKER,
+                quarantine,
+                src_dir_fd=state_fd,
+                dst_dir_fd=state_fd,
+            )
+        except OSError as exc:
+            _raise_marker_error_after_sync(state_fd, exc)
+        try:
+            quarantine_fd = os.open(
+                quarantine,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=state_fd,
+            )
+            quarantine_identity = _validate_owned(
+                quarantine_fd, "file", mode=0o600
+            )
+            quarantine_marker = _read_marker_descriptor(
+                quarantine_fd
+            )
+        except (OSError, DiagnoserError) as exc:
+            _raise_marker_error_after_sync(state_fd, exc)
+        if (
+            _marker_identity(quarantine_identity)
+            != _marker_identity(identity)
+            or quarantine_marker != marker
+        ):
+            _rollback_quarantined_marker(
+                state_fd, quarantine, quarantine_fd
+            )
+            raise DiagnoserError("active batch marker is invalid")
+        try:
+            _revalidate_batch_result_path(batch_fd, result_fd)
+        except DiagnoserError:
+            _rollback_quarantined_marker(
+                state_fd, quarantine, quarantine_fd
+            )
+            raise
+        try:
+            remaining = _private_marker_stat(
+                state_fd, quarantine
+            )
+            active = _private_marker_stat(
+                state_fd, ACTIVE_MARKER
+            )
+        except DiagnoserError as exc:
+            _raise_marker_error_after_sync(state_fd, exc)
+        expected = _marker_identity(quarantine_identity)
+        if remaining is None or _marker_identity(remaining) != expected:
+            _raise_marker_error_after_sync(state_fd)
+        if active is not None:
+            _rollback_quarantined_marker(
+                state_fd, quarantine, quarantine_fd
+            )
+            raise DiagnoserError("active batch marker is invalid")
+        try:
+            _revalidate_batch_result_path(batch_fd, result_fd)
+        except DiagnoserError:
+            _rollback_quarantined_marker(
+                state_fd, quarantine, quarantine_fd
+            )
+            raise
+        try:
+            remaining = _private_marker_stat(
+                state_fd, quarantine
+            )
+            active = _private_marker_stat(
+                state_fd, ACTIVE_MARKER
+            )
+        except DiagnoserError as exc:
+            _raise_marker_error_after_sync(state_fd, exc)
+        if (
+            remaining is None
+            or _marker_identity(remaining) != expected
+        ):
+            _raise_marker_error_after_sync(state_fd)
+        if active is not None:
+            _rollback_quarantined_marker(
+                state_fd, quarantine, quarantine_fd
+            )
+            raise DiagnoserError("active batch marker is invalid")
+        try:
+            os.unlink(quarantine, dir_fd=state_fd)
+            os.fsync(state_fd)
+        except OSError as exc:
+            _raise_marker_error_after_sync(state_fd, exc)
+        try:
+            active = _private_marker_stat(
+                state_fd, ACTIVE_MARKER
+            )
+        except DiagnoserError as exc:
+            _raise_marker_error_after_sync(state_fd, exc)
+        if active is not None:
+            _raise_marker_error_after_sync(state_fd)
+    finally:
+        for held_fd in (quarantine_fd, descriptor):
+            if held_fd is not None:
+                try:
+                    os.close(held_fd)
+                except OSError:
+                    pass
 
 
 def finalize_batch(root: Path, batch_id: str) -> dict:
@@ -2093,11 +2394,12 @@ def finalize_batch(root: Path, batch_id: str) -> dict:
                 raise DiagnoserError("batch result is invalid")
         result, result_fd = existing_result
         os.fsync(descriptors["batch"])
-        _revalidate_batch_result_path(
-            descriptors["batch"], result_fd
-        )
         _remove_active_marker(
-            descriptors["state"], batch_id, strict=True
+            descriptors["state"],
+            batch_id,
+            strict=True,
+            batch_fd=descriptors["batch"],
+            result_fd=result_fd,
         )
         return result
     finally:

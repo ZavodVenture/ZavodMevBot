@@ -609,6 +609,100 @@ class StageEvidenceTests(unittest.TestCase):
             "offchain",
         )
 
+    def test_oversized_stage_log_fails_closed_before_evidence(self):
+        """Reading past the fixed log cap would let unbounded input drive evidence."""
+        log = self.write_guard_result()
+        with log.open("wb") as handle:
+            handle.truncate(
+                mint_auto_diagnoser.mint_runner.SELECTOR_LOG_MAX_BYTES
+                + 1
+            )
+        log.chmod(0o600)
+
+        with self.assertRaises(mint_auto_diagnoser.DiagnoserError):
+            self.record()
+
+        self.assertEqual(
+            mint_auto_diagnoser.next_stage(
+                self.root, self.batch.batch_id
+            ),
+            "stop",
+        )
+
+    def test_stage_log_growth_during_snapshot_fails_closed(self):
+        """Growth after EOF must not enter either log-derived evidence summary."""
+        log = self.write_guard_result()
+        original = log.stat()
+        original_identity = (original.st_dev, original.st_ino)
+        real_read = mint_auto_diagnoser.os.read
+        grew = False
+
+        def grow_after_eof(descriptor, size):
+            nonlocal grew
+            data = real_read(descriptor, size)
+            info = os.fstat(descriptor)
+            if (
+                not grew
+                and not data
+                and (info.st_dev, info.st_ino) == original_identity
+            ):
+                with log.open("ab") as handle:
+                    handle.write(b"Transaction sent successfully\n")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                grew = True
+            return data
+
+        with patch.object(
+            mint_auto_diagnoser.os,
+            "read",
+            side_effect=grow_after_eof,
+        ):
+            with self.assertRaises(mint_auto_diagnoser.DiagnoserError):
+                self.record()
+
+        self.assertTrue(grew)
+        self.assertEqual(
+            log.read_bytes(), b"Transaction sent successfully\n"
+        )
+
+    def test_stage_log_substitution_during_snapshot_fails_closed(self):
+        """A replacement after EOF must not be reopened as trusted evidence."""
+        log = self.write_guard_result()
+        log.write_bytes(b"Fetched 0 mint list.\n")
+        log.chmod(0o600)
+        original = log.stat()
+        original_identity = (original.st_dev, original.st_ino)
+        replacement = b"Transaction sent successfully\n"
+        real_read = mint_auto_diagnoser.os.read
+        substituted = False
+
+        def substitute_after_eof(descriptor, size):
+            nonlocal substituted
+            data = real_read(descriptor, size)
+            info = os.fstat(descriptor)
+            if (
+                not substituted
+                and not data
+                and (info.st_dev, info.st_ino) == original_identity
+            ):
+                log.unlink()
+                log.write_bytes(replacement)
+                log.chmod(0o600)
+                substituted = True
+            return data
+
+        with patch.object(
+            mint_auto_diagnoser.os,
+            "read",
+            side_effect=substitute_after_eof,
+        ):
+            with self.assertRaises(mint_auto_diagnoser.DiagnoserError):
+                self.record()
+
+        self.assertTrue(substituted)
+        self.assertEqual(log.read_bytes(), replacement)
+
     def test_explicit_structural_three_pool_route_is_observed(self):
         """Reducing a three-pool target route to an implicit marker loses hop proof."""
         self.write_guard_result()
@@ -823,8 +917,96 @@ class StageEvidenceTests(unittest.TestCase):
         with self.assertRaises(mint_auto_diagnoser.DiagnoserError):
             self.record()
 
-    def test_post_rename_directory_fsync_error_keeps_published_result(self):
-        """A durability-report error after rename must not create state/result skew."""
+    def test_each_state_replace_is_followed_by_batch_directory_fsync(self):
+        """A crash must not roll a completed state transition back to retryable."""
+        self.write_guard_result()
+        batch_root = self.stage_root.parent.parent
+        batch_identity = (
+            batch_root.stat().st_dev,
+            batch_root.stat().st_ino,
+        )
+        events = []
+        real_replace = mint_auto_diagnoser.os.replace
+        real_fsync = mint_auto_diagnoser.os.fsync
+
+        def track_replace(source, destination, *args, **kwargs):
+            result = real_replace(
+                source, destination, *args, **kwargs
+            )
+            if (
+                destination == "batch-state.json"
+                and kwargs.get("dst_dir_fd") is not None
+            ):
+                info = os.fstat(kwargs["dst_dir_fd"])
+                if (info.st_dev, info.st_ino) == batch_identity:
+                    events.append("state-replace")
+            return result
+
+        def track_fsync(descriptor):
+            info = os.fstat(descriptor)
+            if (info.st_dev, info.st_ino) == batch_identity:
+                events.append("batch-fsync")
+            return real_fsync(descriptor)
+
+        with patch.object(
+            mint_auto_diagnoser.os,
+            "replace",
+            side_effect=track_replace,
+        ), patch.object(
+            mint_auto_diagnoser.os,
+            "fsync",
+            side_effect=track_fsync,
+        ):
+            self.record()
+
+        self.assertEqual(
+            events,
+            [
+                "state-replace",
+                "batch-fsync",
+                "state-replace",
+                "batch-fsync",
+            ],
+        )
+
+    def test_reservation_fsync_failure_blocks_same_stage_retry(self):
+        """An unconfirmed reservation commit must still fail closed in-process."""
+        self.write_guard_result()
+        batch_root = self.stage_root.parent.parent
+        batch_identity = (
+            batch_root.stat().st_dev,
+            batch_root.stat().st_ino,
+        )
+        real_fsync = mint_auto_diagnoser.os.fsync
+        failed = False
+
+        def fail_first_batch_fsync(descriptor):
+            nonlocal failed
+            info = os.fstat(descriptor)
+            if (
+                not failed
+                and (info.st_dev, info.st_ino) == batch_identity
+            ):
+                failed = True
+                raise OSError("fixture state durability failure")
+            return real_fsync(descriptor)
+
+        with patch.object(
+            mint_auto_diagnoser.os,
+            "fsync",
+            side_effect=fail_first_batch_fsync,
+        ):
+            with self.assertRaises(
+                mint_auto_diagnoser.DiagnoserError
+            ):
+                self.record()
+
+        self.assertTrue(failed)
+        with self.assertRaises(mint_auto_diagnoser.DiagnoserError):
+            self.record()
+
+    def test_stage_result_fsync_failure_defers_state_commit_until_retry(self):
+        """Pending evidence must be durable before its state transition commits."""
         self.write_guard_result()
         real_fsync = mint_auto_diagnoser.os.fsync
         final_result = (
@@ -832,17 +1014,27 @@ class StageEvidenceTests(unittest.TestCase):
             / "results"
             / "0-baseline"
         )
+        state_path = (
+            self.stage_root.parent.parent / "batch-state.json"
+        )
+        results_root = final_result.parent
+        results_root.mkdir(mode=0o700)
+        results_identity = (
+            results_root.stat().st_dev,
+            results_root.stat().st_ino,
+        )
+        batch_identity = (
+            state_path.parent.stat().st_dev,
+            state_path.parent.stat().st_ino,
+        )
 
         def fail_post_rename(descriptor):
-            if final_result.exists():
-                try:
-                    target = os.readlink(
-                        f"/proc/self/fd/{descriptor}"
-                    )
-                except OSError:
-                    target = ""
-                if target.endswith("/results"):
-                    raise OSError("fixture directory fsync failure")
+            info = os.fstat(descriptor)
+            if (
+                final_result.exists()
+                and (info.st_dev, info.st_ino) == results_identity
+            ):
+                raise OSError("fixture directory fsync failure")
             return real_fsync(descriptor)
 
         with patch.object(
@@ -850,14 +1042,53 @@ class StageEvidenceTests(unittest.TestCase):
             "fsync",
             side_effect=fail_post_rename,
         ):
-            result = self.record()
+            with self.assertRaises(OSError):
+                self.record()
 
-        self.assertEqual(result["stage_status"], "no_target")
-        self.assertEqual(
-            mint_auto_diagnoser.next_stage(
+        state = json.loads(state_path.read_bytes())
+        self.assertEqual(state["status"], "running")
+        self.assertEqual(state["completed_stages"], [])
+        self.assertEqual(state["next_stage"], "stop")
+
+        events = []
+        real_replace = mint_auto_diagnoser.os.replace
+
+        def track_recovery_fsync(descriptor):
+            info = os.fstat(descriptor)
+            identity = (info.st_dev, info.st_ino)
+            if identity == results_identity:
+                events.append("results-fsync")
+            elif identity == batch_identity:
+                events.append("batch-fsync")
+            return real_fsync(descriptor)
+
+        def track_recovery_replace(
+            source, destination, *args, **kwargs
+        ):
+            result = real_replace(
+                source, destination, *args, **kwargs
+            )
+            if destination == "batch-state.json":
+                events.append("state-replace")
+            return result
+
+        with patch.object(
+            mint_auto_diagnoser.os,
+            "fsync",
+            side_effect=track_recovery_fsync,
+        ), patch.object(
+            mint_auto_diagnoser.os,
+            "replace",
+            side_effect=track_recovery_replace,
+        ):
+            decision = mint_auto_diagnoser.next_stage(
                 self.root, self.batch.batch_id
-            ),
-            "offchain",
+            )
+
+        self.assertEqual(decision, "offchain")
+        self.assertEqual(
+            events,
+            ["results-fsync", "state-replace", "batch-fsync"],
         )
 
     def test_exception_after_rename_recovers_published_result(self):
@@ -1145,6 +1376,72 @@ class StageEvidenceTests(unittest.TestCase):
         self.assertTrue(result_path.exists())
         self.assert_result_substitution_keeps_active_marker(result_path)
 
+    def test_result_substitution_at_marker_quarantine_rolls_marker_back(self):
+        """The result identity must remain bound through marker quarantine."""
+        self.write_guard_result()
+        self.write_artifact(
+            "hot_tokens.json", self.hot_tokens(TARGET_MINT)
+        )
+        self.record()
+        result_path = (
+            self.root
+            / mint_auto_diagnoser.batch_result_path(
+                self.batch.batch_id
+            )
+        )
+        state_root = self.root / "state"
+        active_path = (
+            state_root / mint_auto_diagnoser.ACTIVE_MARKER
+        )
+        replacement = (
+            b'{"completed_stages":["baseline"],'
+            b'"cumulative_observed_loss_lamports":1,'
+            b'"status":"target_positive"}\n'
+        )
+        real_rename = mint_auto_diagnoser.os.rename
+        substituted = False
+
+        def substitute_before_marker_quarantine(
+            source, destination, *args, **kwargs
+        ):
+            nonlocal substituted
+            if (
+                not substituted
+                and source == mint_auto_diagnoser.ACTIVE_MARKER
+            ):
+                result_path.unlink()
+                result_path.write_bytes(replacement)
+                result_path.chmod(0o600)
+                substituted = True
+            return real_rename(
+                source, destination, *args, **kwargs
+            )
+
+        with patch.object(
+            mint_auto_diagnoser.os,
+            "rename",
+            side_effect=substitute_before_marker_quarantine,
+        ):
+            with self.assertRaises(mint_auto_diagnoser.DiagnoserError):
+                mint_auto_diagnoser.finalize_batch(
+                    self.root, self.batch.batch_id
+                )
+
+        self.assertTrue(substituted)
+        self.assertEqual(result_path.read_bytes(), replacement)
+        self.assertEqual(
+            active_path.read_text(), self.batch.batch_id + "\n"
+        )
+        self.assertEqual(
+            tuple(
+                state_root.glob(
+                    mint_auto_diagnoser.ACTIVE_MARKER
+                    + ".releasing-*"
+                )
+            ),
+            (),
+        )
+
     def test_finalize_fsyncs_result_directory_before_marker_release(self):
         """Marker release before the result directory fsync could lose both states."""
         self.write_guard_result()
@@ -1398,6 +1695,99 @@ class StageEvidenceTests(unittest.TestCase):
         self.assertEqual(active_path.read_bytes(), new_active_marker)
         self.assertEqual(len(quarantines), 1)
         self.assertEqual(quarantines[0].read_bytes(), quarantined_marker)
+
+    def test_quarantine_rollback_preserves_late_name_substitution(self):
+        """Rollback must recheck both linked names immediately before unlink."""
+        self.write_guard_result()
+        self.write_artifact(
+            "hot_tokens.json", self.hot_tokens(TARGET_MINT)
+        )
+        self.record()
+        state_root = self.root / "state"
+        state_identity = (
+            state_root.stat().st_dev,
+            state_root.stat().st_ino,
+        )
+        active_path = (
+            state_root / mint_auto_diagnoser.ACTIVE_MARKER
+        )
+        moved_marker = b"20260726T123001Z\n"
+        competing_quarantine = b"20260726T123002Z\n"
+        real_rename = mint_auto_diagnoser.os.rename
+        real_fsync = mint_auto_diagnoser.os.fsync
+        quarantine_name = None
+        injected = False
+
+        def write_at(parent_fd, name, data):
+            descriptor = os.open(
+                name,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+                dir_fd=parent_fd,
+            )
+            try:
+                os.fchmod(descriptor, 0o600)
+                os.write(descriptor, data)
+                real_fsync(descriptor)
+            finally:
+                os.close(descriptor)
+
+        def substitute_active_before_rename(
+            source, destination, *args, **kwargs
+        ):
+            nonlocal quarantine_name
+            if source == mint_auto_diagnoser.ACTIVE_MARKER:
+                parent_fd = kwargs["src_dir_fd"]
+                os.unlink(source, dir_fd=parent_fd)
+                write_at(parent_fd, source, moved_marker)
+                quarantine_name = destination
+            return real_rename(
+                source, destination, *args, **kwargs
+            )
+
+        def substitute_quarantine_after_rollback_fsync(descriptor):
+            nonlocal injected
+            result = real_fsync(descriptor)
+            info = os.fstat(descriptor)
+            if (
+                not injected
+                and quarantine_name is not None
+                and (info.st_dev, info.st_ino) == state_identity
+                and active_path.exists()
+            ):
+                os.unlink(quarantine_name, dir_fd=descriptor)
+                write_at(
+                    descriptor,
+                    quarantine_name,
+                    competing_quarantine,
+                )
+                injected = True
+            return result
+
+        with patch.object(
+            mint_auto_diagnoser.os,
+            "rename",
+            side_effect=substitute_active_before_rename,
+        ), patch.object(
+            mint_auto_diagnoser.os,
+            "fsync",
+            side_effect=substitute_quarantine_after_rollback_fsync,
+        ):
+            with self.assertRaises(mint_auto_diagnoser.DiagnoserError):
+                mint_auto_diagnoser.finalize_batch(
+                    self.root, self.batch.batch_id
+                )
+
+        self.assertTrue(injected)
+        self.assertEqual(active_path.read_bytes(), moved_marker)
+        quarantine_path = state_root / quarantine_name
+        self.assertTrue(quarantine_path.exists())
+        self.assertEqual(
+            quarantine_path.read_bytes(), competing_quarantine
+        )
 
     def test_finalize_rejects_mismatched_existing_result(self):
         """An existing result that disagrees with state must remain untouched and active."""
