@@ -91,55 +91,8 @@ STAGE_MUTATIONS = (
     StageMutation("pool_liquidity", ("auto", "markets"), "min_pool_liquidity_lamports", 0, int),
 )
 STAGE_NAMES = ("baseline",) + tuple(item.name for item in STAGE_MUTATIONS)
-TERMINAL_BATCH_STATES = frozenset(
-    {"target_positive", "exhausted", "failed", "declined"}
-)
-STATE_KEYS = frozenset(
-    {
-        "schema",
-        "status",
-        "completed_stages",
-        "cumulative_observed_loss_lamports",
-        "next_stage",
-    }
-)
 ROUTING_KEYS = frozenset({"routes"})
 ROUTE_KEYS = frozenset({"target_mint", "pool_ids"})
-STAGE_MANIFEST_KEYS = frozenset(
-    {
-        "stage_name",
-        "stage_status",
-        "stop_reason",
-        "duration_seconds",
-        "guard_exit",
-        "selector_histogram",
-        "target_artifact_count",
-        "target_pool_count",
-        "target_lut_count",
-        "target_runtime_count",
-        "route_status",
-        "three_hop_status",
-        "sender_acceptance_count",
-        "sender_rejection_count",
-        "target_filtered_landed",
-        "target_filtered_successful",
-        "target_filtered_failed",
-        "fees_lamports",
-        "rent_lamports",
-        "transfers_lamports",
-        "sol_delta_lamports",
-        "wsol_delta_raw",
-        "cumulative_observed_loss_lamports",
-        "next_decision",
-    }
-)
-BATCH_RESULT_KEYS = frozenset(
-    {
-        "status",
-        "completed_stages",
-        "cumulative_observed_loss_lamports",
-    }
-)
 
 
 def _configuration_error():

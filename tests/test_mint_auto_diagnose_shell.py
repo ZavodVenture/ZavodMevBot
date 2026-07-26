@@ -137,6 +137,18 @@ class MintAutoDiagnoseShellTests(unittest.TestCase):
             [[ -e "/proc/$$/fd/$ZAVOD_LIVE_LOCK_FD" ]]
             [[ -e "/proc/$$/fd/$ZAVOD_BATCH_CONTRACT_FD" ]]
             printf '%s\\n' "$*" >> guard.calls
+            if [[ -e slow-guard ]]; then
+              trap 'touch guard.terminated; exit 143' TERM
+              touch guard.started
+              while true; do sleep 1; done
+            fi
+            printf '%s\\n' \
+              'reason=timeout' \
+              'duration_seconds=1' \
+              'child_exit_code=0' \
+              'loss_limit_lamports=30000000' \
+              'early_stop_lamports=25000000' \
+              'log_path=logs/stage.log'
             """,
         )
 
@@ -236,6 +248,35 @@ class MintAutoDiagnoseShellTests(unittest.TestCase):
             (self.root / "state/.mint-auto-diagnose-active").exists()
         )
 
+    def test_sigterm_forwards_to_guard_and_restores(self):
+        (self.root / "slow-guard").touch()
+        self.set_decisions("continue")
+        process = subprocess.Popen(
+            ["bash", "scripts/mint-auto-diagnose.sh", TARGET_MINT],
+            cwd=self.root,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        process.stdin.write(CONFIRMATION)
+        process.stdin.flush()
+        deadline = 5
+        while deadline > 0 and not (self.root / "guard.started").exists():
+            import time
+            time.sleep(0.05)
+            deadline -= 0.05
+        self.assertTrue((self.root / "guard.started").exists())
+
+        process.terminate()
+        stdout, stderr = process.communicate(timeout=5)
+
+        self.assertEqual(process.returncode, 143, (stdout, stderr))
+        self.assertTrue((self.root / "guard.terminated").exists())
+        self.assertFalse(
+            (self.root / "state/.mint-auto-diagnose-active").exists()
+        )
+
     def test_only_guarded_wrapper_launches_a_stage(self):
         self.set_decisions("target_positive")
 
@@ -246,6 +287,14 @@ class MintAutoDiagnoseShellTests(unittest.TestCase):
         script = (self.root / "scripts/mint-auto-diagnose.sh").read_text()
         self.assertIn("scripts/run-guarded.sh", script)
         self.assertNotIn("zavod-mev-bot-rust-version-cli run", script)
+        guard_result = (
+            self.root
+            / "state/auto-diagnose-runs/20260726T190000Z/"
+            "stages/0-baseline/guard-result.txt"
+        )
+        self.assertTrue(guard_result.is_file())
+        self.assertEqual(guard_result.stat().st_mode & 0o777, 0o600)
+        self.assertIn("reason=timeout", guard_result.read_text())
 
 
 if __name__ == "__main__":

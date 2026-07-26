@@ -58,6 +58,7 @@ flock -n "$live_lock_fd" || {
 
 batch_id=""
 prepare_attempted=0
+guard_pid=""
 cleanup() {
   local status=$?
   trap - EXIT INT TERM
@@ -70,9 +71,18 @@ cleanup() {
   fi
   exit "$status"
 }
+handle_signal() {
+  local status="$1"
+  if [[ -n "$guard_pid" ]] && kill -0 "$guard_pid" 2>/dev/null; then
+    kill -TERM "$guard_pid" 2>/dev/null || true
+    wait "$guard_pid" 2>/dev/null || true
+    guard_pid=""
+  fi
+  exit "$status"
+}
 trap cleanup EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
+trap 'handle_signal 130' INT
+trap 'handle_signal 143' TERM
 
 prepare_attempted=1
 prepare_json="$(
@@ -157,6 +167,21 @@ for line in "${prepared_lines[@]:1}"; do
     break
   }
   exec {contract_fd}<"$contract_path"
+  guard_result_path="$workspace/guard-result.txt"
+  set +e
+  set -o noclobber
+  exec {guard_result_fd}>"$guard_result_path"
+  guard_result_status=$?
+  set +o noclobber
+  set -e
+  if (( guard_result_status != 0 )); then
+    exec {contract_fd}<&-
+    terminal_status="failed"
+    stop_reason="evaluation_error"
+    shell_status=2
+    break
+  fi
+  chmod 600 "/proc/$$/fd/$guard_result_fd"
   started_at="$(date +%s)"
   set +e
   ZAVOD_LIVE_LOCK_FD="$live_lock_fd" \
@@ -165,9 +190,13 @@ for line in "${prepared_lines[@]:1}"; do
       --live-confirmed \
       --timeout 300 \
       --profile auto-filter-live \
-      --workspace "$workspace"
+      --workspace "$workspace" >&"$guard_result_fd" &
+  guard_pid=$!
+  wait "$guard_pid"
   guard_exit=$?
+  guard_pid=""
   set -e
+  exec {guard_result_fd}>&-
   ended_at="$(date +%s)"
   exec {contract_fd}<&-
   executed+=("$stage_name")

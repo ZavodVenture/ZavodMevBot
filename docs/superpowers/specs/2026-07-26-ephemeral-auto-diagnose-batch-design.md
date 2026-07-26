@@ -90,3 +90,10 @@ Tests cover only the load-bearing behavior:
 The existing guard and preparation suites remain unchanged and must continue
 to pass. No live or transaction-capable command is part of implementation
 verification.
+
+## Implementation Status
+
+Implemented in the isolated `codex/autonomous-live-filter-diagnoser` branch as
+a one-shot `evaluate_stage` API and a linear `mint-auto-diagnose.sh` loop.
+Persistent stage state, pending recovery, quarantine, and resume interfaces
+were removed.
