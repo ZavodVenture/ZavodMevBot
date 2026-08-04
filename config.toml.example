@@ -123,6 +123,20 @@ tip_lamports = { from = 1_000_000, to = 10_033_333 }
 dynamic_priority_fee = { enable = true, min_percentile = 10, max_percentile = 85, min = 111, max = 6333 }
 dynamic_tip = { enable = true, min_percentile = 10, max_percentile = 85, min = 1_000_011, max = 30_000_333 }
 
+[astralane]
+enabled = false
+api-key = ""
+endpoints = [
+  "https://fr.gateway.astralane.io/iris",
+  "https://jp.gateway.astralane.io/iris",
+  "https://ny.gateway.astralane.io/iris",
+]
+process_delay = 300
+priority_fee_lamports = { from = 111, to = 3333 }
+tip_lamports = { from = 10_000, to = 1_000_000 }
+dynamic_priority_fee = { enable = true, min_percentile = 10, max_percentile = 85, min = 111, max = 6333 }
+dynamic_tip = { enable = true, min_percentile = 10, max_percentile = 85, min = 10_000, max = 30_000_333 }
+
 [auto]
 enabled = true
 refresh_interval_in_secs = 10.0
