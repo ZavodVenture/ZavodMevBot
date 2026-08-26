@@ -57,7 +57,8 @@ enabled = false
 window_ms = 5_000
 min_samples = 50
 # success_only | not_success | all
-sample_scope = "all"
+sample_scope = "not_success"
+ignored_addresses = []
 
 [spam]
 enabled = true
