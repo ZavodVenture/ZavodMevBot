@@ -154,6 +154,12 @@ min_roi = 0.0
 min_volume_lamports = 0
 max_volume_lamports = 9_223_372_036_854_775_807
 ignore_offchain_bots = false
+# Filtered successes / (empty + failed attempts), using completed seconds over duration.
+# Profit, liquidity and supported-route filters affect the numerator only.
+# 0 disables the filter. The ratio always uses available records, even during startup
+# or after tx_limit eviction; positive thresholds are still applied.
+# Example: 10 successes / 100 unsuccessful attempts = 0.1 (not 10).
+success_rate = 0.0
 
 [auto.markets]
 max_pool_len = 4
