@@ -2,9 +2,24 @@
 
 set -euo pipefail
 
-API_URL="https://api.github.com/repos/ZavodVenture/ZavodMevBot/releases/latest"
+RELEASES_API_URL="https://api.github.com/repos/ZavodVenture/ZavodMevBot/releases"
 TARGET_DIR="$(pwd)"
 TEMP_DIR=""
+
+usage() {
+    cat <<'EOF'
+Usage: ./upgrade.sh [VERSION]
+
+Install the specified release of ZavodMevBot.
+
+Arguments:
+  VERSION   Release tag, for example v0.1.14 or 0.1.14.
+            If omitted, the latest release is installed.
+
+Options:
+  -h, --help  Show this help message.
+EOF
+}
 
 cleanup() {
     if [[ -n "${TEMP_DIR}" && -d "${TEMP_DIR}" ]]; then
@@ -43,6 +58,33 @@ extract_json_string() {
     sed -n "s/.*\"${key}\":[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p" "${file_path}" | head -n1
 }
 
+if [[ $# -gt 1 ]]; then
+    usage >&2
+    fail "too many arguments"
+fi
+
+REQUESTED_VERSION="${1:-}"
+
+case "${REQUESTED_VERSION}" in
+    -h|--help)
+        usage
+        exit 0
+        ;;
+esac
+
+if [[ -n "${REQUESTED_VERSION}" ]]; then
+    if [[ "${REQUESTED_VERSION}" != v* && "${REQUESTED_VERSION}" =~ ^[0-9] ]]; then
+        REQUESTED_VERSION="v${REQUESTED_VERSION}"
+    fi
+
+    [[ "${REQUESTED_VERSION}" =~ ^[A-Za-z0-9._-]+$ ]] || \
+        fail "invalid version: ${REQUESTED_VERSION}"
+
+    API_URL="${RELEASES_API_URL}/tags/${REQUESTED_VERSION}"
+else
+    API_URL="${RELEASES_API_URL}/latest"
+fi
+
 trap cleanup EXIT
 
 install_package_if_needed "curl" "curl"
@@ -51,27 +93,36 @@ install_package_if_needed "unzip" "unzip"
 install_package_if_needed "rsync" "rsync"
 
 TEMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/zavod-upgrade.XXXXXX")"
-API_RESPONSE_FILE="${TEMP_DIR}/latest-release.json"
+API_RESPONSE_FILE="${TEMP_DIR}/release.json"
 ARCHIVE_FILE="${TEMP_DIR}/release.zip"
 EXTRACT_DIR="${TEMP_DIR}/extracted"
 
-echo "Fetching the latest release information from the GitHub API..."
-curl -fsSL "${API_URL}" -o "${API_RESPONSE_FILE}" || fail "failed to fetch release data"
+if [[ -n "${REQUESTED_VERSION}" ]]; then
+    echo "Fetching release ${REQUESTED_VERSION} from the GitHub API..."
+else
+    echo "Fetching the latest release information from the GitHub API..."
+fi
+curl -fsSL "${API_URL}" -o "${API_RESPONSE_FILE}" || \
+    fail "failed to fetch release data from ${API_URL}"
 
-LATEST_TAG="$(extract_json_string "tag_name" "${API_RESPONSE_FILE}")"
+RELEASE_TAG="$(extract_json_string "tag_name" "${API_RESPONSE_FILE}")"
 DOWNLOAD_URL="$(extract_json_string "browser_download_url" "${API_RESPONSE_FILE}")"
 
-[[ -n "${LATEST_TAG}" ]] || fail "failed to determine tag_name of the latest release"
+[[ -n "${RELEASE_TAG}" ]] || fail "failed to determine tag_name of the release"
 [[ -n "${DOWNLOAD_URL}" ]] || fail "failed to determine browser_download_url of the first asset"
+
+if [[ -n "${REQUESTED_VERSION}" && "${RELEASE_TAG}" != "${REQUESTED_VERSION}" ]]; then
+    fail "GitHub returned release ${RELEASE_TAG} instead of ${REQUESTED_VERSION}"
+fi
 
 case "${DOWNLOAD_URL}" in
     *.zip) ;;
     *)
-        fail "the first asset of the latest release is not a zip archive: ${DOWNLOAD_URL}"
+        fail "the first asset of release ${RELEASE_TAG} is not a zip archive: ${DOWNLOAD_URL}"
         ;;
 esac
 
-echo "Latest release found: ${LATEST_TAG}"
+echo "Release found: ${RELEASE_TAG}"
 echo "Downloading archive: ${DOWNLOAD_URL}"
 wget -q -O "${ARCHIVE_FILE}" "${DOWNLOAD_URL}" || fail "failed to download release archive"
 
@@ -95,4 +146,4 @@ if [[ -f "${TARGET_DIR}/upgrade.sh" ]]; then
     chmod +x "${TARGET_DIR}/upgrade.sh" || fail "failed to set executable permissions on upgrade.sh"
 fi
 
-echo "Upgrade completed: version ${LATEST_TAG} has been installed"
+echo "Upgrade completed: version ${RELEASE_TAG} has been installed"
