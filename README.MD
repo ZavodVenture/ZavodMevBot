@@ -1,62 +1,73 @@
 # **ZavodMevBot**
 ZavodMevBot — Solana MEV Bot and Automated Solana On-Chain Arbitrage Bot
 
-Documentation:  
+Documentation:
 https://zavod-venture.gitbook.io/zavod-venture-docs/zavod-mev-bot/kak-rabotaet-nash-bot
 
-On-chain program address:  
+On-chain program address:
 `4Qv3mbzcq1bKmrhGG4voS3EemfPd7f838FLUU7wBHSyi`
+
+**Getting started:** see [HowToRun.MD](./HowToRun.MD).
+
 ---
 
 ## 🚀 Introduction
 
-**ZavodMevBot** is an advanced, fully-automated, compute-optimized, flash-loan–enabled **Solana On-chain Arbitrage Bot** built in Rust for maximum speed and reliability.
-
-Designed as a next-generation alternative to tools like SolanaMevBot and NotArb, **ZavodMevBot delivers superior performance, faster execution, and higher profitability** based on extensive real-world testing.
+**ZavodMevBot** is a fully automated, flash-loan–enabled **Solana on-chain arbitrage bot** written in Rust.
 
 **No need to hunt for arbitrage pairs manually.**
-**ZavodMevBot** continuously scans the entire Solana ecosystem and executes profitable opportunities automatically.
+Our ASSIST server watches the whole Solana market and streams profitable arbitrage routes to the bot in real time. The bot decides which routes are worth repeating, builds the transactions and sends them.
 
-**No upfront SOL required for swaps.**
-Thanks to integrated flash-loan support, you only need a small amount of SOL for gas fees—**ZavodMevBot** handles the rest.
-
-**ZavodMevBot includes everything you need.**
-Just run it, let it operate autonomously, and watch profitable arbitrage transactions roll in.
+**No upfront capital for swaps.**
+With flash loans enabled, the swap amount is borrowed and repaid inside the same transaction. You only need SOL for fees and tips.
 
 ---
 
 ## 💡 Key Features
 
-### **🔍 Search Engine in Multi-DEX**
+### **🔍 Multi-DEX routes**
 
-**ZavodMevBot** supports dynamic pool discovery and execution across:
+2-hop and 3-hop arbitrage routes across:
 
-- Pump.Amm Pools
+- Pump.fun AMM (PumpSwap)
 - Meteora DLMM
-- Raydium CPMM
+- Meteora DAMM v2
 - Raydium AMM
-- Meteora AmmV2
+- Raydium CPMM
 - Raydium CLMM
-- Orca (Whirlpools)
-- ...
+- Orca Whirlpools
 
-### **🧠 Smart Opportunity Detection**
+### **🧠 Activity windows**
 
-- Real-time price monitoring
-- Efficient path computation
-- Optimal trade size calculation
+You decide which routes are worth sending and how often: a route is sent while it has enough recent executions and profit in one of your windows. Each window has its own send interval, senders and fees.
 
-### **⚡ Ultra-Fast Execution**
+### **⚡ Many ways to send**
 
-- Optimized Rust-based engine
-- Jito bundle support
-- Low-latency RPC support
+Every window can send through any mix of:
 
-### **🔐 Safety & Reliability**
+- your own RPCs (spam)
+- Jito and Jito bundles
+- Helius and Helius SWQoS
+- Temporal, Falcon, Circular, Astralane
 
-- Transaction simulation before send
-- Slippage awareness and error recovery
-- Automated blockhash refreshing
+Fees can be fixed ranges or **dynamic**: based on what other arbitrage transactions with the same tokens recently paid, within your own limits.
+
+### **📊 Web panel**
+
+A built-in HTTPS panel with a password:
+
+- live dashboard: routes, sends, profit and errors
+- statistics of every transaction of your wallet, per window
+- configuration page: edit `config.toml` with a description of every setting
+- restart, stop and start the bot
+
+### **🔐 Safety**
+
+- Stops, or unwraps WSOL to refill SOL, when the wallet balance gets low
+- The wallet key can be encrypted on disk (`encrypt-key`)
+- Pool liquidity filters
+- Automatic claim of Pump.fun AMM cashback
+- Automatic closing of unused empty token accounts to return their rent
 
 ![Arbitrage Screenshot](./screenshot.png)
 
@@ -64,44 +75,29 @@ Just run it, let it operate autonomously, and watch profitable arbitrage transac
 
 ## 🌊 How **ZavodMevBot** Works
 
-1. **Monitors pools** across all supported DEXes in real-time.
-2. **Identifies profitable price deviations** where a token can be swapped between pools for a net gain.
-3. **Calculates optimal trade size** considering liquidity depth and fees.
-4. **Builds and sends transactions** via High-speed RPC Providers.
-5. **Tracks profit, volume, and performance** automatically.
+1. **ASSIST streams** arbitrage executions seen on Solana to the bot.
+2. **The bot keeps the routes** that pass your activity windows and liquidity filters.
+3. **It prepares transactions**: pool accounts, lookup tables, up to 5 pools per transaction.
+4. **It sends them** through the window's senders, at the window's interval, with your fees.
+5. **The on-chain program** picks the optimal trade size at execution time.
+6. **The panel shows** what was sent and what it earned.
+
+The bot can also run without ASSIST, from pool groups listed in a file (file mode).
 
 ---
 
 ## 🔧 Configuration
 
-Users can customize:
+Everything is set in `config.toml` (start from `config.toml.example`):
 
-- Minimum profit threshold
-- Token whitelist / blacklist
-- Pool liquidity filters
-- Priority fee settings
-- When to stop and start
+- RPC and wallet
+- low-balance stop and WSOL unwrap
+- liquidity filters
+- activity windows: thresholds, send interval, senders and fees
+- sender connections (keys, regions)
+- panel
 
----
-
-## 📈 Why Choose **ZavodMevBot**?
-
-Because **ZavodMevBot** is designed to be:
-
-- **Fast** – written in Rust and optimized for concurrency
-- **Reliable** – safe error handling and fallback mechanisms
-- **Profitable** – intelligently finds and executes high-yield opportunities
-- **Scalable** – handles thousands of pools efficiently
-
-Whether you're a beginner or a seasoned Solana trader, **ZavodMevBot** empowers you with institutional-grade arbitrage technology.
-
----
-
-## 🐳 Future Enhancements
-
-- Multi-hop arbitrage (triangular)
-- Mobile and web dashboards
-- Bot-as-a-service cloud option
+Every setting is described on the panel's configuration page.
 
 ---
 
@@ -110,4 +106,3 @@ Whether you're a beginner or a seasoned Solana trader, **ZavodMevBot** empowers 
 Have questions or want to know details?
 
 - **Telegram:** [**ZavodMevBot**](https://t.me/ZavodMevBot_Monitor)
-

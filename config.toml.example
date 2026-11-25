@@ -1,184 +1,207 @@
-# Example bot configuration.
-# Copy this into config.toml and fill in your RPC / key / sender modes.
+# Example bot configuration. Copy it to config.toml and fill in [rpc] and [wallet].
+# Only settings that need a value are listed; everything else uses its default.
+# Every setting is described on the panel's «Конфигурация» page.
+# Amounts are in lamports: 1 SOL = 1_000_000_000. Changes apply after the bot restarts.
+
+[rpc]
+# Main RPC; public RPCs will not do. An environment variable works too: "$RPC_URL".
+url = ""
+
+[wallet]
+# Wallet private key, or an environment variable: "$PRIVATE_KEY".
+# To avoid keeping the key in plain text, run `encrypt-key --config config.toml`:
+# the key is encrypted into wallet.enc and this line can be removed.
+private_key = ""
 
 [stop]
-min_balance_lamports = 100_000_000
-should_unwrap = true
-unwrap_amount_lamports = 200_000_000
+min_balance_lamports = 50_000_000         # stop when the wallet holds less SOL
+should_unwrap = true                      # unwrap WSOL into SOL instead of stopping
+unwrap_amount_lamports = 5_300_000_000    # how much WSOL to unwrap at a time
 
 [cashback_autoclaim]
 enabled = true
 claim_threshold_lamports = 100_000_000
-check_interval_secs = 3600
-
-# Markets sources from file.
-# File format: TOML where each [[group]] is one transaction:
-# [[group]]
-# mint_a = "..."
-# markets_a = ["...", "..."]
-# mint_b = "..."              # optional
-# markets_b = ["...", "..."]  # required when mint_b is set
-# luts = ["..."]
-#
-# If `update_seconds = 0`, the file is read once at startup.
-# [[markets_file]]
-# enabled = false
-# path = "markets.toml"
-# update_seconds = 0
-# If true, LUTs from markets.toml are ignored and fresh LUTs are resolved through Arb-Assist every 5 seconds.
-# auto_luts = false
-
-# LUT sources from file.
-# Supported formats:
-# 1. TOML like `luts = ["..."]`
-# 2. TXT where the first token on each line is a LUT address
-# If `update_seconds = 0`, the file is read once at startup.
-# [[lookup_tables_file]]
-# enabled = false
-# path = "lookup-tables.txt"
-# update_seconds = 0
+check_interval_secs = 3_600
 
 [bot]
-# Compute unit limit per transaction
-compute_unit_limit = 358_182
-dlmm_bin_range_to_search = 20
-gas_file = false
-extended_logs = false
-merge_mints = true
-log = false
+compute_unit_limit = 400_182
+dlmm_bin_range_to_search = 23
 
-[DataSizeEstimation]
-# If true, DataSizeLimit is estimated by simulation and added to transactions.
-# If false, estimation is skipped and the instruction is not added.
-enable = true
-
-[dynamic_fees]
+[data_size_estimation]
 enabled = false
-window_ms = 5_000
-min_samples = 50
-# success_only | not_success | all
-sample_scope = "not_success"
-ignored_addresses = []
-
-[spam]
-enabled = true
-process_delay = 300
-sending_rpc_urls = [
-  "",
-]
-priority_fee = { from = 1111, to = 10333 }
-dynamic_priority_fee = { enable = true, min_percentile = 10, max_percentile = 85, min = 1111, max = 23333 }
-
-[jito]
-enabled = false
-process_delay = 1000
-uuid = ""
-block_engine_urls = [
-  "https://frankfurt.mainnet.block-engine.jito.wtf/api/v1",
-]
-priority_fee_lamports = { from = 1111, to = 8333 }
-tip_config = { from = 1111, to = 8333 }
-dynamic_priority_fee = { enable = true, min_percentile = 10, max_percentile = 85, min = 111, max = 20333 }
-dynamic_tip = { enable = true, min_percentile = 10, max_percentile = 85, min = 111, max = 20333 }
-
-[helius]
-enabled = false
-process_delay = 300
-priority_fee_lamports = { from = 111, to = 3333 }
-tip_lamports = { from = 200_000, to = 30_000_000 }
-dynamic_priority_fee = { enable = true, min_percentile = 10, max_percentile = 85, min = 111, max = 8333 }
-dynamic_tip = { enable = true, min_percentile = 10, max_percentile = 85, min = 200_000, max = 100_000_333 }
-
-[helius_swqos]
-enabled = false
-process_delay = 300
-priority_fee_lamports = { from = 100, to = 3333 }
-tip_lamports = { from = 5000, to = 5_000_333 }
-dynamic_priority_fee = { enable = true, min_percentile = 10, max_percentile = 85, min = 111, max = 6333 }
-dynamic_tip = { enable = true, min_percentile = 10, max_percentile = 85, min = 5111, max = 10_000_333 }
-
-[temporal]
-enabled = false
-uuid = ""
-process_delay = 300
-priority_fee_lamports = { from = 1111, to = 3333 }
-tip_lamports = { from = 1_000_000, to = 20_000_333 }
-dynamic_priority_fee = { enable = true, min_percentile = 10, max_percentile = 85, min = 111, max = 6333 }
-dynamic_tip = { enable = true, min_percentile = 10, max_percentile = 85, min = 1_000_011, max = 30_000_333 }
-
-[falcon]
-enabled = false
-uuid = ""
-process_delay = 300
-priority_fee_lamports = { from = 111, to = 3333 }
-tip_lamports = { from = 1_000_000, to = 10_000_333 }
-dynamic_priority_fee = { enable = true, min_percentile = 10, max_percentile = 85, min = 111, max = 6333 }
-dynamic_tip = { enable = true, min_percentile = 10, max_percentile = 85, min = 1_000_011, max = 30_000_333 }
-
-[circular]
-enabled = false
-api-key = ""
-endpoint = "https://fast.circular.fi/transactions"
-process_delay = 300
-priority_fee_lamports = { from = 111, to = 3333 }
-# Minimum tip_lamports.from is 100_000 lamports.
-tip_lamports = { from = 1_000_000, to = 10_033_333 }
-dynamic_priority_fee = { enable = true, min_percentile = 10, max_percentile = 85, min = 111, max = 6333 }
-dynamic_tip = { enable = true, min_percentile = 10, max_percentile = 85, min = 1_000_011, max = 30_000_333 }
-
-[astralane]
-enabled = false
-api-key = ""
-endpoints = [
-  "https://fr.gateway.astralane.io/iris",
-  "https://jp.gateway.astralane.io/iris",
-  "https://ny.gateway.astralane.io/iris",
-]
-process_delay = 300
-priority_fee_lamports = { from = 111, to = 3333 }
-tip_lamports = { from = 10_000, to = 1_000_000 }
-dynamic_priority_fee = { enable = true, min_percentile = 10, max_percentile = 85, min = 111, max = 6333 }
-dynamic_tip = { enable = true, min_percentile = 10, max_percentile = 85, min = 10_000, max = 30_000_333 }
-
-[auto]
-enabled = true
-refresh_interval_in_secs = 10.0
-force_two_mints = true
-enable_three_hop = false
-
-[auto.filters]
-limit = 2
-min_tx_len = 5
-duration = 60
-min_profit = 200_000_000
-min_profit_per_arb = 10000000
-min_roi = 0.0
-min_volume_lamports = 0
-max_volume_lamports = 9_223_372_036_854_775_807
-ignore_offchain_bots = false
-# Filtered successes / (empty + failed attempts), using completed seconds over duration.
-# Profit, liquidity and supported-route filters affect the numerator only.
-# 0 disables the filter. The ratio always uses available records, even during startup
-# or after tx_limit eviction; positive thresholds are still applied.
-# Example: 10 successes / 100 unsuccessful attempts = 0.1 (not 10).
-success_rate = 0.0
-
-[auto.markets]
-max_pool_len = 4
-min_pool_liquidity_lamports = 6_000_000_000
-max_pool_liquidity_lamports = 780_000_000_000_000
-route_relevance_max_window_secs = 120
-route_relevance_half_life_secs = 20
-profit_weight = 0.75
-count_weight = 0.25
 
 [flashloan]
 enabled = true
 
-[rpc]
-# You can pass the value directly or via environment variable, for example "$RPC_URL"
-url = ""
+# Sample for dynamic fees. Dynamic fees themselves are switched on per sender
+# in a window: dynamic_priority_fee and dynamic_tip.
+[dynamic_fees]
+sample_window_ms = 3_000
+min_samples = 30
+sample_scope = "not_success"
 
-[wallet]
-# You can pass the private key directly or via environment variable, for example "$PRIVATE_KEY"
-private_key = ""
+# spam sends through [rpc].url. To send through other RPCs, add:
+# [spam]
+# sending_rpc_urls = ["https://..."]
+
+[jito]
+# uuid = ""                               # Jito key, if you have one
+block_engine_urls = [
+  "https://mainnet.block-engine.jito.wtf/api/v1",   # nearest region
+]
+
+[auto]
+enabled = true
+
+[auto.filters]
+min_pool_liquidity_lamports = 0
+max_pool_liquidity_lamports = 100_000_000_000_000_000
+
+# --- Activity windows ---
+# A route is sent while, over the last window_secs, it had at least min_tx_count
+# executions worth at least min_profit_lamports in total. Of the windows it passes,
+# the one with the highest min_profit_lamports is used. The windows below go from
+# the most profitable routes to the smallest ones.
+
+# 2 SOL of profit or more in 45 s
+[[auto.activity.windows]]
+name = "huge"
+window_secs = 45
+min_tx_count = 40
+min_profit_lamports = 2_000_000_000
+min_profit_per_arb = 100_000
+send_interval_ms = 70
+idle_secs = 3
+
+[auto.activity.windows.senders.spam]
+priority_fee_lamports = { from = 10_500, to = 60_500 }
+dynamic_priority_fee = { enable = true, min_percentile = 85, max_percentile = 99, min = 70_011, max = 565_900 }
+
+[auto.activity.windows.senders.jito]
+priority_fee_lamports = { from = 10_000, to = 43_000 }
+tip_lamports = { from = 10_000, to = 32_003 }
+dynamic_priority_fee = { enable = true, min_percentile = 79, max_percentile = 90, min = 111, max = 30_500 }
+dynamic_tip = { enable = true, min_percentile = 90, max_percentile = 99, min = 10_011, max = 155_500 }
+
+# 0.56 SOL or more in 45 s
+[[auto.activity.windows]]
+name = "large"
+window_secs = 45
+min_tx_count = 70
+min_profit_lamports = 560_000_000
+min_profit_per_arb = 10_000
+send_interval_ms = 70
+idle_secs = 3
+
+[auto.activity.windows.senders.spam]
+priority_fee_lamports = { from = 5_500, to = 35_500 }
+dynamic_priority_fee = { enable = true, min_percentile = 85, max_percentile = 96, min = 30_011, max = 205_900 }
+
+[auto.activity.windows.senders.jito]
+priority_fee_lamports = { from = 1_000, to = 3_000 }
+tip_lamports = { from = 5_000, to = 22_003 }
+dynamic_priority_fee = { enable = true, min_percentile = 79, max_percentile = 90, min = 111, max = 3_500 }
+
+# 0.1 SOL or more in 45 s
+[[auto.activity.windows]]
+name = "medium"
+window_secs = 45
+min_tx_count = 50
+min_profit_lamports = 100_000_000
+min_profit_per_arb = 10_000
+send_interval_ms = 100
+idle_secs = 3
+
+[auto.activity.windows.senders.spam]
+priority_fee_lamports = { from = 5_000, to = 33_500 }
+dynamic_priority_fee = { enable = true, min_percentile = 85, max_percentile = 98, min = 5_011, max = 555_900 }
+
+[auto.activity.windows.senders.jito]
+priority_fee_lamports = { from = 1_000, to = 3_000 }
+tip_lamports = { from = 5_000, to = 32_003 }
+dynamic_priority_fee = { enable = true, min_percentile = 79, max_percentile = 90, min = 111, max = 35_500 }
+dynamic_tip = { enable = true, min_percentile = 85, max_percentile = 99, min = 2_011, max = 155_500 }
+
+# 0.05 SOL or more in 90 s
+[[auto.activity.windows]]
+name = "small"
+window_secs = 90
+min_tx_count = 40
+min_profit_lamports = 50_000_000
+min_profit_per_arb = 10_000
+send_interval_ms = 500
+idle_secs = 4
+
+[auto.activity.windows.senders.spam]
+priority_fee_lamports = { from = 5_500, to = 25_500 }
+dynamic_priority_fee = { enable = true, min_percentile = 90, max_percentile = 98, min = 3_011, max = 105_900 }
+
+[auto.activity.windows.senders.jito]
+priority_fee_lamports = { from = 1_000, to = 3_000 }
+tip_lamports = { from = 5_000, to = 18_003 }
+dynamic_priority_fee = { enable = true, min_percentile = 79, max_percentile = 90, min = 111, max = 10_500 }
+dynamic_tip = { enable = true, min_percentile = 90, max_percentile = 99, min = 2_011, max = 55_500 }
+
+# 0.02 SOL or more in 90 s
+[[auto.activity.windows]]
+name = "tiny"
+window_secs = 90
+min_tx_count = 40
+min_profit_lamports = 20_000_000
+min_profit_per_arb = 10_000
+send_interval_ms = 600
+idle_secs = 5
+
+[auto.activity.windows.senders.spam]
+priority_fee_lamports = { from = 1_500, to = 15_500 }
+dynamic_priority_fee = { enable = true, min_percentile = 90, max_percentile = 98, min = 3_011, max = 40_900 }
+
+[auto.activity.windows.senders.jito]
+priority_fee_lamports = { from = 1_000, to = 3_000 }
+tip_lamports = { from = 3_000, to = 12_003 }
+dynamic_priority_fee = { enable = true, min_percentile = 79, max_percentile = 90, min = 111, max = 20_500 }
+dynamic_tip = { enable = true, min_percentile = 90, max_percentile = 99, min = 2_011, max = 45_500 }
+
+# Short bursts: 0.01 SOL and 5 executions or more in 10 s
+[[auto.activity.windows]]
+name = "burst"
+window_secs = 10
+min_tx_count = 5
+min_profit_lamports = 10_000_000
+min_profit_per_arb = 10_000
+send_interval_ms = 150
+idle_secs = 3
+
+[auto.activity.windows.senders.spam]
+priority_fee_lamports = { from = 1_000, to = 15_500 }
+dynamic_priority_fee = { enable = true, min_percentile = 90, max_percentile = 100, min = 6_011, max = 20_900 }
+
+[auto.activity.windows.senders.jito]
+priority_fee_lamports = { from = 1_000, to = 3_000 }
+tip_lamports = { from = 1_000, to = 15_003 }
+dynamic_priority_fee = { enable = true, min_percentile = 69, max_percentile = 90, min = 1_111, max = 10_500 }
+dynamic_tip = { enable = true, min_percentile = 80, max_percentile = 97, min = 5_011, max = 50_500 }
+
+[auto.scheduler]
+max_active_transactions = 3
+
+[auto.liquidity]
+high_activity_route_interval_ms = 300
+refresh_low_activity_ms = 5_000
+
+[auto.pool_accounts]
+high_activity_route_interval_ms = 300
+refresh_high_activity_ms = 200
+refresh_low_activity_ms = 500
+
+# Extra routes that fill spare room in transactions already being sent
+[auto.packing.extra_window]
+min_profit_lamports = 50_000_000
+min_profit_per_arb = 10_000
+
+# Panel: https://<server IP>:8787. Before the first run:
+#   ./zavod-mev-bot-rust-version-cli panel issue-cert
+#   ./zavod-mev-bot-rust-version-cli panel set-password
+# Without a certificate the bot runs, but the panel does not start.
+[panel]
+enabled = true
